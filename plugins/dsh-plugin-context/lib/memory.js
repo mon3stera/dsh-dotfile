@@ -9,6 +9,7 @@
 // un-archives them.
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { CATEGORIES } from "./db.js";
+import { rrfMerge } from "./retrieval.js";
 
 export const DEFAULT_MEMORY_CONFIG = {
 	alpha: 0.4,
@@ -101,7 +102,7 @@ export function recordInjectionHit(cdb, memory, config, now = Date.now()) {
 }
 
 /** Build the registered ctx_memory tool (write / delete). */
-export function createMemoryTool(cdb) {
+export function createMemoryTool(cdb, retrieval = {}) {
 	return defineTool({
 		name: "ctx_memory",
 		description: [
@@ -129,7 +130,7 @@ export function createMemoryTool(cdb) {
 			},
 			render: (args, value) => [{ type: "text", text: value.message }],
 		},
-		execute(args) {
+		async execute(args) {
 			if (args.action === "delete") {
 				if (typeof args.id !== "number") return { ok: false, message: "ctx_memory delete requires a numeric id (use ctx_search to find it)" };
 				if (cdb.memoryById(args.id) === undefined) return { ok: false, message: `memory ${args.id} does not exist` };
@@ -140,6 +141,14 @@ export function createMemoryTool(cdb) {
 				return { ok: false, message: "ctx_memory write requires category, summary, content, importance" };
 			}
 			const id = cdb.writeMemory({ category: args.category, summary: args.summary, content: args.content, importance: args.importance });
+			if (retrieval.embedding !== undefined && cdb.vecEnabled) {
+				try {
+					const vector = await retrieval.embedding.embed(`${args.summary}\n${args.content}`);
+					cdb.setEmbedding(id, JSON.stringify(vector));
+				} catch {
+					// embedding is best-effort; the memory stays FTS-searchable
+				}
+			}
 			return { ok: true, id, message: `wrote memory ${id} [${args.category}]` };
 		},
 	});
@@ -147,8 +156,44 @@ export function createMemoryTool(cdb) {
 
 const MAX_CONTENT_CHARS = 4000;
 
-/** Build the registered ctx_search tool (FTS5 today; vec/RRF/rerank in Phase 6). */
-export function createSearchTool(cdb, config = DEFAULT_MEMORY_CONFIG) {
+/**
+ * Hybrid memory search: FTS5 top-K (+ optional vector top-K fused with RRF),
+ * optional rerank to rerankTopN, hits recorded on the returned rows.
+ */
+export async function searchMemories(cdb, memoryConfig, retrieval, query, limit) {
+	const fts = cdb.ftsSearch(query, retrieval.ftsTopK);
+	let ranked = fts.map((row) => row.id);
+	if (retrieval.embedding !== undefined && cdb.vecEnabled) {
+		try {
+			const vector = await retrieval.embedding.embed(query);
+			const vec = cdb.vecSearch(JSON.stringify(vector), retrieval.vecTopK).map((row) => row.rowid);
+			ranked = rrfMerge([ranked, vec], retrieval.rrfK);
+		} catch {
+			// vector path failed: keep FTS-only ranking
+		}
+	}
+	let rows = ranked.map((id) => cdb.memoryById(id)).filter((row) => row !== undefined);
+	if (retrieval.rerank !== undefined && rows.length > 0) {
+		try {
+			const docs = rows.slice(0, retrieval.rerankInputTopK).map((row) => `${row.summary}\n${row.content}`);
+			const order = await retrieval.rerank.rerank(query, docs);
+			rows = order.slice(0, retrieval.rerankTopN).map((entry) => rows[entry.index]).filter((row) => row !== undefined);
+		} catch {
+			rows = rows.slice(0, retrieval.rerankTopN);
+		}
+	} else {
+		rows = rows.slice(0, limit);
+	}
+	const now = Date.now();
+	for (const row of rows) {
+		cdb.recordMemoryHit(row.id, now);
+		if (row.archived !== 0) maybeUnarchive(cdb, row, memoryConfig, now);
+	}
+	return rows;
+}
+
+/** Build the registered ctx_search tool (FTS5 + optional vec/RRF/rerank). */
+export function createSearchTool(cdb, memoryConfig = DEFAULT_MEMORY_CONFIG, retrieval = {}) {
 	return defineTool({
 		name: "ctx_search",
 		description: [
@@ -186,14 +231,9 @@ export function createSearchTool(cdb, config = DEFAULT_MEMORY_CONFIG) {
 				return [{ type: "text", text }];
 			},
 		},
-		execute(args) {
+		async execute(args) {
 			const limit = typeof args.limit === "number" ? Math.max(1, Math.min(10, Math.floor(args.limit))) : 5;
-			const rows = cdb.ftsSearch(args.query, limit);
-			const now = Date.now();
-			for (const row of rows) {
-				cdb.recordMemoryHit(row.id, now);
-				if (row.archived !== 0) maybeUnarchive(cdb, row, config, now);
-			}
+			const rows = await searchMemories(cdb, memoryConfig, retrieval, args.query, limit);
 			return {
 				results: rows.map((row) => ({
 					id: row.id,

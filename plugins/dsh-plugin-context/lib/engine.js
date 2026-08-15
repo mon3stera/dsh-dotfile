@@ -24,6 +24,7 @@ import {
 	renderInjectionText,
 	selectInjectionMemories,
 } from "./memory.js";
+import { EmbeddingClient, RerankClient } from "./retrieval.js";
 
 const DEFAULT_GENERATE_THRESHOLD = 0.65;
 const DEFAULT_RETAIN_ROUNDS = 20;
@@ -39,6 +40,18 @@ const OWN_KEYS = new Set([
 	"injectBudgetTokens",
 	"archiveThreshold",
 	"halfLives",
+	"embeddingModel",
+	"embeddingBaseUrl",
+	"embeddingApiKeyEnv",
+	"embeddingDim",
+	"rerankModel",
+	"rerankBaseUrl",
+	"rerankApiKeyEnv",
+	"rerankTopN",
+	"rerankInputTopK",
+	"ftsTopK",
+	"vecTopK",
+	"rrfK",
 ]);
 
 /** Resolve the exact provider/model durably routed for the latest request. */
@@ -96,6 +109,18 @@ export class ContextEngine extends BasicCompactionEngine {
 			CONVENTIONS: z.number(),
 			PREFERENCES: z.number(),
 		}),
+		embeddingModel: z.string(),
+		embeddingBaseUrl: z.string(),
+		embeddingApiKeyEnv: z.string(),
+		embeddingDim: z.number().step(1).min(1),
+		rerankModel: z.string(),
+		rerankBaseUrl: z.string(),
+		rerankApiKeyEnv: z.string(),
+		rerankTopN: z.number().step(1).min(1),
+		rerankInputTopK: z.number().step(1).min(1),
+		ftsTopK: z.number().step(1).min(1),
+		vecTopK: z.number().step(1).min(1),
+		rrfK: z.number().step(1).min(1),
 	});
 
 	cdb;
@@ -123,6 +148,31 @@ export class ContextEngine extends BasicCompactionEngine {
 				injectBudgetTokens: own.injectBudgetTokens ?? DEFAULT_MEMORY_CONFIG.injectBudgetTokens,
 				archiveThreshold: own.archiveThreshold ?? DEFAULT_MEMORY_CONFIG.archiveThreshold,
 				halfLives: { ...DEFAULT_MEMORY_CONFIG.halfLives, ...(own.halfLives ?? {}) },
+			},
+			retrievalConfig: {
+				ftsTopK: own.ftsTopK ?? 20,
+				vecTopK: own.vecTopK ?? 20,
+				rrfK: own.rrfK ?? 60,
+				rerankTopN: own.rerankTopN ?? 5,
+				rerankInputTopK: own.rerankInputTopK ?? 20,
+				embedding: typeof own.embeddingModel === "string" && own.embeddingModel.length > 0 && typeof own.embeddingBaseUrl === "string" && own.embeddingBaseUrl.length > 0
+					? new EmbeddingClient({
+						baseUrl: own.embeddingBaseUrl,
+						model: own.embeddingModel,
+						...(typeof own.embeddingApiKeyEnv === "string" && own.embeddingApiKeyEnv.length > 0
+							? { apiKey: process.env[own.embeddingApiKeyEnv] }
+							: {}),
+					})
+					: undefined,
+				rerank: typeof own.rerankModel === "string" && own.rerankModel.length > 0 && typeof own.rerankBaseUrl === "string" && own.rerankBaseUrl.length > 0
+					? new RerankClient({
+						baseUrl: own.rerankBaseUrl,
+						model: own.rerankModel,
+						...(typeof own.rerankApiKeyEnv === "string" && own.rerankApiKeyEnv.length > 0
+							? { apiKey: process.env[own.rerankApiKeyEnv] }
+							: {}),
+					})
+					: undefined,
 			},
 		};
 		this.cdb = openDatabase(resolveDshHome());
@@ -156,8 +206,8 @@ export class ContextEngine extends BasicCompactionEngine {
 
 	/** project_memory (Phase 5): tools, prompt section, injection refresh. */
 	_installMemorySystem(ctx) {
-		ctx.tools.register(createMemoryTool(this.cdb));
-		ctx.tools.register(createSearchTool(this.cdb, this.ownConfig.memoryConfig));
+		ctx.tools.register(createMemoryTool(this.cdb, this.ownConfig.retrievalConfig));
+		ctx.tools.register(createSearchTool(this.cdb, this.ownConfig.memoryConfig, this.ownConfig.retrievalConfig));
 		ctx.systemPrompt.section(MEMORY_SECTION);
 	}
 
