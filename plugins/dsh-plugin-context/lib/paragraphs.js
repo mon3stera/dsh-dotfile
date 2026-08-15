@@ -108,7 +108,10 @@ export function createParagraphAssigner(cdb, { skipToolNames = SKIP_TOOL_NAMES }
 			const calls = event.data.message.content.filter((block) => block.type === "tool-call");
 			if (calls.length > 0 && calls.every((call) => skipToolNames.has(call.name))) return;
 		} else if (event.type === "tool/result") {
-			const name = callNames.get(session)?.get(event.data.callId);
+			// The call id lives on the tool-result message's source, not on the
+			// event data root.
+			const callId = event.data.message?.source?.callId ?? event.data.callId;
+			const name = callNames.get(session)?.get(callId);
 			if (name !== undefined && skipToolNames.has(name)) return;
 		}
 		if (isSurfaceEvent(event)) cdb.assignParagraph(session.id, event.seq);
