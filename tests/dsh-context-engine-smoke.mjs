@@ -69,6 +69,7 @@ const check = (label, ok) => {
 			logger: { warn: () => {} },
 			on: (name, handler) => { stubs.push([name, handler]); },
 			systemPrompt: { section: () => {} },
+			tools: { register: () => {} },
 			reflect: { provide: () => () => {} },
 		};
 		const engine = new ContextEngine(fakeCtx, { generateThreshold: 0.7, retainRounds: 10, thresholdRatio: 0.8 });

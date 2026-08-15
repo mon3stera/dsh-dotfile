@@ -90,11 +90,11 @@ export class ContextEngine extends BasicCompactionEngine {
 		injectBudgetTokens: z.number().step(1).min(1),
 		archiveThreshold: z.number(),
 		halfLives: z.object({
-			ARCHITECTURE: z.number().nullable(),
-			CONSTRAINTS: z.number().nullable(),
-			ENVIRONMENT: z.number().nullable(),
-			CONVENTIONS: z.number().nullable(),
-			PREFERENCES: z.number().nullable(),
+			ARCHITECTURE: z.number(),
+			CONSTRAINTS: z.number(),
+			ENVIRONMENT: z.number(),
+			CONVENTIONS: z.number(),
+			PREFERENCES: z.number(),
 		}),
 	});
 
