@@ -36,7 +36,7 @@ window.__ModuleLoader__.load({
 			/* the button lives in the section header (left of the search slot); the slot's
 			 * own margin-left:auto is neutralized so this button's auto margin pushes the
 			 * whole right cluster (button + search + view options) to the edge */
-			`[class$="_searchSlot"]{margin-left:0}`,
+			`html [class$="_searchSlot"]{margin-left:0}`,
 			/* rail (collapsed) mode shows icons only; the workspace search slot is absent anyway */
 			`[class$="_rail"] .${BTN_ID}{display:none}`,
 			/* mask session-row titles with a placeholder (box size stays, so the

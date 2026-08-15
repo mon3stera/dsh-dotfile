@@ -100,7 +100,7 @@ const cssText = styleTags[0].textContent;
 if (!cssText.includes('content:"[MASKED]"') || !cssText.includes("::after")) throw new Error("FAIL: MASKED placeholder rule missing");
 if (/title\)\{display:none/.test(cssText)) throw new Error("FAIL: old display:none rule still present");
 if (!cssText.includes("margin-left:auto")) throw new Error("FAIL: auto margin missing");
-if (!cssText.includes('_searchSlot"]{margin-left:0}')) throw new Error("FAIL: slot margin neutralizer missing");
+if (!cssText.includes('html [class$="_searchSlot"]{margin-left:0}')) throw new Error("FAIL: slot margin neutralizer missing");
 if (cssText.includes(":has(")) throw new Error("FAIL: :has width games should be gone");
 if (!inserted || inserted.ref !== fakeSlot) throw new Error("FAIL: button not inserted before the search slot in the header");
 if (attrs["data-dsh-hide-titles"] !== "off") throw new Error("FAIL: initial attr: " + attrs["data-dsh-hide-titles"]);
