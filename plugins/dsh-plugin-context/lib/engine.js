@@ -89,7 +89,7 @@ function delay(ms, signal) {
 }
 
 export class ContextEngine extends BasicCompactionEngine {
-	static inject = ["llm", "tokenMeter", "sessions", "systemPrompt", "tools"];
+	static inject = ["llm", "tokenMeter", "sessions", "systemPrompt", "tools", "timer"];
 	static Config = z.object({
 		thresholdRatio: z.number(),
 		retainRatio: z.number(),
