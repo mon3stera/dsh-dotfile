@@ -22,9 +22,14 @@ const docEl = {
   removeAttribute(k) { delete attrs[k]; }
 };
 const styleTags = [];
-let inserted = null; // { btn, ref }
+
 const fakeSearchRoot = { isSearchRoot: true };
+let inserted = null;
+const fakeHeader = {
+  insertBefore(btn, ref) { inserted = { btn, ref }; }
+};
 const fakeSlot = {
+  parentElement: fakeHeader,
   querySelector(sel) { return sel.startsWith(":scope") ? fakeSearchRoot : null; },
   insertBefore(btn, ref) { inserted = { btn, ref }; }
 };
@@ -94,8 +99,10 @@ if (styleTags.length !== 1 || !styleTags[0].textContent.includes("_sessionRow"))
 const cssText = styleTags[0].textContent;
 if (!cssText.includes('content:"[MASKED]"') || !cssText.includes("::after")) throw new Error("FAIL: MASKED placeholder rule missing");
 if (/title\)\{display:none/.test(cssText)) throw new Error("FAIL: old display:none rule still present");
-if (!cssText.includes('_searchSlot"]:has') || !cssText.includes("max-width:60px") || !cssText.includes('_searchSlotExpanded"]:has')) throw new Error("FAIL: slot width fix missing");
-if (!inserted || inserted.ref !== fakeSearchRoot) throw new Error("FAIL: button not inserted before search root");
+if (!cssText.includes("margin-left:auto")) throw new Error("FAIL: auto margin missing");
+if (!cssText.includes('_searchSlot"]{margin-left:0}')) throw new Error("FAIL: slot margin neutralizer missing");
+if (cssText.includes(":has(")) throw new Error("FAIL: :has width games should be gone");
+if (!inserted || inserted.ref !== fakeSlot) throw new Error("FAIL: button not inserted before the search slot in the header");
 if (attrs["data-dsh-hide-titles"] !== "off") throw new Error("FAIL: initial attr: " + attrs["data-dsh-hide-titles"]);
 const btn = inserted.btn;
 if (btn.attrs["aria-pressed"] !== "false") throw new Error("FAIL: initial aria-pressed: " + JSON.stringify(btn.attrs));

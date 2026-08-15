@@ -29,15 +29,14 @@ window.__ModuleLoader__.load({
 		const EYE_OFF_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
 
 		const PLUGIN_CSS = [
-			`.${BTN_ID}{box-sizing:border-box;flex:none;width:28px;height:28px;color:inherit;background:transparent;border:none;border-radius:8px;padding:0;display:inline-flex;align-items:center;justify-content:center;cursor:pointer}`,
+			`.${BTN_ID}{box-sizing:border-box;flex:none;width:28px;height:28px;color:inherit;background:transparent;border:none;border-radius:8px;padding:0;margin-left:auto;margin-right:4px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer}`,
 			`.${BTN_ID}:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
 			`.${BTN_ID} svg{width:14px;height:14px}`,
 			`.${BTN_ID}[data-active="true"]{color:var(--dsw-alias-state-business-primary)}`,
-			/* the search slot caps its collapsed width at 28px (one button); when the
-			 * toggle is present it needs room for both buttons, and the expanded state
-			 * must keep its full width (rules ordered: expanded wins at equal specificity) */
-			`[class$="_searchSlot"]:has(.){max-width:60px}`,
-			`[class$="_searchSlotExpanded"]:has(.){max-width:100%}`,
+			/* the button lives in the section header (left of the search slot); the slot's
+			 * own margin-left:auto is neutralized so this button's auto margin pushes the
+			 * whole right cluster (button + search + view options) to the edge */
+			`[class$="_searchSlot"]{margin-left:0}`,
 			/* rail (collapsed) mode shows icons only; the workspace search slot is absent anyway */
 			`[class$="_rail"] .${BTN_ID}{display:none}`,
 			/* mask session-row titles with a placeholder (box size stays, so the
@@ -96,20 +95,20 @@ window.__ModuleLoader__.load({
 				scheduleSave();
 			};
 
-			/** Insert the toggle button left of the search root inside the search slot. */
+			/** Insert the toggle button into the section header, left of the search slot. */
 			const injectButton = () => {
 				if (button) return true;
 				const slot = document.querySelector('[class$="_searchSlot"]');
 				if (!slot) return false;
-				const searchRoot = slot.querySelector(':scope > [class$="_search"]');
-				if (!searchRoot) return false;
+				const header = slot.parentElement;
+				if (!header) return false;
 				const btn = document.createElement("button");
 				btn.type = "button";
 				btn.id = BTN_ID;
 				btn.className = BTN_ID;
 				btn.setAttribute("aria-label", "Toggle session titles");
 				btn.addEventListener("click", toggle);
-				slot.insertBefore(btn, searchRoot);
+				header.insertBefore(btn, slot);
 				button = btn;
 				syncButton();
 				return true;
@@ -119,7 +118,12 @@ window.__ModuleLoader__.load({
 			const ensureObserver = () => {
 				if (observer || typeof MutationObserver === "undefined") return;
 				observer = new MutationObserver(() => {
-					if (!button) injectButton();
+					const slot = document.querySelector('[class$="_searchSlot"]');
+					if (slot && !button) injectButton();
+					else if (!slot && button) {
+						button.remove();
+						button = null;
+					}
 				});
 				observer.observe(document.body, { childList: true, subtree: true });
 			};
