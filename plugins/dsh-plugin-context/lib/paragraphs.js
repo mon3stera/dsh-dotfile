@@ -39,9 +39,28 @@ export function injectParagraphNo(message, no) {
 	return { ...message, content: prefixFirstText(message.content, no) };
 }
 
-/** True when a message carries tool blocks (assistant tool calls or tool results). */
-function carriesToolBlocks(message) {
-	return message.content.some((block) => block.type === "tool-call" || block.type === "tool-result");
+/**
+ * Rebuild a tool-result message with the paragraph number INSIDE the
+ * tool-result block's own content (the text the model reads), leaving the
+ * message's top-level content a pure `[tool-result]` array. The DeepSeek
+ * adapter expands such a message into a single `{role: "tool"}` wire message
+ * (any text is legal there), so the number stays visible to the model without
+ * ever inserting a stray user message between a tool call and its reply.
+ * Blocks without a text block get the prefix prepended to their content.
+ */
+export function injectToolResultParagraph(message, no) {
+	return {
+		...message,
+		content: message.content.map((block) => {
+			if (block.type !== "tool-result") return block;
+			return { ...block, content: prefixFirstText(block.content, no) };
+		}),
+	};
+}
+
+/** True when a message carries an assistant tool-call block (no content slot). */
+function carriesToolCalls(message) {
+	return message.content.some((block) => block.type === "tool-call");
 }
 
 /**
@@ -55,13 +74,13 @@ function carriesToolBlocks(message) {
  * `session.deriveMessages()`) satisfied: both the request assembly and the
  * invariant check go through this same wrapper.
  *
- * Messages that carry tool blocks KEEP their paragraph number (they can be
- * referenced by ctx_reduce) but never receive the §N§ prefix: the DeepSeek
- * adapter requires assistant tool-call messages to have empty content, and
- * expands a tool-result message into standalone `{role: "tool"}` wire
- * messages — a prefixed text block would make the assistant content
- * non-empty or insert a stray user message between the tool call and its
- * reply, which the provider rejects (INVALID_REQUEST 400).
+ * Messages that carry tool blocks keep their paragraph number (they can be
+ * referenced by ctx_reduce) but are never prefixed at the top level:
+ * assistant tool-call messages have no content slot at all (DeepSeek
+ * requires empty content on tool_calls messages), and tool-result messages
+ * carry their number INSIDE the tool-result block's content, so the adapter
+ * still expands them into standalone `{role: "tool"}` wire messages with no
+ * stray user message inserted between a tool call and its reply.
  * @param session - the session whose method is wrapped.
  * @param cdb - context database supplying paragraph numbers.
  * @param opts - { extraMessage: () => Message | null } head message (e.g. the
@@ -85,8 +104,12 @@ export function installParagraphInjector(session, cdb, opts = {}) {
 			const msg = session.deriveEventMessage(session.events[seq]);
 			if (!msg) continue;
 			const no = cdb.paragraphFor(session.id, seq);
-			if (no === undefined || carriesToolBlocks(msg)) {
+			if (no === undefined) {
 				cache.push(msg);
+			} else if (msg.content.some((block) => block.type === "tool-result")) {
+				cache.push(injectToolResultParagraph(msg, no));
+			} else if (carriesToolCalls(msg)) {
+				cache.push(msg); // numbered, but no display slot
 			} else {
 				cache.push(injectParagraphNo(msg, no));
 			}

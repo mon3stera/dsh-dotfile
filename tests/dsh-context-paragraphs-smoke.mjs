@@ -4,6 +4,7 @@
 import {
 	prefixFirstText,
 	injectParagraphNo,
+	injectToolResultParagraph,
 	installParagraphInjector,
 	createParagraphAssigner,
 } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/paragraphs.js";
@@ -90,7 +91,20 @@ const check = (label, ok) => {
 	check("injector passthrough for unnumbered", fourth.length === 3 && fourth[2].content[0].text === "msg9");
 }
 
-// ── injector: tool-carrying messages keep the number but never the prefix ──
+// ── injectToolResultParagraph: number goes INSIDE the tool-result block ────
+{
+	const msg = {
+		role: "user",
+		content: [{ type: "tool-result", toolCallId: "c1", content: [{ type: "text", text: "out" }], isError: false }],
+	};
+	const out = injectToolResultParagraph(msg, 7);
+	check("tool-result keeps block shape", out.content[0].type === "tool-result");
+	check("number lands inside the block content", out.content[0].content[0].text === "\u00A77\u00A7 out");
+	check("top level stays pure tool-result", out.content.every((b) => b.type !== "text"));
+	check("input untouched", msg.content[0].content[0].text === "out");
+}
+
+// ── injector: text prefixed, tool results numbered inside, calls kept bare ──
 {
 	const paras = new Map([["s1,1", 1], ["s1,2", 2], ["s1,3", 3]]);
 	const cdb = { paragraphFor: (sid, seq) => paras.get(`${sid},${seq}`) };
@@ -112,9 +126,15 @@ const check = (label, ok) => {
 	installParagraphInjector(session, cdb);
 	const out = session.deriveMessages();
 	check("text message still prefixed", out[0].content[0].text === "\u00A71\u00A7 hi");
-	check("assistant tool-call message never prefixed", out[1].content[0].type === "tool-call" && out[1].content.every((b) => b.type !== "text"));
-	check("tool-result message never prefixed", out[2].content[0].type === "tool-result" && out[2].content.every((b) => b.type !== "text"));
+	check("assistant tool-call message stays bare", out[1].content[0].type === "tool-call" && out[1].content.every((b) => b.type !== "text"));
+	check("tool-result top level pure", out[2].content[0].type === "tool-result" && out[2].content.every((b) => b.type !== "text"));
+	check("tool-result carries number inside", out[2].content[0].content[0].text === "\u00A73\u00A7 out");
 	check("tool-carrying messages keep their numbers", paras.get("s1,2") === 2 && paras.get("s1,3") === 3);
+	// wire-level regression: the adapter expansion of the tool-result message
+	// must produce exactly ONE {role: "tool"} message, no stray user message
+	const toolResults = out[2].content.filter((b) => b.type === "tool-result");
+	const text = out[2].content.filter((b) => b.type === "text").map((b) => b.text).join("");
+	check("adapter expansion: no stray user message", text.length === 0 && toolResults.length === 1);
 }
 
 if (failed > 0) {
