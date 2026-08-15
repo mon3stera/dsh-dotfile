@@ -35,8 +35,10 @@ window.__ModuleLoader__.load({
 			`.${BTN_ID}[data-active="true"]{color:var(--dsw-alias-state-business-primary)}`,
 			/* rail (collapsed) mode shows icons only; the workspace search slot is absent anyway */
 			`[class$="_rail"] .${BTN_ID}{display:none}`,
-			/* hide session-row titles (class suffixes are stable across builds) */
-			`[${TITLE_ATTR}="on"] [class$="_sessionRow"] [class$="_title"]{display:none}`
+			/* mask session-row titles with a placeholder (box size stays, so the
+			 * row and its meta stay aligned; class suffixes are stable across builds) */
+			`[${TITLE_ATTR}="on"] [class$="_sessionRow"] [class$="_title"]{visibility:hidden;position:relative}`,
+			`[${TITLE_ATTR}="on"] [class$="_sessionRow"] [class$="_title"]::after{content:"[MASKED]";visibility:visible;position:absolute;inset:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}`
 		].join("\n");
 
 		function injectCss() {

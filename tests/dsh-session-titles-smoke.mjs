@@ -91,6 +91,9 @@ const ctx = {
 // apply: button inserted left of the search root, attribute off
 clientExports.apply(ctx);
 if (styleTags.length !== 1 || !styleTags[0].textContent.includes("_sessionRow")) throw new Error("FAIL: css not injected");
+const cssText = styleTags[0].textContent;
+if (!cssText.includes('content:"[MASKED]"') || !cssText.includes("::after")) throw new Error("FAIL: MASKED placeholder rule missing");
+if (/title\)\{display:none/.test(cssText)) throw new Error("FAIL: old display:none rule still present");
 if (!inserted || inserted.ref !== fakeSearchRoot) throw new Error("FAIL: button not inserted before search root");
 if (attrs["data-dsh-hide-titles"] !== "off") throw new Error("FAIL: initial attr: " + attrs["data-dsh-hide-titles"]);
 const btn = inserted.btn;
