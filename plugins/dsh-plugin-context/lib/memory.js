@@ -156,11 +156,22 @@ export function createMemoryTool(cdb, retrieval = {}) {
 
 const MAX_CONTENT_CHARS = 4000;
 
+/** Retrieval defaults when no embedding/rerank configuration is present. */
+export const DEFAULT_RETRIEVAL = {
+	ftsTopK: 20,
+	vecTopK: 20,
+	rrfK: 60,
+	rerankTopN: 5,
+	rerankInputTopK: 20,
+	embedding: undefined,
+	rerank: undefined,
+};
+
 /**
  * Hybrid memory search: FTS5 top-K (+ optional vector top-K fused with RRF),
  * optional rerank to rerankTopN, hits recorded on the returned rows.
  */
-export async function searchMemories(cdb, memoryConfig, retrieval, query, limit) {
+export async function searchMemories(cdb, memoryConfig, retrieval = DEFAULT_RETRIEVAL, query, limit) {
 	const fts = cdb.ftsSearch(query, retrieval.ftsTopK);
 	let ranked = fts.map((row) => row.id);
 	if (retrieval.embedding !== undefined && cdb.vecEnabled) {
@@ -193,7 +204,7 @@ export async function searchMemories(cdb, memoryConfig, retrieval, query, limit)
 }
 
 /** Build the registered ctx_search tool (FTS5 + optional vec/RRF/rerank). */
-export function createSearchTool(cdb, memoryConfig = DEFAULT_MEMORY_CONFIG, retrieval = {}) {
+export function createSearchTool(cdb, memoryConfig = DEFAULT_MEMORY_CONFIG, retrieval = DEFAULT_RETRIEVAL) {
 	return defineTool({
 		name: "ctx_search",
 		description: [
