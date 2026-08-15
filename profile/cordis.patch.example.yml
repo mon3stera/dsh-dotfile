@@ -1,0 +1,9 @@
+# Example loader patch for the DSH web profile.
+# Copy the insert entries below into ~/.dsh/profiles/web/cordis.patch.yml
+# (or your profile's cordis.patch.yml) and place the plugin packages under
+# ~/.dsh/profiles/node_modules/. A process restart picks them up.
+- insert:
+    - id: dsh-plugin-background
+      name: dsh-plugin-background
+    - id: dsh-plugin-font
+      name: dsh-plugin-font
