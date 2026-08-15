@@ -7,3 +7,5 @@
       name: dsh-plugin-background
     - id: dsh-plugin-font
       name: dsh-plugin-font
+    - id: dsh-plugin-hide-session-titles
+      name: dsh-plugin-hide-session-titles
