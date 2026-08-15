@@ -14,6 +14,7 @@ import { selectCompartmentRange } from "./range.js";
 import { landCompartment } from "./landing.js";
 import { summarizeCompartment } from "./summarizer.js";
 import { createParagraphAssigner, installParagraphInjector, PARAGRAPH_SECTION } from "./paragraphs.js";
+import { createReduceTool } from "./tools.js";
 
 const DEFAULT_GENERATE_THRESHOLD = 0.65;
 const DEFAULT_RETAIN_ROUNDS = 20;
@@ -40,7 +41,7 @@ function delay(ms, signal) {
 }
 
 export class ContextEngine extends BasicCompactionEngine {
-	static inject = ["llm", "tokenMeter", "sessions", "systemPrompt"];
+	static inject = ["llm", "tokenMeter", "sessions", "systemPrompt", "tools"];
 	static Config = z.object({
 		thresholdRatio: z.number(),
 		retainRatio: z.number(),
@@ -105,6 +106,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			installParagraphInjector(session, this.cdb);
 		});
 		ctx.systemPrompt.section(PARAGRAPH_SECTION);
+		ctx.tools.register(createReduceTool(this.cdb));
 	}
 
 	_registerTriggers(ctx) {
