@@ -40,7 +40,8 @@ export function injectParagraphNo(message, no) {
 }
 
 /**
- * Wrap `session.deriveMessages` with paragraph injection.
+ * Wrap `session.deriveMessages` with paragraph injection (and an optional
+ * extra head message, used by the memory injector).
  *
  * Mirrors the original incremental cache (keyed by replace generation), but
  * rebuilds every message object so the shared frozen event data is never
@@ -50,8 +51,11 @@ export function injectParagraphNo(message, no) {
  * invariant check go through this same wrapper.
  * @param session - the session whose method is wrapped.
  * @param cdb - context database supplying paragraph numbers.
+ * @param opts - { extraMessage: () => Message | null } head message (e.g. the
+ * cached <project_memory> block), evaluated per call, inserted first.
  */
-export function installParagraphInjector(session, cdb) {
+export function installParagraphInjector(session, cdb, opts = {}) {
+	const { extraMessage } = opts;
 	let cacheGen = -1;
 	let cacheNodes = 0;
 	const cache = [];
@@ -71,6 +75,8 @@ export function installParagraphInjector(session, cdb) {
 			cache.push(no === undefined ? msg : injectParagraphNo(msg, no));
 		}
 		cacheNodes = nodes.length;
+		const head = extraMessage === undefined ? null : extraMessage();
+		if (head !== null) return [head, ...cache];
 		return [...cache];
 	};
 }

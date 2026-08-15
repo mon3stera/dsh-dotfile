@@ -252,6 +252,12 @@ export class ContextDb {
 		return this.db.prepare("SELECT * FROM memories WHERE id = ?").get(id);
 	}
 
+	/** Physically delete one memory (ctx_memory delete; FTS trigger cleans up). */
+	deleteMemory(id) {
+		this.removeEmbedding(id);
+		this.db.prepare("DELETE FROM memories WHERE id = ?").run(id);
+	}
+
 	/** Memories needing Dreamer verification: never verified, or older than the cycle. */
 	memoriesNeedingVerification(now, verifyIntervalDays) {
 		const cutoff = now - verifyIntervalDays * 86400e3;

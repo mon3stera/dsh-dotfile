@@ -15,13 +15,31 @@ import { landCompartment } from "./landing.js";
 import { summarizeCompartment } from "./summarizer.js";
 import { createParagraphAssigner, installParagraphInjector, PARAGRAPH_SECTION } from "./paragraphs.js";
 import { createReduceTool } from "./tools.js";
+import {
+	DEFAULT_MEMORY_CONFIG,
+	MEMORY_SECTION,
+	createMemoryTool,
+	createSearchTool,
+	recordInjectionHit,
+	renderInjectionText,
+	selectInjectionMemories,
+} from "./memory.js";
 
 const DEFAULT_GENERATE_THRESHOLD = 0.65;
 const DEFAULT_RETAIN_ROUNDS = 20;
 const DEFAULT_WAIT_READY_TIMEOUT_MS = 60000;
 
 /** Keys ContextEngine owns; everything else goes to the basic engine config. */
-const OWN_KEYS = new Set(["generateThreshold", "retainRounds", "waitReadyTimeoutMs"]);
+const OWN_KEYS = new Set([
+	"generateThreshold",
+	"retainRounds",
+	"waitReadyTimeoutMs",
+	"alpha",
+	"beta",
+	"injectBudgetTokens",
+	"archiveThreshold",
+	"halfLives",
+]);
 
 /** Resolve the exact provider/model durably routed for the latest request. */
 function routedTarget(session) {
@@ -67,6 +85,17 @@ export class ContextEngine extends BasicCompactionEngine {
 		generateThreshold: z.number(),
 		retainRounds: z.number().step(1).min(1),
 		waitReadyTimeoutMs: z.number().step(1).min(0),
+		alpha: z.number(),
+		beta: z.number(),
+		injectBudgetTokens: z.number().step(1).min(1),
+		archiveThreshold: z.number(),
+		halfLives: z.object({
+			ARCHITECTURE: z.number().nullable(),
+			CONSTRAINTS: z.number().nullable(),
+			ENVIRONMENT: z.number().nullable(),
+			CONVENTIONS: z.number().nullable(),
+			PREFERENCES: z.number().nullable(),
+		}),
 	});
 
 	cdb;
@@ -74,6 +103,7 @@ export class ContextEngine extends BasicCompactionEngine {
 	agentBySession = new WeakMap();
 	inFlight = new Map(); // sessionId -> Promise
 	overflowRetries = new WeakMap();
+	injection = new WeakMap(); // session -> { text }
 
 	constructor(ctx, config = {}) {
 		const own = {};
@@ -87,10 +117,18 @@ export class ContextEngine extends BasicCompactionEngine {
 			generateThreshold: own.generateThreshold ?? DEFAULT_GENERATE_THRESHOLD,
 			retainRounds: own.retainRounds ?? DEFAULT_RETAIN_ROUNDS,
 			waitReadyTimeoutMs: own.waitReadyTimeoutMs ?? DEFAULT_WAIT_READY_TIMEOUT_MS,
+			memoryConfig: {
+				alpha: own.alpha ?? DEFAULT_MEMORY_CONFIG.alpha,
+				beta: own.beta ?? DEFAULT_MEMORY_CONFIG.beta,
+				injectBudgetTokens: own.injectBudgetTokens ?? DEFAULT_MEMORY_CONFIG.injectBudgetTokens,
+				archiveThreshold: own.archiveThreshold ?? DEFAULT_MEMORY_CONFIG.archiveThreshold,
+				halfLives: { ...DEFAULT_MEMORY_CONFIG.halfLives, ...(own.halfLives ?? {}) },
+			},
 		};
 		this.cdb = openDatabase(resolveDshHome());
 		ctx.effect(() => () => this.cdb.close(), "dsh-plugin-context db");
 		this._installParagraphSystem(ctx);
+		this._installMemorySystem(ctx);
 		this._registerTriggers(ctx);
 	}
 
@@ -103,10 +141,33 @@ export class ContextEngine extends BasicCompactionEngine {
 			const session = agent.session;
 			if (wrapped.has(session)) return;
 			wrapped.add(session);
-			installParagraphInjector(session, this.cdb);
+			this.refreshInjection(session); // new conversation: inject memories
+			installParagraphInjector(session, this.cdb, {
+				extraMessage: () => {
+					const inj = this.injection.get(session);
+					if (inj === undefined || inj.text.length === 0) return null;
+					return { role: "user", content: [{ type: "text", text: inj.text }] };
+				},
+			});
 		});
 		ctx.systemPrompt.section(PARAGRAPH_SECTION);
 		ctx.tools.register(createReduceTool(this.cdb));
+	}
+
+	/** project_memory (Phase 5): tools, prompt section, injection refresh. */
+	_installMemorySystem(ctx) {
+		ctx.tools.register(createMemoryTool(this.cdb));
+		ctx.tools.register(createSearchTool(this.cdb, this.ownConfig.memoryConfig));
+		ctx.systemPrompt.section(MEMORY_SECTION);
+	}
+
+	/** Re-select and cache the <project_memory> injection block for one session. */
+	refreshInjection(session) {
+		const selected = selectInjectionMemories(this.cdb, this.ownConfig.memoryConfig);
+		const text = renderInjectionText(selected);
+		for (const memory of selected) recordInjectionHit(this.cdb, memory, this.ownConfig.memoryConfig);
+		this.injection.set(session, { text });
+		return text;
 	}
 
 	_registerTriggers(ctx) {
@@ -232,6 +293,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			compartment,
 			{ owner: "current-turn", signal },
 		);
+		this.refreshInjection(agent.session); // landing: re-select memories
 	}
 
 	/** Overflow / manual fallback: land a ready compartment or generate synchronously. */
