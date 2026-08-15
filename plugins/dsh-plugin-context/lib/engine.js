@@ -8,7 +8,7 @@ import z from "@deepseek-ai/schemastery";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 import { BasicCompactionEngine } from "@deepseek-ai/dsh-compaction-basic";
 import { ManualCompactionError } from "@deepseek-ai/dsh-compaction";
-import { CONTEXT_WINDOW_EXCEEDED_CODE } from "@deepseek-ai/dsh-llm";
+import { CONTEXT_WINDOW_EXCEEDED_CODE, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { openDatabase } from "./db.js";
 import { selectCompartmentRange } from "./range.js";
 import { landCompartment } from "./landing.js";
@@ -20,15 +20,23 @@ import {
 	MEMORY_SECTION,
 	createMemoryTool,
 	createSearchTool,
+	estimateTokens,
 	recordInjectionHit,
 	renderInjectionText,
 	selectInjectionMemories,
 } from "./memory.js";
 import { EmbeddingClient, RerankClient } from "./retrieval.js";
+import { runArchival, runDreamer } from "./dreamer.js";
 
 const DEFAULT_GENERATE_THRESHOLD = 0.65;
 const DEFAULT_RETAIN_ROUNDS = 20;
 const DEFAULT_WAIT_READY_TIMEOUT_MS = 60000;
+const DEFAULT_DREAMER_IDLE_MINUTES = 15;
+const DEFAULT_DREAMER_INTERVAL_HOURS = 24;
+const DEFAULT_DREAMER_MAX_ROUNDS = 20;
+const DEFAULT_DREAMER_TIMEOUT_MS = 600000;
+const DEFAULT_VERIFY_INTERVAL_DAYS = 30;
+const DEFAULT_COMPARTMENT_BUDGET_TOKENS = 40000;
 
 /** Keys ContextEngine owns; everything else goes to the basic engine config. */
 const OWN_KEYS = new Set([
@@ -52,6 +60,15 @@ const OWN_KEYS = new Set([
 	"ftsTopK",
 	"vecTopK",
 	"rrfK",
+	"dreamerIdleMinutes",
+	"dreamerIntervalHours",
+	"dreamerMaxRounds",
+	"dreamerTimeoutMs",
+	"verifyIntervalDays",
+	"compartmentBudgetTokens",
+	"dreamerWorkspaceRoot",
+	"dreamerProvider",
+	"dreamerModel",
 ]);
 
 /** Resolve the exact provider/model durably routed for the latest request. */
@@ -121,6 +138,15 @@ export class ContextEngine extends BasicCompactionEngine {
 		ftsTopK: z.number().step(1).min(1),
 		vecTopK: z.number().step(1).min(1),
 		rrfK: z.number().step(1).min(1),
+		dreamerIdleMinutes: z.number().step(1).min(1),
+		dreamerIntervalHours: z.number().step(1).min(1),
+		dreamerMaxRounds: z.number().step(1).min(1),
+		dreamerTimeoutMs: z.number().step(1).min(1000),
+		verifyIntervalDays: z.number().step(1).min(1),
+		compartmentBudgetTokens: z.number().step(1).min(1),
+		dreamerWorkspaceRoot: z.string(),
+		dreamerProvider: z.string(),
+		dreamerModel: z.string(),
 	});
 
 	cdb;
@@ -129,6 +155,8 @@ export class ContextEngine extends BasicCompactionEngine {
 	inFlight = new Map(); // sessionId -> Promise
 	overflowRetries = new WeakMap();
 	injection = new WeakMap(); // session -> { text }
+	idleTimers = new WeakMap(); // session -> timer
+	dreamerBusy = false;
 
 	constructor(ctx, config = {}) {
 		const own = {};
@@ -173,6 +201,17 @@ export class ContextEngine extends BasicCompactionEngine {
 							: {}),
 					})
 					: undefined,
+			},
+			dreamerConfig: {
+				idleMinutes: own.dreamerIdleMinutes ?? DEFAULT_DREAMER_IDLE_MINUTES,
+				intervalHours: own.dreamerIntervalHours ?? DEFAULT_DREAMER_INTERVAL_HOURS,
+				maxRounds: own.dreamerMaxRounds ?? DEFAULT_DREAMER_MAX_ROUNDS,
+				timeoutMs: own.dreamerTimeoutMs ?? DEFAULT_DREAMER_TIMEOUT_MS,
+				verifyIntervalDays: own.verifyIntervalDays ?? DEFAULT_VERIFY_INTERVAL_DAYS,
+				compartmentBudgetTokens: own.compartmentBudgetTokens ?? DEFAULT_COMPARTMENT_BUDGET_TOKENS,
+				workspaceRoot: own.dreamerWorkspaceRoot ?? "",
+				provider: own.dreamerProvider ?? "",
+				model: own.dreamerModel ?? "",
 			},
 		};
 		this.cdb = openDatabase(resolveDshHome());
@@ -230,10 +269,34 @@ export class ContextEngine extends BasicCompactionEngine {
 				ctx.logger.warn(`compartment generation failed: ${error instanceof Error ? error.message : String(error)}`);
 			});
 		});
+		// Dreamer idle trigger: any session activity resets a per-session timer.
+		ctx.on("session/event", (session) => {
+			const existing = this.idleTimers.get(session);
+			if (existing !== undefined) {
+				clearTimeout(existing);
+				this.idleTimers.delete(session);
+			}
+			const timer = setTimeout(() => {
+				this.idleTimers.delete(session);
+				const agent = this.agentBySession.get(session);
+				if (agent === undefined) return;
+				this._runDreamerForAgent(agent).catch((error) => {
+					ctx.logger.warn(`dreamer run failed: ${error instanceof Error ? error.message : String(error)}`);
+				});
+			}, this.ownConfig.dreamerConfig.idleMinutes * 60 * 1000);
+			this.idleTimers.set(session, timer);
+		});
+		// Dreamer periodic trigger (24h default).
+		ctx.setInterval(() => {
+			this._runDreamerGlobal().catch((error) => {
+				ctx.logger.warn(`periodic dreamer run failed: ${error instanceof Error ? error.message : String(error)}`);
+			});
+		}, this.ownConfig.dreamerConfig.intervalHours * 3600 * 1000);
 		// 80%: land a ready compartment before the next step.
 		ctx.on("agent/pre-step", async ({ agent, signal }, next) => {
 			if (!signal.aborted) {
 				try {
+					await this._removeArchivedCheckpoints(agent);
 					await this.maybeLand(agent, signal);
 				} catch (error) {
 					ctx.logger.warn(`compartment landing failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -344,6 +407,71 @@ export class ContextEngine extends BasicCompactionEngine {
 			{ owner: "current-turn", signal },
 		);
 		this.refreshInjection(agent.session); // landing: re-select memories
+	}
+
+	/** Remove archived checkpoint nodes from the surface (compaction/prune protocol). */
+	async _removeArchivedCheckpoints(agent) {
+		const session = agent.session;
+		const archived = this.cdb.archivedCompartments(session.id);
+		if (archived.length === 0) return;
+		const nodes = session.surface.nodes;
+		for (const compartment of archived) {
+			const seq = compartment.landing_seq;
+			if (seq === undefined || !nodes.includes(seq)) {
+				this.cdb.markCompartmentRemoved(compartment.id);
+				continue;
+			}
+			const event = session.events[seq];
+			const tokenCount = event?.data?.content === undefined ? 0 : estimateTokens(JSON.stringify(event.data.content));
+			session.append("compaction/prune", {
+				shadowedRange: { start: seq, end: seq },
+				shadowedSeqs: [seq],
+				shadowedTokenCount: tokenCount,
+			});
+			session.append("user/message", createUserMessage({ content: [{ type: "text", text: "" }] }), {
+				surfaceOp: { op: "replace", start: seq, end: seq },
+				sourceEventSeqs: [seq],
+			});
+			this.cdb.markCompartmentRemoved(compartment.id);
+		}
+	}
+
+	/** Run one Dreamer pass for a session's agent (single-flight). */
+	async _runDreamerForAgent(agent) {
+		const dreamer = this.ownConfig.dreamerConfig;
+		const target = dreamer.provider.length > 0 && dreamer.model.length > 0
+			? { provider: dreamer.provider, model: dreamer.model }
+			: routedTarget(agent.session);
+		if (target === undefined) return { skipped: true, reason: "no route" };
+		if (this.dreamerBusy) return { skipped: true, reason: "busy" };
+		this.dreamerBusy = true;
+		try {
+			const result = await runDreamer(this.ctx, this.cdb, {
+				agent,
+				provider: target.provider,
+				model: target.model,
+				workspaceRoot: dreamer.workspaceRoot,
+				maxRounds: dreamer.maxRounds,
+				timeoutMs: dreamer.timeoutMs,
+				verifyIntervalDays: dreamer.verifyIntervalDays,
+				retrieval: this.ownConfig.retrievalConfig,
+			});
+			runArchival(this.cdb, { budgetTokens: dreamer.compartmentBudgetTokens });
+			return result;
+		} finally {
+			this.dreamerBusy = false;
+		}
+	}
+
+	/** Periodic Dreamer pass over any agent that has material. */
+	async _runDreamerGlobal() {
+		for (const agent of this.agentBySession.values()) {
+			if (this.dreamerBusy) return;
+			const material = this.cdb.pendingFacts().length + this.cdb.memoriesNeedingVerification(Date.now(), this.ownConfig.dreamerConfig.verifyIntervalDays).length + this.cdb.unpromotedCompartments().length;
+			if (material === 0) return;
+			await this._runDreamerForAgent(agent);
+			return;
+		}
 	}
 
 	/** Overflow / manual fallback: land a ready compartment or generate synchronously. */

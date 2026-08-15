@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS compartments (
   shadowed_tokens INTEGER,
   provider     TEXT,
   model        TEXT,
+  landing_seq  INTEGER,
+  removed      INTEGER NOT NULL DEFAULT 0,
   UNIQUE (session_id, generation)
 );
 CREATE INDEX IF NOT EXISTS compartments_session ON compartments(session_id);
@@ -204,6 +206,13 @@ export class ContextDb {
 		return this.db.prepare("SELECT * FROM compartments WHERE status = 'landed' AND archived = 0 ORDER BY created_at").all();
 	}
 
+	/** Landed compartments whose facts Dreamer has not distilled yet. */
+	unpromotedCompartments() {
+		return this.db.prepare(
+			"SELECT * FROM compartments WHERE status = 'landed' AND has_promoted_facts = 0 ORDER BY created_at"
+		).all();
+	}
+
 	/** Archival candidates ordered by priority: promoted first, then low importance, then old. */
 	archivalCandidates() {
 		return this.db.prepare(
@@ -211,8 +220,20 @@ export class ContextDb {
 		).all();
 	}
 
-	markCompartmentLanded(id, landedAt = Date.now()) {
-		this.db.prepare("UPDATE compartments SET status = 'landed', landed_at = ? WHERE id = ?").run(landedAt, id);
+	markCompartmentLanded(id, landingSeq, landedAt = Date.now()) {
+		this.db.prepare("UPDATE compartments SET status = 'landed', landed_at = ?, landing_seq = COALESCE(?, landing_seq) WHERE id = ?")
+			.run(landedAt, landingSeq ?? null, id);
+	}
+
+	/** Archived compartments whose checkpoint node is still on the surface. */
+	archivedCompartments(sessionId) {
+		return this.db.prepare(
+			"SELECT * FROM compartments WHERE session_id = ? AND archived = 1 AND removed = 0 ORDER BY landing_seq"
+		).all(sessionId);
+	}
+
+	markCompartmentRemoved(id) {
+		this.db.prepare("UPDATE compartments SET removed = 1 WHERE id = ?").run(id);
 	}
 
 	flagCompartmentArchive(id, importance) {
@@ -366,6 +387,8 @@ function migrate(db) {
 		["shadowed_tokens", "ALTER TABLE compartments ADD COLUMN shadowed_tokens INTEGER"],
 		["provider", "ALTER TABLE compartments ADD COLUMN provider TEXT"],
 		["model", "ALTER TABLE compartments ADD COLUMN model TEXT"],
+		["landing_seq", "ALTER TABLE compartments ADD COLUMN landing_seq INTEGER"],
+		["removed", "ALTER TABLE compartments ADD COLUMN removed INTEGER NOT NULL DEFAULT 0"],
 	]) {
 		if (!compartmentCols.has(name)) db.exec(ddl);
 	}

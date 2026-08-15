@@ -156,14 +156,14 @@ export async function landCompartment(deps, compartment, opts) {
 			provider: compartment.provider ?? "",
 			model: compartment.model ?? "",
 		});
-		session.append("user/message", checkpointMessage, {
+		const replaceEvent = session.append("user/message", checkpointMessage, {
 			surfaceOp: { op: "replace", start: compartment.start_seq, end: compartment.end_seq },
 			sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...selection.shadowedSeqs],
 		});
 		closing = true;
 		const endEvent = session.append("compaction/end", lifecycle);
 		closed = true;
-		cdb.markCompartmentLanded(compartment.id);
+		cdb.markCompartmentLanded(compartment.id, replaceEvent.seq);
 		result = {
 			compactionId,
 			...(sourceCommandId === undefined ? {} : { sourceCommandId }),
