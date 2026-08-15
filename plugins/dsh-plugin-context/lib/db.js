@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS compartments (
   archive_flagged INTEGER NOT NULL DEFAULT 0,
   archived     INTEGER NOT NULL DEFAULT 0,
   archived_at  INTEGER,
+  shadowed_tokens INTEGER,
+  provider     TEXT,
+  model        TEXT,
   UNIQUE (session_id, generation)
 );
 CREATE INDEX IF NOT EXISTS compartments_session ON compartments(session_id);
@@ -158,11 +161,16 @@ export class ContextDb {
 
 	// ── compartments ────────────────────────────────────────────────────────
 
-	insertCompartment({ sessionId, generation, startSeq, endSeq, startPara, endPara, summary, memoryIds }) {
+	insertCompartment({ sessionId, generation, startSeq, endSeq, startPara, endPara, summary, memoryIds, shadowedTokens, provider, model }) {
 		const result = this.db.prepare(
-			"INSERT INTO compartments(session_id, generation, start_seq, end_seq, start_para, end_para, summary, memory_ids, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'generating', ?)"
-		).run(sessionId, generation, startSeq, endSeq, startPara, endPara, summary, memoryIds ?? null, Date.now());
+			"INSERT INTO compartments(session_id, generation, start_seq, end_seq, start_para, end_para, summary, memory_ids, status, created_at, shadowed_tokens, provider, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'generating', ?, ?, ?, ?)"
+		).run(sessionId, generation, startSeq, endSeq, startPara, endPara, summary, memoryIds ?? null, Date.now(), shadowedTokens ?? null, provider ?? null, model ?? null);
 		return Number(result.lastInsertRowid);
+	}
+
+	setCompartmentSummary(id, { summary, provider, model }) {
+		this.db.prepare("UPDATE compartments SET summary = ?, provider = ?, model = ?, status = 'ready' WHERE id = ?")
+			.run(summary, provider ?? null, model ?? null, id);
 	}
 
 	setCompartmentStatus(id, status) {
@@ -339,5 +347,20 @@ export function openDatabase(homeDir, opts = {}) {
 		// Vector path degrades to FTS5-only retrieval.
 	}
 	db.exec(SCHEMA.replaceAll("__EMBEDDING_DIM__", String(embeddingDim)));
+	migrate(db);
 	return new ContextDb(db, vecEnabled, embeddingDim);
+}
+
+/** Additive column migrations for databases created before a field existed. */
+function migrate(db) {
+	const compartmentCols = new Set(
+		db.prepare("PRAGMA table_info(compartments)").all().map((row) => row.name)
+	);
+	for (const [name, ddl] of [
+		["shadowed_tokens", "ALTER TABLE compartments ADD COLUMN shadowed_tokens INTEGER"],
+		["provider", "ALTER TABLE compartments ADD COLUMN provider TEXT"],
+		["model", "ALTER TABLE compartments ADD COLUMN model TEXT"],
+	]) {
+		if (!compartmentCols.has(name)) db.exec(ddl);
+	}
 }
