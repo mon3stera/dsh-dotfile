@@ -90,6 +90,33 @@ const check = (label, ok) => {
 	check("injector passthrough for unnumbered", fourth.length === 3 && fourth[2].content[0].text === "msg9");
 }
 
+// ── injector: tool-carrying messages keep the number but never the prefix ──
+{
+	const paras = new Map([["s1,1", 1], ["s1,2", 2], ["s1,3", 3]]);
+	const cdb = { paragraphFor: (sid, seq) => paras.get(`${sid},${seq}`) };
+	const nodes = [1, 2, 3];
+	const session = {
+		id: "s1",
+		surface: { nodes, replaceGeneration: 0 },
+		events: {
+			1: { seq: 1, type: "user/message" },
+			2: { seq: 2, type: "assistant/message" },
+			3: { seq: 3, type: "tool/result" },
+		},
+		deriveEventMessage: (event) => {
+			if (event.seq === 2) return { role: "assistant", content: [{ type: "tool-call", name: "bash", id: "c1", arguments: "{}" }] };
+			if (event.seq === 3) return { role: "user", content: [{ type: "tool-result", toolCallId: "c1", content: [{ type: "text", text: "out" }], isError: false }] };
+			return { role: "user", content: [{ type: "text", text: "hi" }] };
+		},
+	};
+	installParagraphInjector(session, cdb);
+	const out = session.deriveMessages();
+	check("text message still prefixed", out[0].content[0].text === "\u00A71\u00A7 hi");
+	check("assistant tool-call message never prefixed", out[1].content[0].type === "tool-call" && out[1].content.every((b) => b.type !== "text"));
+	check("tool-result message never prefixed", out[2].content[0].type === "tool-result" && out[2].content.every((b) => b.type !== "text"));
+	check("tool-carrying messages keep their numbers", paras.get("s1,2") === 2 && paras.get("s1,3") === 3);
+}
+
 if (failed > 0) {
 	console.error(`${failed} assertion(s) failed`);
 	process.exit(1);

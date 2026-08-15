@@ -39,6 +39,11 @@ export function injectParagraphNo(message, no) {
 	return { ...message, content: prefixFirstText(message.content, no) };
 }
 
+/** True when a message carries tool blocks (assistant tool calls or tool results). */
+function carriesToolBlocks(message) {
+	return message.content.some((block) => block.type === "tool-call" || block.type === "tool-result");
+}
+
 /**
  * Wrap `session.deriveMessages` with paragraph injection (and an optional
  * extra head message, used by the memory injector).
@@ -49,6 +54,14 @@ export function injectParagraphNo(message, no) {
  * `llm/stream` reconstruction invariant (JSON equality with
  * `session.deriveMessages()`) satisfied: both the request assembly and the
  * invariant check go through this same wrapper.
+ *
+ * Messages that carry tool blocks KEEP their paragraph number (they can be
+ * referenced by ctx_reduce) but never receive the §N§ prefix: the DeepSeek
+ * adapter requires assistant tool-call messages to have empty content, and
+ * expands a tool-result message into standalone `{role: "tool"}` wire
+ * messages — a prefixed text block would make the assistant content
+ * non-empty or insert a stray user message between the tool call and its
+ * reply, which the provider rejects (INVALID_REQUEST 400).
  * @param session - the session whose method is wrapped.
  * @param cdb - context database supplying paragraph numbers.
  * @param opts - { extraMessage: () => Message | null } head message (e.g. the
@@ -72,7 +85,11 @@ export function installParagraphInjector(session, cdb, opts = {}) {
 			const msg = session.deriveEventMessage(session.events[seq]);
 			if (!msg) continue;
 			const no = cdb.paragraphFor(session.id, seq);
-			cache.push(no === undefined ? msg : injectParagraphNo(msg, no));
+			if (no === undefined || carriesToolBlocks(msg)) {
+				cache.push(msg);
+			} else {
+				cache.push(injectParagraphNo(msg, no));
+			}
 		}
 		cacheNodes = nodes.length;
 		const head = extraMessage === undefined ? null : extraMessage();
