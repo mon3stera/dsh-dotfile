@@ -68,6 +68,7 @@ const check = (label, ok) => {
 			effect: () => () => {},
 			logger: { warn: () => {} },
 			on: (name, handler) => { stubs.push([name, handler]); },
+			setInterval: () => {},
 			systemPrompt: { section: () => {} },
 			tools: { register: () => {} },
 			reflect: { provide: () => () => {} },
