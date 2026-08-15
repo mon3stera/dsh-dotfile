@@ -7,7 +7,7 @@
 import z from "@deepseek-ai/schemastery";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 import { BasicCompactionEngine } from "@deepseek-ai/dsh-compaction-basic";
-import { ManualCompactionError } from "@deepseek-ai/dsh-compaction";
+import { isCompactCheckpointSource, ManualCompactionError } from "@deepseek-ai/dsh-compaction";
 import { CONTEXT_WINDOW_EXCEEDED_CODE, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { openDatabase } from "./db.js";
 import { selectCompartmentRange } from "./range.js";
@@ -78,14 +78,19 @@ function routedTarget(session) {
 	return { provider: config.provider, model: config.model };
 }
 
-function delay(ms, signal) {
-	return new Promise((resolve) => {
+function delay(ms, signal) {	return new Promise((resolve) => {
 		const timer = setTimeout(resolve, ms);
 		if (signal !== undefined) signal.addEventListener("abort", () => {
 			clearTimeout(timer);
 			resolve();
 		}, { once: true });
 	});
+}
+
+/** Join the text blocks of one message content value. */
+function extractText(content) {
+	if (!Array.isArray(content)) return "";
+	return content.filter((block) => block?.type === "text").map((block) => block.text ?? "").join("\n");
 }
 
 export class ContextEngine extends BasicCompactionEngine {
@@ -346,6 +351,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		const session = agent.session;
 		const id = session.id;
 		if (this.inFlight.has(id)) return;
+		this._registerUnownedCheckpoints(agent); // migrate legacy checkpoints once
 		if (this.cdb.readyCompartments(id).length > 0) return;
 		const contextWindow = await this._contextWindow(agent);
 		if (contextWindow === undefined) return;
@@ -379,6 +385,38 @@ export class ContextEngine extends BasicCompactionEngine {
 				this.inFlight.delete(id);
 			});
 		this.inFlight.set(id, promise);
+	}
+
+	/**
+	 * Migration: register checkpoint nodes produced by the LEGACY engine
+	 * (or by this engine before the compartments table existed) as landed
+	 * compartments, so they join the chain lifecycle (range selection skips
+	 * them, Dreamer can distill/mark them, archival can retire them).
+	 * Idempotent: already-registered seqs are left alone.
+	 */
+	_registerUnownedCheckpoints(agent) {
+		const session = agent.session;
+		const nodes = session.surface.nodes;
+		let seq = 0;
+		for (const node of nodes) {
+			const event = session.events[node];
+			if (event?.type !== "user/message" || event.data?.source === undefined || !isCompactCheckpointSource(event.data.source)) break;
+			seq = node;
+			if (this.cdb.compartmentByLandingSeq(session.id, seq) !== undefined) continue;
+			const text = extractText(event.data.content);
+			const id = this.cdb.insertCompartment({
+				sessionId: session.id,
+				generation: this.cdb.maxGeneration(session.id) + 1,
+				startSeq: seq,
+				endSeq: seq,
+				startPara: this.cdb.paragraphFor(session.id, seq) ?? 0,
+				endPara: this.cdb.paragraphFor(session.id, seq) ?? 0,
+				summary: text,
+				shadowedTokens: estimateTokens(JSON.stringify(event.data.content)),
+			});
+			this.cdb.markCompartmentLanded(id, seq);
+		}
+		return seq;
 	}
 
 	/** 80% trigger: land the oldest ready compartment (wait briefly if generating). */

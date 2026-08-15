@@ -39,7 +39,7 @@ const check = (label, ok) => {
 	// checkpointed surface: node 16 is a landed checkpoint (head), turns 4+5 follow.
 	const events2 = [...events];
 	events2.push({ type: "compaction/summary", seq: 15, time: 0, data: {} });
-	events2.push({ type: "user/message", seq: 16, time: 0, data: { content: [{ type: "text", text: "cp" }] }, surfaceOp: { op: "replace", start: 1, end: 13 } });
+	events2.push({ type: "user/message", seq: 16, time: 0, data: { content: [{ type: "text", text: "cp" }], source: { kind: "plugin", plugin: "compact", compactionId: "c1" } }, surfaceOp: { op: "replace", start: 1, end: 13 } });
 	const nodes2 = [16, 19, 22]; // checkpoint, t4 assistant, t5 assistant
 	events2.push({ type: "tool/call", seq: 17, time: 0, data: { callId: "x", name: "bash", arguments: "{}" } });
 	events2.push({ type: "step/start", seq: 18, time: 0, data: { turn: 4, step: 1 } });
@@ -49,10 +49,30 @@ const check = (label, ok) => {
 	events2.push({ type: "assistant/message", seq: 22, time: 0, data: { turn: 5, step: 1, message: { content: [] } }, surfaceOp: "append" });
 	events2.push({ type: "turn/end", seq: 23, time: 0, data: { turn: 5, reason: { kind: "completed" } } });
 	const session2 = { events: events2, surface: { nodes: nodes2, replaceGeneration: 1 } };
+	// the checkpoint itself is never re-summarizable: only t4 stays compressible
 	r = selectCompartmentRange(session2, { retainRounds: 2 });
-	check("checkpointed retain 2", r !== null && r.start === 16 && r.end === 16);
+	check("checkpointed retain 2 null", r === null);
+	r = selectCompartmentRange(session2, { retainRounds: 1 });
+	check("checkpointed retain 1 after checkpoint", r !== null && r.start === 19 && r.end === 19);
 	r = selectCompartmentRange(session2, { retainRounds: 5 });
 	check("checkpointed retain 5 null", r === null);
+
+	// chain surface [C1][C2]+content: BOTH head checkpoints are skipped, so the
+	// range starts at the first real content after the last checkpoint.
+	const events3 = events2.slice(0, 23); // seq 0..22, then the new generation
+	events3.push({ type: "compaction/summary", seq: 23, time: 0, data: {} });
+	events3.push({ type: "user/message", seq: 24, time: 0, data: { content: [{ type: "text", text: "cp2" }], source: { kind: "plugin", plugin: "compact", compactionId: "c2" } }, surfaceOp: { op: "replace", start: 19, end: 19 } });
+	events3.push({ type: "step/start", seq: 25, time: 0, data: { turn: 6, step: 1 } });
+	events3.push({ type: "assistant/message", seq: 26, time: 0, data: { turn: 6, step: 1, message: { content: [] } }, surfaceOp: "append" });
+	events3.push({ type: "tool/call", seq: 27, time: 0, data: { callId: "y", name: "read", arguments: "{}" } });
+	events3.push({ type: "step/start", seq: 28, time: 0, data: { turn: 7, step: 1 } });
+	events3.push({ type: "assistant/message", seq: 29, time: 0, data: { turn: 7, step: 1, message: { content: [] } }, surfaceOp: "append" });
+	events3.push({ type: "turn/end", seq: 30, time: 0, data: { turn: 7, reason: { kind: "completed" } } });
+	const session3 = { events: events3, surface: { nodes: [16, 24, 26, 29], replaceGeneration: 2 } };
+	r = selectCompartmentRange(session3, { retainRounds: 1 });
+	check("chain skips both checkpoints", r !== null && r.start === 26 && r.end === 26 && r.shadowedSeqs.join(",") === "26");
+	r = selectCompartmentRange(session3, { retainRounds: 0 });
+	check("chain retain 0 still skips checkpoints", r !== null && r.start === 26 && r.end === 29);
 }
 
 // ── landing transaction ─────────────────────────────────────────────────────

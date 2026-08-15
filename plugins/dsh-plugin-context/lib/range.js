@@ -5,7 +5,13 @@
 // `retainRounds` turns — the "recent N rounds kept verbatim" rule from the
 // design. Everything inside is summarized by the background summarizer; the
 // landing later replaces exactly this span and nothing beyond it.
-import { toolPairingBalancedAfter, toolPairingBalancedBefore } from "@deepseek-ai/dsh-compaction";
+import { isCompactCheckpointSource, toolPairingBalancedAfter, toolPairingBalancedBefore } from "@deepseek-ai/dsh-compaction";
+
+/** True when one surface event is a compaction checkpoint node (any engine). */
+function isCheckpointNode(session, seq) {
+	const event = session.events[seq];
+	return event?.type === "user/message" && event.data?.source !== undefined && isCompactCheckpointSource(event.data.source);
+}
 
 /** Resolve the turn owning one surface event (user messages look ahead to their step). */
 function turnOf(event, events) {
@@ -58,7 +64,12 @@ export function selectCompartmentRange(session, { retainRounds }) {
 	let endIdx = keepIdx - 1;
 	if (!toolPairingBalancedAfter(session, nodes[endIdx])) endIdx -= 1;
 	if (endIdx < 0) return null;
+	// The generation range starts AFTER every contiguous head checkpoint:
+	// after several landings the surface is [C1][C2]…[Ck] + new content, and
+	// the head node is still the oldest checkpoint. Only content after the
+	// last checkpoint may be summarized again (chain design — never re-summarize).
 	let startIdx = 0;
+	while (startIdx < nodes.length && isCheckpointNode(session, nodes[startIdx])) startIdx += 1;
 	if (!toolPairingBalancedBefore(session, nodes[startIdx])) startIdx += 1;
 	if (endIdx < startIdx) return null;
 	return {

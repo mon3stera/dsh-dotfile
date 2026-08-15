@@ -78,6 +78,33 @@ const check = (label, ok) => {
 		check("basic auto disabled", engine.config.auto === false);
 		check("basic threshold kept", engine.config.thresholdRatio === 0.8);
 		check("triggers registered", stubs.some(([n]) => n === "agent/pre-step") && stubs.some(([n]) => n === "session/event") && stubs.some(([n]) => n === "agent/request-error"));
+
+		// legacy checkpoint migration: a checkpoint node produced by the old
+		// engine (source marker present, no compartments row) gets registered
+		// as a landed compartment when the engine first looks at the session.
+		const legacySession = {
+			id: "legacy-s",
+			events: {
+				0: { seq: 0, type: "user/message", data: { content: [{ type: "text", text: "q" }] }, surfaceOp: "append" },
+				1: { seq: 1, type: "user/message", data: { content: [{ type: "text", text: "<compacted-summary>old big block</compacted-summary>" }], source: { kind: "plugin", plugin: "compact", compactionId: "old-1" } }, surfaceOp: { op: "replace", start: 0, end: 0 } },
+				2: { seq: 2, type: "user/message", data: { content: [{ type: "text", text: "after" }] }, surfaceOp: "append" },
+			},
+			surface: { nodes: [1, 2], replaceGeneration: 1 },
+		};
+		engine._registerUnownedCheckpoints({ session: legacySession });
+		const registered = engine.cdb.allActiveCompartments();
+		check("legacy checkpoint registered", registered.length === 1 && registered[0].session_id === "legacy-s" && registered[0].landing_seq === 1);
+		check("legacy checkpoint summary kept", registered[0].summary === "<compacted-summary>old big block</compacted-summary>");
+		check("migration idempotent", (() => { engine._registerUnownedCheckpoints({ session: legacySession }); return engine.cdb.allActiveCompartments().length; })() === 1);
+		// a second legacy checkpoint chains on with the next generation number
+		const chained = {
+			id: "legacy-s",
+			events: { ...legacySession.events, 3: { seq: 3, type: "user/message", data: { content: [{ type: "text", text: "cp2" }], source: { kind: "plugin", plugin: "compact", compactionId: "old-2" } }, surfaceOp: { op: "replace", start: 2, end: 2 } } },
+			surface: { nodes: [1, 3], replaceGeneration: 2 },
+		};
+		engine._registerUnownedCheckpoints({ session: chained });
+		const chained2 = engine.cdb.allActiveCompartments();
+		check("second legacy checkpoint registered", chained2.length === 2 && chained2[1].landing_seq === 3 && chained2[1].generation === 2);
 		// session/event handlers: the paragraph assigner must ignore non-surface
 		// events; the boundary handler must ignore non-boundary events.
 		const [, boundaryHandler] = stubs.filter(([n]) => n === "session/event").map(([, h]) => h);

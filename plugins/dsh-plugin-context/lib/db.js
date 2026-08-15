@@ -225,6 +225,17 @@ export class ContextDb {
 			.run(landedAt, landingSeq ?? null, id);
 	}
 
+	/** Highest generation number recorded for one session (0 when none). */
+	maxGeneration(sessionId) {
+		const row = this.db.prepare("SELECT COALESCE(MAX(generation), 0) AS n FROM compartments WHERE session_id = ?").get(sessionId);
+		return row.n;
+	}
+
+	/** One compartment whose landing replaced a specific surface seq (migration lookup). */
+	compartmentByLandingSeq(sessionId, seq) {
+		return this.db.prepare("SELECT * FROM compartments WHERE session_id = ? AND landing_seq = ?").get(sessionId, seq);
+	}
+
 	/** Archived compartments whose checkpoint node is still on the surface. */
 	archivedCompartments(sessionId) {
 		return this.db.prepare(
