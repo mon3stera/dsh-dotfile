@@ -33,6 +33,11 @@ window.__ModuleLoader__.load({
 			`.${BTN_ID}:hover{background:var(--dsw-alias-interactive-bg-hover)}`,
 			`.${BTN_ID} svg{width:14px;height:14px}`,
 			`.${BTN_ID}[data-active="true"]{color:var(--dsw-alias-state-business-primary)}`,
+			/* the search slot caps its collapsed width at 28px (one button); when the
+			 * toggle is present it needs room for both buttons, and the expanded state
+			 * must keep its full width (rules ordered: expanded wins at equal specificity) */
+			`[class$="_searchSlot"]:has(.){max-width:60px}`,
+			`[class$="_searchSlotExpanded"]:has(.){max-width:100%}`,
 			/* rail (collapsed) mode shows icons only; the workspace search slot is absent anyway */
 			`[class$="_rail"] .${BTN_ID}{display:none}`,
 			/* mask session-row titles with a placeholder (box size stays, so the
