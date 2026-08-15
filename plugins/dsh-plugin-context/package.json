@@ -1,0 +1,16 @@
+{
+  "name": "dsh-plugin-context",
+  "version": "0.1.0",
+  "description": "Async compartment compaction + paragraph numbering + project memory (S(t) scoring, FTS5+vec retrieval) + Dreamer background maintainer for DSH",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./db": "./lib/db.js",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "sqlite-vec": "^0.1.6"
+  },
+  "license": "MIT"
+}
