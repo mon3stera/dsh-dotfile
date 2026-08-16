@@ -11,3 +11,10 @@
       name: dsh-plugin-hide-session-titles
     - id: dsh-plugin-context-settings
       name: dsh-plugin-context/settings
+    - id: dsh-plugin-outline
+      name: dsh-plugin-outline/client
+
+# Make Context Compact the default for newly created Web sessions.
+- id: agent-presets
+  config:
+    default: my-compact

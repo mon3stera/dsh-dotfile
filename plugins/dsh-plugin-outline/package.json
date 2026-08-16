@@ -1,0 +1,25 @@
+{
+  "name": "dsh-plugin-outline",
+  "version": "0.1.0",
+  "description": "Right-side session outline for jumping between user messages in long DSH conversations",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT"
+}
