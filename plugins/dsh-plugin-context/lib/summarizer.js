@@ -93,14 +93,14 @@ function finishError(finish) {
  * the summary (compartment -> ready) and extracted facts (session_facts).
  * @param ctx - host context with llm service.
  * @param cdb - context database.
- * @param args - { session, compartment, range }.
+ * @param args - { session, compartment, range, target? }.
  * @returns the parsed { summary, facts }.
  */
-export async function summarizeCompartment(ctx, cdb, { session, compartment, range }) {
+export async function summarizeCompartment(ctx, cdb, { session, compartment, range, target: configuredTarget, scopePath }) {
 	const input = buildSummarizationInput(session, range, cdb.skippedSeqs(session.id));
-	const header = session.requestHeader();
-	const target = header?.config;
-	if (target === undefined || target.provider.length === 0 || target.model.length === 0) {
+	const target = configuredTarget ?? session.requestHeader()?.config;
+	if (typeof target?.provider !== "string" || target.provider.length === 0
+		|| typeof target.model !== "string" || target.model.length === 0) {
 		throw new Error("no provider/model available for compartment summarization");
 	}
 	const assembler = new BlockAssembler();
@@ -128,7 +128,7 @@ export async function summarizeCompartment(ctx, cdb, { session, compartment, ran
 	const parsed = parseOrganizerOutput(text);
 	cdb.setCompartmentSummary(compartment.id, { summary: parsed.summary, provider: options.provider, model: options.model });
 	for (const fact of parsed.facts) {
-		cdb.insertFact({ sessionId: session.id, compartmentId: compartment.id, fact: fact.text, importance: fact.importance });
+		cdb.insertFact({ sessionId: session.id, scopePath, compartmentId: compartment.id, fact: fact.text, importance: fact.importance });
 	}
 	return parsed;
 }

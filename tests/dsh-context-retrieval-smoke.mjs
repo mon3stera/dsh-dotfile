@@ -2,7 +2,7 @@
 // hybrid ctx_search).
 import { mkdtempSync, rmSync } from "node:fs";
 import { rrfMerge, EmbeddingClient, RerankClient, startMockRetrievalServer } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/retrieval.js";
-import { searchMemories, createMemoryTool, DEFAULT_MEMORY_CONFIG } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/memory.js";
+import { searchMemories, createMemoryTool, createSearchTool, DEFAULT_MEMORY_CONFIG } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/memory.js";
 import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/db.js";
 
 let failed = 0;
@@ -39,8 +39,9 @@ const check = (label, ok) => {
 // ── hybrid search ───────────────────────────────────────────────────────────
 {
 	const home = mkdtempSync("/home/mon3tr/ctx-retr-");
+	const embeddingInputs = [];
 	const mock = await startMockRetrievalServer({
-		vectors: () => [0.5, 0.5, 0.5, 0.5],
+		vectors: (text) => { embeddingInputs.push(text); return [0.5, 0.5, 0.5, 0.5]; },
 		rerankOrder: (query, docs) => docs.map((_, i) => i).reverse(),
 	});
 	try {
@@ -55,10 +56,12 @@ const check = (label, ok) => {
 			rerank: new RerankClient({ baseUrl: mock.url, model: "r" }),
 		};
 		// seed memories with vectors
-		const memTool = createMemoryTool(cdb, retrieval);
+		const memTool = createMemoryTool(cdb, retrieval, { resolveScope: () => "/repo/a" });
 		const a = await memTool.execute({ action: "write", category: "ARCHITECTURE", summary: "jwt auth", content: "30 day expiry", importance: 8 });
-		const b = await memTool.execute({ action: "write", category: "PREFERENCES", summary: "spaces", content: "2-space indent", importance: 5 });
+		const longContent = `2-space indent\n${"full detail ".repeat(500)}`;
+		const b = await memTool.execute({ action: "write", category: "PREFERENCES", summary: "spaces", content: longContent, importance: 5 });
 		check("write embeds", cdb.vecSearch("[0.5,0.5,0.5,0.5]", 5).length === 2);
+		check("write embeds summary only", embeddingInputs[0] === "jwt auth" && embeddingInputs[1] === "spaces");
 
 		// pure FTS search (no embedding, no rerank)
 		const rows = await searchMemories(cdb, DEFAULT_MEMORY_CONFIG, { ...retrieval, embedding: undefined, rerank: undefined }, "jwt", 5);
@@ -68,6 +71,14 @@ const check = (label, ok) => {
 		// with rerank: reversed order → second memory first
 		const reranked = await searchMemories(cdb, DEFAULT_MEMORY_CONFIG, retrieval, "jwt", 5);
 		check("rerank reorders", reranked.length === 2 && reranked[0].id === b.id);
+		const limited = await searchMemories(cdb, DEFAULT_MEMORY_CONFIG, retrieval, "jwt", 1);
+		check("rerank respects limit", limited.length === 1);
+		const searchTool = createSearchTool(cdb, DEFAULT_MEMORY_CONFIG, { ...retrieval, embedding: undefined, rerank: undefined });
+		const fullContent = await searchTool.execute({ query: "spaces", limit: 5 });
+		check("ctx_search returns full content", fullContent.results.find((row) => row.id === b.id)?.content.length === longContent.length);
+		cdb.updateMemory(b.id, { archived: 1 });
+		const archived = await searchMemories(cdb, DEFAULT_MEMORY_CONFIG, { ...retrieval, embedding: undefined, rerank: undefined }, "spaces", 5);
+		check("archived memory remains searchable", archived.length === 1 && archived[0].id === b.id && cdb.memoryById(b.id).archived === 0);
 
 		// degradation: embedding server down → FTS still works
 		await mock.close();

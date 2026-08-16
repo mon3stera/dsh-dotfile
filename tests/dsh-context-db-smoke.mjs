@@ -14,6 +14,7 @@ try {
 	const cdb = openDatabase(home, {});
 	check("vec0 enabled", cdb.vecEnabled === true);
 	check("categories", CATEGORIES.join(",") === "ARCHITECTURE,CONSTRAINTS,CONVENTIONS,PREFERENCES,ENVIRONMENT");
+	check("scope columns", ["scope_path"].every((name) => cdb.db.prepare("PRAGMA table_info(memories)").all().some((row) => row.name === name)) && ["scope_path"].every((name) => cdb.db.prepare("PRAGMA table_info(session_facts)").all().some((row) => row.name === name)) && ["scope_path"].every((name) => cdb.db.prepare("PRAGMA table_info(compartments)").all().some((row) => row.name === name)));
 
 	// paragraphs: global monotonic, per-session, idempotent assign
 	const p1 = cdb.assignParagraph("s1", 1);
@@ -34,14 +35,25 @@ try {
 	const m2 = cdb.writeMemory({ category: "PREFERENCES", summary: "Use spaces", content: "The project uses two-space indentation everywhere", importance: 3 });
 	check("fts auth finds m1", JSON.stringify(cdb.ftsSearch("auth", 5).map((r) => r.id)) === JSON.stringify([m1]));
 	check("fts spaces finds m2", JSON.stringify(cdb.ftsSearch("spaces", 5).map((r) => r.id)) === JSON.stringify([m2]));
+	cdb.updateMemory(m2, { archived: 1 });
+	check("fts includes archived memories", cdb.ftsSearch("spaces", 5).some((r) => r.id === m2));
+	cdb.updateMemory(m2, { archived: 0 });
+	check("importance validation", (() => { try { cdb.writeMemory({ category: "ARCHITECTURE", summary: "bad", content: "bad", importance: 11 }); return false; } catch { return true; } })());
 
 	// vec path (delete-then-insert update)
-	const mk = (v) => JSON.stringify(Array.from(new Float32Array(1024).fill(v)));
-	cdb.setEmbedding(m1, mk(0.9));
-	cdb.setEmbedding(m2, mk(0.1));
-	const q = mk(0.95);
+	const near = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
+	const far = Array.from({ length: 1024 }, (_, index) => index === 1 ? 1 : 0);
+	const close = Array.from({ length: 1024 }, (_, index) => index === 0 ? 0.8 : index === 1 ? 0.6 : 0);
+	const farther = Array.from({ length: 1024 }, (_, index) => index === 0 ? 0.7 : index === 1 ? Math.sqrt(0.51) : 0);
+	cdb.setEmbedding(m1, near);
+	cdb.setEmbedding(m2, far);
+	const thresholded = cdb.vecSearch(near, 2, { minSimilarity: 0.9 });
+	check("vec similarity threshold", thresholded.length === 1 && thresholded[0].rowid === m1 && thresholded[0].similarity >= 0.9);
+	cdb.setEmbedding(m1, near);
+	cdb.setEmbedding(m2, close);
+	const q = near;
 	check("vec knn", JSON.stringify(cdb.vecSearch(q, 2).map((r) => r.rowid)) === JSON.stringify([m1, m2]));
-	cdb.setEmbedding(m2, mk(0.3));
+	cdb.setEmbedding(m2, farther);
 	check("vec update", JSON.stringify(cdb.vecSearch(q, 2).map((r) => r.rowid)) === JSON.stringify([m1, m2]));
 	cdb.removeEmbedding(m1);
 	check("vec remove", JSON.stringify(cdb.vecSearch(q, 2).map((r) => r.rowid)) === JSON.stringify([m2]));
@@ -56,6 +68,7 @@ try {
 		cdb.markCompartmentLanded(id);
 	}
 	check("ready+landed", cdb.readyCompartments("s").length === 0 && cdb.activeCompartments("s").length === 3);
+	check("max generation survives active filtering", cdb.maxGeneration("s") === 3);
 	cdb.markCompartmentPromoted(c1);
 	cdb.flagCompartmentArchive(c2, 2);
 	check("archival order promoted-first", cdb.archivalCandidates().map((x) => x.id).join(",") === `${c1},${c3},${c2}`);
@@ -77,8 +90,11 @@ try {
 	cdb.updateMemory(m1, { verified_at: Date.now() });
 	check("needs verification after verify", cdb.memoriesNeedingVerification(Date.now(), 30).length === 1);
 	check("updateMemory unknown field rejected", cdb.updateMemory(m2, { nope: 1 }) === false);
-
+	cdb.db.exec("DELETE FROM memories_fts");
 	cdb.close();
+	const reopened = openDatabase(home, {});
+	check("fts rebuilds missing index rows", reopened.ftsSearch("auth", 5).some((row) => row.id === m1));
+	reopened.close();
 } finally {
 	rmSync(home, { recursive: true, force: true });
 }

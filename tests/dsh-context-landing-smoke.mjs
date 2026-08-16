@@ -1,6 +1,6 @@
 // dsh-plugin-context landing + range selection smoke test.
-import { selectCompartmentRange } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/range.js";
-import { landCompartment, frameCompartmentSummary } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/landing.js";
+import { selectCompartmentRange, selectManualCompartmentRange } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/range.js";
+import { estimateFramedSummaryTokens, landCompartment, frameCompartmentSummary } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/landing.js";
 
 let failed = 0;
 const check = (label, ok) => {
@@ -30,11 +30,15 @@ const check = (label, ok) => {
 	const surface = { nodes: [1, 3, 6, 8, 11, 13], replaceGeneration: 0 };
 	const session = { events, surface };
 	let r = selectCompartmentRange(session, { retainRounds: 1 });
-	check("retain 1 keeps turn3", r !== null && r.start === 1 && r.end === 8 && r.shadowedSeqs.join(",") === "1,3,6,8");
+	check("retain 1 keeps one paragraph", r !== null && r.start === 1 && r.end === 11 && r.shadowedSeqs.join(",") === "1,3,6,8,11");
 	r = selectCompartmentRange(session, { retainRounds: 2 });
-	check("retain 2 keeps turns 2+3", r !== null && r.start === 1 && r.end === 3 && r.shadowedSeqs.join(",") === "1,3");
+	check("retain 2 keeps two paragraphs", r !== null && r.start === 1 && r.end === 8 && r.shadowedSeqs.join(",") === "1,3,6,8");
 	r = selectCompartmentRange(session, { retainRounds: 3 });
-	check("retain 3 null", r === null);
+	check("retain 3 keeps three paragraphs", r !== null && r.start === 1 && r.end === 6 && r.shadowedSeqs.join(",") === "1,3,6");
+	r = selectManualCompartmentRange(session, { retainRounds: 20 });
+	check("manual short history keeps one paragraph tail", r !== null && r.start === 1 && r.end === 1 && r.shadowedSeqs.join(",") === "1");
+	const oneTurn = { events: events.slice(0, 5), surface: { nodes: [1, 3], replaceGeneration: 0 } };
+	check("manual short history leaves one paragraph", (() => { const one = selectManualCompartmentRange(oneTurn, { retainRounds: 20 }); return one !== null && one.start === 1 && one.end === 1; })());
 
 	// checkpointed surface: node 16 is a landed checkpoint (head), turns 4+5 follow.
 	const events2 = [...events];
@@ -43,10 +47,10 @@ const check = (label, ok) => {
 	const nodes2 = [16, 19, 22]; // checkpoint, t4 assistant, t5 assistant
 	events2.push({ type: "tool/call", seq: 17, time: 0, data: { callId: "x", name: "bash", arguments: "{}" } });
 	events2.push({ type: "step/start", seq: 18, time: 0, data: { turn: 4, step: 1 } });
-	events2.push({ type: "assistant/message", seq: 19, time: 0, data: { turn: 4, step: 1, message: { content: [] } }, surfaceOp: "append" });
+	events2.push({ type: "assistant/message", seq: 19, time: 0, data: { turn: 4, step: 1, message: { content: [{ type: "text", text: "t4" }] } }, surfaceOp: "append" });
 	events2.push({ type: "turn/end", seq: 20, time: 0, data: { turn: 4, reason: { kind: "completed" } } });
 	events2.push({ type: "step/start", seq: 21, time: 0, data: { turn: 5, step: 1 } });
-	events2.push({ type: "assistant/message", seq: 22, time: 0, data: { turn: 5, step: 1, message: { content: [] } }, surfaceOp: "append" });
+	events2.push({ type: "assistant/message", seq: 22, time: 0, data: { turn: 5, step: 1, message: { content: [{ type: "text", text: "t5" }] } }, surfaceOp: "append" });
 	events2.push({ type: "turn/end", seq: 23, time: 0, data: { turn: 5, reason: { kind: "completed" } } });
 	const session2 = { events: events2, surface: { nodes: nodes2, replaceGeneration: 1 } };
 	// the checkpoint itself is never re-summarizable: only t4 stays compressible
@@ -63,10 +67,10 @@ const check = (label, ok) => {
 	events3.push({ type: "compaction/summary", seq: 23, time: 0, data: {} });
 	events3.push({ type: "user/message", seq: 24, time: 0, data: { content: [{ type: "text", text: "cp2" }], source: { kind: "plugin", plugin: "compact", compactionId: "c2" } }, surfaceOp: { op: "replace", start: 19, end: 19 } });
 	events3.push({ type: "step/start", seq: 25, time: 0, data: { turn: 6, step: 1 } });
-	events3.push({ type: "assistant/message", seq: 26, time: 0, data: { turn: 6, step: 1, message: { content: [] } }, surfaceOp: "append" });
+	events3.push({ type: "assistant/message", seq: 26, time: 0, data: { turn: 6, step: 1, message: { content: [{ type: "text", text: "t6" }] } }, surfaceOp: "append" });
 	events3.push({ type: "tool/call", seq: 27, time: 0, data: { callId: "y", name: "read", arguments: "{}" } });
 	events3.push({ type: "step/start", seq: 28, time: 0, data: { turn: 7, step: 1 } });
-	events3.push({ type: "assistant/message", seq: 29, time: 0, data: { turn: 7, step: 1, message: { content: [] } }, surfaceOp: "append" });
+	events3.push({ type: "assistant/message", seq: 29, time: 0, data: { turn: 7, step: 1, message: { content: [{ type: "text", text: "t7" }] } }, surfaceOp: "append" });
 	events3.push({ type: "turn/end", seq: 30, time: 0, data: { turn: 7, reason: { kind: "completed" } } });
 	const session3 = { events: events3, surface: { nodes: [16, 24, 26, 29], replaceGeneration: 2 } };
 	r = selectCompartmentRange(session3, { retainRounds: 1 });
@@ -111,6 +115,7 @@ const check = (label, ok) => {
 		estimateMessage: () => 25,
 		measure: (s) => ({ nodes: s.surface.nodes.map((seq) => ({ seq, tokens: 1 })) }),
 	};
+	check("framed summary estimate delegates to meter", estimateFramedSummaryTokens(meter, "") === 25);
 	const compartment = { id: 9, start_seq: 1, end_seq: 3, summary: "compressed history summary", shadowed_tokens: 100, provider: "deepseek-official", model: "deepseek-v4-flash" };
 
 	const result = await landCompartment({ session, cdb, meter }, compartment, { owner: "current-turn" });

@@ -20,6 +20,7 @@ const SCHEMA = `
 CREATE TABLE IF NOT EXISTS memories (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   category    TEXT NOT NULL CHECK(category IN ('ARCHITECTURE','CONSTRAINTS','CONVENTIONS','PREFERENCES','ENVIRONMENT')),
+  scope_path  TEXT,
   summary     TEXT NOT NULL,
   content     TEXT NOT NULL,
   importance  REAL NOT NULL DEFAULT 5,
@@ -47,9 +48,6 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
   INSERT INTO memories_fts(rowid, summary, content) VALUES (new.id, new.summary, new.content);
 END;
 
-CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec
-  USING vec0(embedding float[__EMBEDDING_DIM__]);
-
 CREATE TABLE IF NOT EXISTS paragraphs (
   session_id   TEXT NOT NULL,
   seq          INTEGER NOT NULL,
@@ -69,6 +67,7 @@ CREATE TABLE IF NOT EXISTS skip_marks (
 CREATE TABLE IF NOT EXISTS compartments (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id   TEXT NOT NULL,
+  scope_path   TEXT,
   generation   INTEGER NOT NULL,
   start_seq    INTEGER NOT NULL,
   end_seq      INTEGER NOT NULL,
@@ -97,6 +96,7 @@ CREATE INDEX IF NOT EXISTS compartments_archived ON compartments(archived, statu
 CREATE TABLE IF NOT EXISTS session_facts (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id   TEXT NOT NULL,
+  scope_path   TEXT,
   compartment_id INTEGER,
   fact         TEXT NOT NULL,
   importance   REAL NOT NULL DEFAULT 5,
@@ -106,6 +106,47 @@ CREATE TABLE IF NOT EXISTS session_facts (
 );
 CREATE INDEX IF NOT EXISTS session_facts_status ON session_facts(status);
 `;
+
+const VEC_SCHEMA = `
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec
+  USING vec0(embedding float[__EMBEDDING_DIM__]);
+`;
+
+function assertImportance(value, label = "importance") {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 10) {
+		throw new Error(`${label} must be a finite number between 0 and 10`);
+	}
+}
+
+function normalizeMemoryScope(category, scopePath) {
+	if (category === "PREFERENCES") return null;
+	if (scopePath === undefined || scopePath === null) return null;
+	if (typeof scopePath !== "string" || scopePath.length === 0) throw new Error("memory scope_path must be a non-empty string or null");
+	return scopePath;
+}
+
+/** Scope predicate: undefined keeps low-level DB callers backward-compatible. */
+export function memoryScopeMatches(memory, scopePath) {
+	if (scopePath === undefined) return true;
+	if (memory?.category === "PREFERENCES") return true;
+	return typeof scopePath === "string" && memory?.scope_path === scopePath;
+}
+
+function normalizeVector(vector, embeddingDim) {
+	const value = typeof vector === "string" ? JSON.parse(vector) : vector;
+	if (!Array.isArray(value) || value.length !== embeddingDim || value.some((item) => typeof item !== "number" || !Number.isFinite(item))) {
+		throw new Error(`embedding vector must contain exactly ${embeddingDim} finite numbers`);
+	}
+	const norm = Math.sqrt(value.reduce((sum, item) => sum + item * item, 0));
+	if (!Number.isFinite(norm) || norm === 0) throw new Error("embedding vector must have a non-zero norm");
+	return JSON.stringify(value.map((item) => item / norm));
+}
+
+/** Convert sqlite-vec L2 distance between unit vectors into cosine similarity. */
+export function similarityFromDistance(distance) {
+	if (typeof distance !== "number" || !Number.isFinite(distance)) return -1;
+	return Math.max(-1, Math.min(1, 1 - (distance * distance) / 2));
+}
 
 /** One open context database plus the typed storage API. */
 export class ContextDb {
@@ -163,10 +204,10 @@ export class ContextDb {
 
 	// ── compartments ────────────────────────────────────────────────────────
 
-	insertCompartment({ sessionId, generation, startSeq, endSeq, startPara, endPara, summary, memoryIds, shadowedTokens, provider, model }) {
+	insertCompartment({ sessionId, scopePath, generation, startSeq, endSeq, startPara, endPara, summary, memoryIds, shadowedTokens, provider, model }) {
 		const result = this.db.prepare(
-			"INSERT INTO compartments(session_id, generation, start_seq, end_seq, start_para, end_para, summary, memory_ids, status, created_at, shadowed_tokens, provider, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'generating', ?, ?, ?, ?)"
-		).run(sessionId, generation, startSeq, endSeq, startPara, endPara, summary, memoryIds ?? null, Date.now(), shadowedTokens ?? null, provider ?? null, model ?? null);
+			"INSERT INTO compartments(session_id, scope_path, generation, start_seq, end_seq, start_para, end_para, summary, memory_ids, status, created_at, shadowed_tokens, provider, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating', ?, ?, ?, ?)"
+		).run(sessionId, scopePath ?? null, generation, startSeq, endSeq, startPara, endPara, summary, memoryIds ?? null, Date.now(), shadowedTokens ?? null, provider ?? null, model ?? null);
 		return Number(result.lastInsertRowid);
 	}
 
@@ -207,10 +248,11 @@ export class ContextDb {
 	}
 
 	/** Landed compartments whose facts Dreamer has not distilled yet. */
-	unpromotedCompartments() {
-		return this.db.prepare(
+	unpromotedCompartments(scopePath) {
+		const rows = this.db.prepare(
 			"SELECT * FROM compartments WHERE status = 'landed' AND has_promoted_facts = 0 ORDER BY created_at"
 		).all();
+		return scopePath === undefined ? rows : rows.filter((row) => row.scope_path === scopePath);
 	}
 
 	/** Archival candidates ordered by priority: promoted first, then low importance, then old. */
@@ -262,26 +304,49 @@ export class ContextDb {
 
 	// ── memories ────────────────────────────────────────────────────────────
 
-	writeMemory({ category, summary, content, importance }) {
+	writeMemory({ category, scopePath, summary, content, importance }) {
+		if (!CATEGORIES.includes(category)) throw new Error(`invalid memory category: ${String(category)}`);
+		if (typeof summary !== "string" || summary.length === 0) throw new Error("memory summary must be a non-empty string");
+		if (typeof content !== "string") throw new Error("memory content must be a string");
+		assertImportance(importance);
+		const normalizedScope = normalizeMemoryScope(category, scopePath);
 		const now = Date.now();
 		const result = this.db.prepare(
-			"INSERT INTO memories(category, summary, content, importance, hits, created_at, last_hit_at, verified_at, archived) VALUES (?, ?, ?, ?, 0, ?, ?, NULL, 0)"
-		).run(category, summary, content, importance, now, now);
+			"INSERT INTO memories(category, scope_path, summary, content, importance, hits, created_at, last_hit_at, verified_at, archived) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, 0)"
+		).run(category, normalizedScope, summary, content, importance, now, now);
 		return Number(result.lastInsertRowid);
 	}
 
-	/** Update whitelisted memory fields; returns true when the row exists. */
-	updateMemory(id, fields) {
-		const allowed = new Set(["category", "summary", "content", "importance", "archived", "verified_at", "hits", "last_hit_at"]);
-		const entries = Object.entries(fields).filter(([key]) => allowed.has(key));
-		if (entries.length === 0) return false;
+	/** Update whitelisted memory fields; an optional scope rejects cross-project mutation. */
+	updateMemory(id, fields, scopePath) {
+		const current = this.memoryById(id);
+		if (current === undefined || !memoryScopeMatches(current, scopePath)) return false;
+		const allowed = new Set(["category", "scope_path", "summary", "content", "importance", "archived", "verified_at", "hits", "last_hit_at"]);
+		const normalized = Object.fromEntries(Object.entries(fields).filter(([key]) => allowed.has(key)));
+		if (Object.keys(normalized).length === 0) return false;
+		const nextCategory = normalized.category ?? current.category;
+		if (nextCategory === "PREFERENCES" && (normalized.category !== undefined || normalized.scope_path !== undefined)) normalized.scope_path = null;
+		else if (normalized.scope_path !== undefined) normalized.scope_path = normalizeMemoryScope(nextCategory, normalized.scope_path);
+		const entries = Object.entries(normalized);
+		for (const [key, value] of entries) {
+			if (key === "category" && !CATEGORIES.includes(value)) throw new Error(`invalid memory category: ${String(value)}`);
+			if (key === "scope_path" && value !== null && (typeof value !== "string" || value.length === 0)) throw new Error("memory scope_path must be a non-empty string or null");
+			if (key === "summary" && (typeof value !== "string" || value.length === 0)) throw new Error("memory summary must be a non-empty string");
+			if (key === "content" && typeof value !== "string") throw new Error("memory content must be a string");
+			if (key === "importance") assertImportance(value);
+		}
 		const sets = entries.map(([key]) => `${key} = ?`).join(", ");
 		const result = this.db.prepare(`UPDATE memories SET ${sets} WHERE id = ?`).run(...entries.map(([, value]) => value), id);
 		return result.changes > 0;
 	}
 
-	memoryById(id) {
-		return this.db.prepare("SELECT * FROM memories WHERE id = ?").get(id);
+	memoryById(id, scopePath) {
+		const row = this.db.prepare("SELECT * FROM memories WHERE id = ?").get(id);
+		return row !== undefined && memoryScopeMatches(row, scopePath) ? row : undefined;
+	}
+
+	memoryVisibleToScope(memory, scopePath) {
+		return memoryScopeMatches(memory, scopePath);
 	}
 
 	/** Physically delete one memory (ctx_memory delete; FTS trigger cleans up). */
@@ -291,37 +356,60 @@ export class ContextDb {
 	}
 
 	/** Memories needing Dreamer verification: never verified, or older than the cycle. */
-	memoriesNeedingVerification(now, verifyIntervalDays) {
+	memoriesNeedingVerification(now, verifyIntervalDays, scopePath) {
 		const cutoff = now - verifyIntervalDays * 86400e3;
-		return this.db.prepare(
+		const rows = this.db.prepare(
 			"SELECT * FROM memories WHERE archived = 0 AND (verified_at IS NULL OR verified_at < ?) ORDER BY created_at"
 		).all(cutoff);
+		return scopePath === undefined ? rows : rows.filter((row) => memoryScopeMatches(row, scopePath));
 	}
 
 	recordMemoryHit(id, at = Date.now()) {
 		this.db.prepare("UPDATE memories SET hits = hits + 1, last_hit_at = ? WHERE id = ?").run(at, id);
 	}
 
-	/** Injection candidates: non-archived, with S(t) computed by the caller. */
-	allInjectableMemories() {
-		return this.db.prepare("SELECT * FROM memories WHERE archived = 0 ORDER BY last_hit_at DESC").all();
+	/** Injection candidates: non-archived, filtered to the current project/global scope. */
+	allInjectableMemories(scopePath) {
+		const rows = this.db.prepare("SELECT * FROM memories WHERE archived = 0 ORDER BY last_hit_at DESC").all();
+		return scopePath === undefined ? rows : rows.filter((row) => memoryScopeMatches(row, scopePath));
 	}
 
 	// ── session facts ───────────────────────────────────────────────────────
 
-	insertFact({ sessionId, compartmentId, fact, importance }) {
+	insertFact({ sessionId, scopePath, compartmentId, fact, importance }) {
+		if (typeof fact !== "string" || fact.length === 0) throw new Error("session fact must be a non-empty string");
+		assertImportance(importance);
 		const result = this.db.prepare(
-			"INSERT INTO session_facts(session_id, compartment_id, fact, importance, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)"
-		).run(sessionId, compartmentId ?? null, fact, importance, Date.now());
+			"INSERT INTO session_facts(session_id, scope_path, compartment_id, fact, importance, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
+		).run(sessionId, scopePath ?? null, compartmentId ?? null, fact, importance, Date.now());
 		return Number(result.lastInsertRowid);
 	}
 
-	pendingFacts() {
-		return this.db.prepare("SELECT * FROM session_facts WHERE status = 'pending' ORDER BY created_at").all();
+	pendingFacts(scopePath) {
+		const rows = this.db.prepare("SELECT * FROM session_facts WHERE status = 'pending' ORDER BY created_at").all();
+		return scopePath === undefined ? rows : rows.filter((row) => row.scope_path === scopePath);
 	}
 
 	promoteFact(id, memoryId) {
 		this.db.prepare("UPDATE session_facts SET status = 'promoted', promoted_memory_id = ? WHERE id = ?").run(memoryId, id);
+	}
+
+	/** Atomically create a memory and mark one pending fact as promoted. */
+	promoteFactToMemory({ factId, scopePath, category, summary, content, importance }) {
+		this.db.exec("BEGIN IMMEDIATE");
+		try {
+			const fact = this.db.prepare("SELECT status, scope_path FROM session_facts WHERE id = ?").get(factId);
+			if (fact === undefined) throw new Error(`fact ${factId} does not exist`);
+			if (scopePath !== undefined && fact.scope_path !== scopePath) throw new Error(`fact ${factId} does not belong to this workspace`);
+			if (fact.status !== "pending") throw new Error(`fact ${factId} is not pending`);
+			const memoryId = this.writeMemory({ category, scopePath: fact.scope_path, summary, content, importance });
+			this.promoteFact(factId, memoryId);
+			this.db.exec("COMMIT");
+			return memoryId;
+		} catch (error) {
+			try { this.db.exec("ROLLBACK"); } catch {}
+			throw error;
+		}
 	}
 
 	discardFact(id) {
@@ -330,21 +418,40 @@ export class ContextDb {
 
 	// ── retrieval ───────────────────────────────────────────────────────────
 
-	/** FTS5 phrase search over non-archived memories, BM25-ranked. */
-	ftsSearch(query, limit) {
-		const quoted = `"${query.replace(/"/g, '""')}"`;
+	/** FTS5-tokenized AND search over memories visible to the current scope. */
+	ftsSearch(query, limit, scopePath) {
+		const fragments = typeof query === "string" ? query.match(/\S+/gu) ?? [] : [];
+		if (fragments.length === 0) return [];
+		// Quote each user fragment so FTS5's tokenizer still handles hyphens,
+		// CJK text, and punctuation without allowing query operators through.
+		const matchQuery = fragments
+			.map((fragment) => `"${fragment.replaceAll('"', '""')}"`)
+			.join(" AND ");
+		const params = [matchQuery];
+		let scopeClause = "";
+		if (scopePath !== undefined) {
+			if (typeof scopePath === "string") {
+				scopeClause = " AND (m.category = 'PREFERENCES' OR m.scope_path = ?)";
+				params.push(scopePath);
+			} else {
+				scopeClause = " AND m.category = 'PREFERENCES'";
+			}
+		}
+		params.push(limit);
 		return this.db.prepare(
-			`SELECT m.id, m.category, m.summary, m.content, m.importance, m.hits,
+			`SELECT m.id, m.category, m.scope_path, m.summary, m.content, m.importance, m.hits,
 			        bm25(memories_fts) AS rank
 			 FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid
-			 WHERE memories_fts MATCH ? AND m.archived = 0
+			 WHERE memories_fts MATCH ?${scopeClause}
 			 ORDER BY rank LIMIT ?`
-		).all(quoted, limit);
+		).all(...params);
 	}
 
-	/** Store one memory embedding (rowid = memory id) via raw SQL (vec0 rowid binding quirk). */
-	setEmbedding(memoryId, vectorJson) {
+	/** Store one memory embedding (rowid = memory id) via validated numeric SQL. */
+	setEmbedding(memoryId, vector) {
 		if (!this.vecEnabled) return false;
+		if (!Number.isSafeInteger(Number(memoryId))) throw new Error("memory id must be a safe integer");
+		const vectorJson = normalizeVector(vector, this.embeddingDim);
 		// vec0 is a virtual table: no INSERT OR REPLACE, so delete-then-insert.
 		this.db.exec(`DELETE FROM memories_vec WHERE rowid = ${Number(memoryId)}`);
 		this.db.exec(`INSERT INTO memories_vec(rowid, embedding) VALUES (${Number(memoryId)}, '${vectorJson}')`);
@@ -353,15 +460,23 @@ export class ContextDb {
 
 	removeEmbedding(memoryId) {
 		if (!this.vecEnabled) return;
+		if (!Number.isSafeInteger(Number(memoryId))) throw new Error("memory id must be a safe integer");
 		this.db.exec(`DELETE FROM memories_vec WHERE rowid = ${Number(memoryId)}`);
 	}
 
-	/** KNN over memory embeddings; returns [{rowid, distance}]. */
-	vecSearch(embeddingJson, k) {
+	/** KNN over normalized memory embeddings; optionally filters by cosine similarity. */
+	vecSearch(embedding, k, { minSimilarity } = {}) {
 		if (!this.vecEnabled) return [];
-		return this.db.prepare(
+		if (minSimilarity !== undefined && (typeof minSimilarity !== "number" || !Number.isFinite(minSimilarity) || minSimilarity < -1 || minSimilarity > 1)) {
+			throw new Error("minSimilarity must be a finite number between -1 and 1");
+		}
+		const embeddingJson = normalizeVector(embedding, this.embeddingDim);
+		const rows = this.db.prepare(
 			"SELECT rowid, distance FROM memories_vec WHERE embedding MATCH ? AND k = ? ORDER BY distance"
 		).all(embeddingJson, k);
+		return rows
+			.map((row) => ({ ...row, similarity: similarityFromDistance(row.distance) }))
+			.filter((row) => minSimilarity === undefined || row.similarity >= minSimilarity);
 	}
 }
 
@@ -384,17 +499,31 @@ export function openDatabase(homeDir, opts = {}) {
 	} catch {
 		// Vector path degrades to FTS5-only retrieval.
 	}
-	db.exec(SCHEMA.replaceAll("__EMBEDDING_DIM__", String(embeddingDim)));
+	db.exec(SCHEMA);
+	if (vecEnabled) {
+		try {
+			db.exec(VEC_SCHEMA.replaceAll("__EMBEDDING_DIM__", String(embeddingDim)));
+		} catch {
+			// A broken or incompatible vec table must not disable FTS5 storage.
+			vecEnabled = false;
+		}
+	}
 	migrate(db);
 	return new ContextDb(db, vecEnabled, embeddingDim);
 }
 
 /** Additive column migrations for databases created before a field existed. */
 function migrate(db) {
+	const memoryCols = new Set(db.prepare("PRAGMA table_info(memories)").all().map((row) => row.name));
+	if (!memoryCols.has("scope_path")) db.exec("ALTER TABLE memories ADD COLUMN scope_path TEXT");
+	db.exec("CREATE INDEX IF NOT EXISTS memories_scope ON memories(category, scope_path, archived)");
+	const factCols = new Set(db.prepare("PRAGMA table_info(session_facts)").all().map((row) => row.name));
+	if (!factCols.has("scope_path")) db.exec("ALTER TABLE session_facts ADD COLUMN scope_path TEXT");
 	const compartmentCols = new Set(
 		db.prepare("PRAGMA table_info(compartments)").all().map((row) => row.name)
 	);
 	for (const [name, ddl] of [
+		["scope_path", "ALTER TABLE compartments ADD COLUMN scope_path TEXT"],
 		["shadowed_tokens", "ALTER TABLE compartments ADD COLUMN shadowed_tokens INTEGER"],
 		["provider", "ALTER TABLE compartments ADD COLUMN provider TEXT"],
 		["model", "ALTER TABLE compartments ADD COLUMN model TEXT"],
@@ -403,4 +532,7 @@ function migrate(db) {
 	]) {
 		if (!compartmentCols.has(name)) db.exec(ddl);
 	}
+	const memoryCount = db.prepare("SELECT COUNT(*) AS count FROM memories").get().count;
+	const ftsCount = db.prepare("SELECT COUNT(*) AS count FROM memories_fts_docsize").get().count;
+	if (memoryCount !== ftsCount) db.exec("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')");
 }

@@ -98,7 +98,7 @@ async function grepTree(root, pattern, start, maxMatches = MAX_GREP_MATCHES) {
 }
 
 /** Build the Dreamer's internal tool set. */
-export function createDreamerTools(cdb, { workspaceRoot, retrieval = {} } = {}) {
+export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = {} } = {}) {
 	const root = resolve(workspaceRoot ?? process.cwd());
 	const byName = new Map();
 	const add = (tool) => {
@@ -116,8 +116,11 @@ export function createDreamerTools(cdb, { workspaceRoot, retrieval = {} } = {}) 
 				required: ["sql"],
 			},
 			async execute(args) {
-				if (typeof args.sql !== "string" || !/^\s*SELECT\b/i.test(args.sql)) throw new Error("sql_query only accepts SELECT statements");
-				const rows = cdb.db.prepare(args.sql).all();
+				const sql = typeof args.sql === "string" ? args.sql.trim() : "";
+				if (!/^SELECT\b/i.test(sql) || sql.includes(";") || /\bload_extension\s*\(/i.test(sql)) {
+					throw new Error("sql_query only accepts one SELECT statement");
+				}
+				const rows = cdb.db.prepare(sql).all();
 				return rows.slice(0, MAX_SQL_ROWS);
 			},
 		}),
@@ -173,11 +176,12 @@ export function createDreamerTools(cdb, { workspaceRoot, retrieval = {} } = {}) 
 				required: ["category", "summary", "content", "importance"],
 			},
 			async execute(args) {
-				const id = cdb.writeMemory(args);
+				if (args.category !== "PREFERENCES" && typeof scopePath !== "string") throw new Error("project memory write requires a session workspace scope");
+				const id = cdb.writeMemory({ ...args, scopePath });
 				if (retrieval.embedding !== undefined && cdb.vecEnabled) {
 					try {
-						const vector = await retrieval.embedding.embed(`${args.summary}\n${args.content}`);
-						cdb.setEmbedding(id, JSON.stringify(vector));
+						const vector = await retrieval.embedding.embed(args.summary);
+						cdb.setEmbedding(id, vector);
 					} catch {
 						// best-effort
 					}
@@ -201,11 +205,21 @@ export function createDreamerTools(cdb, { workspaceRoot, retrieval = {} } = {}) 
 				},
 				required: ["id"],
 			},
-			execute(args) {
+			async execute(args) {
+				if (cdb.memoryById(args.id, scopePath) === undefined) throw new Error(`memory ${args.id} does not exist in this workspace`);
 				const fields = { ...args };
 				delete fields.id;
-				const changed = cdb.updateMemory(args.id, fields);
+				const changed = cdb.updateMemory(args.id, fields, scopePath);
 				if (!changed) throw new Error(`memory ${args.id} does not exist`);
+				if (fields.summary !== undefined && retrieval.embedding !== undefined && cdb.vecEnabled) {
+					cdb.removeEmbedding(args.id);
+					try {
+						const vector = await retrieval.embedding.embed(cdb.memoryById(args.id).summary);
+						cdb.setEmbedding(args.id, vector);
+					} catch {
+						// FTS remains available when a corrected summary cannot be embedded.
+					}
+				}
 				return { ok: true };
 			},
 		}),
@@ -219,7 +233,8 @@ export function createDreamerTools(cdb, { workspaceRoot, retrieval = {} } = {}) 
 				required: ["id"],
 			},
 			execute(args) {
-				const changed = cdb.updateMemory(args.id, { archived: 1 });
+				if (cdb.memoryById(args.id, scopePath) === undefined) throw new Error(`memory ${args.id} does not exist in this workspace`);
+				const changed = cdb.updateMemory(args.id, { archived: 1 }, scopePath);
 				if (!changed) throw new Error(`memory ${args.id} does not exist`);
 				return { ok: true };
 			},
@@ -240,10 +255,9 @@ export function createDreamerTools(cdb, { workspaceRoot, retrieval = {} } = {}) 
 				required: ["factId", "category", "summary", "content", "importance"],
 			},
 			async execute(args) {
-				const fact = cdb.db.prepare("SELECT * FROM session_facts WHERE id = ?").get(args.factId);
-				if (fact === undefined) throw new Error(`fact ${args.factId} does not exist`);
-				if (fact.status !== "pending") throw new Error(`fact ${args.factId} is not pending`);
-				const id = cdb.writeMemory({
+				const id = cdb.promoteFactToMemory({
+					factId: args.factId,
+					scopePath,
 					category: args.category,
 					summary: args.summary,
 					content: args.content,
@@ -251,13 +265,12 @@ export function createDreamerTools(cdb, { workspaceRoot, retrieval = {} } = {}) 
 				});
 				if (retrieval.embedding !== undefined && cdb.vecEnabled) {
 					try {
-						const vector = await retrieval.embedding.embed(`${args.summary}\n${args.content}`);
-						cdb.setEmbedding(id, JSON.stringify(vector));
+						const vector = await retrieval.embedding.embed(args.summary);
+						cdb.setEmbedding(id, vector);
 					} catch {
-						// best-effort
+						// best-effort; the promoted memory remains FTS-searchable
 					}
 				}
-				cdb.promoteFact(args.factId, id);
 				return { id };
 			},
 		}),
@@ -277,7 +290,7 @@ export function createDreamerTools(cdb, { workspaceRoot, retrieval = {} } = {}) 
 			},
 			execute(args) {
 				const compartment = cdb.compartmentById(args.compartmentId);
-				if (compartment === undefined) throw new Error(`compartment ${args.compartmentId} does not exist`);
+				if (compartment === undefined || (scopePath !== undefined && compartment.scope_path !== scopePath)) throw new Error(`compartment ${args.compartmentId} does not exist in this workspace`);
 				if (args.processed === true) cdb.markCompartmentPromoted(args.compartmentId);
 				if (args.archive === true || args.importance !== undefined) {
 					cdb.flagCompartmentArchive(args.compartmentId, args.importance);
@@ -290,10 +303,10 @@ export function createDreamerTools(cdb, { workspaceRoot, retrieval = {} } = {}) 
 }
 
 /** Material lists handed to the Dreamer as its first user message. */
-export function buildDreamerBrief(cdb, verifyIntervalDays) {
-	const facts = cdb.pendingFacts();
-	const memories = cdb.memoriesNeedingVerification(Date.now(), verifyIntervalDays);
-	const compartments = cdb.unpromotedCompartments();
+export function buildDreamerBrief(cdb, verifyIntervalDays, scopePath) {
+	const facts = cdb.pendingFacts(scopePath);
+	const memories = cdb.memoriesNeedingVerification(Date.now(), verifyIntervalDays, scopePath);
+	const compartments = cdb.unpromotedCompartments(scopePath);
 	const brief = [
 		`PENDING SESSION FACTS (${facts.length}):`,
 		JSON.stringify(facts.map((f) => ({ id: f.id, sessionId: f.session_id, compartmentId: f.compartment_id, fact: f.fact, importance: f.importance })), null, 1),
@@ -319,16 +332,17 @@ export async function runDreamer(ctx, cdb, opts) {
 		provider,
 		model,
 		workspaceRoot,
+		scopePath,
 		maxRounds = 20,
 		timeoutMs = 600000,
 		verifyIntervalDays = 30,
 		retrieval = {},
 	} = opts;
-	const material = buildDreamerBrief(cdb, verifyIntervalDays);
+	const material = buildDreamerBrief(cdb, verifyIntervalDays, scopePath);
 	if (material.facts.length === 0 && material.memories.length === 0 && material.compartments.length === 0) {
 		return { skipped: true, rounds: 0, ...material };
 	}
-	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot, retrieval });
+	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval });
 	const toolSchemas = tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,

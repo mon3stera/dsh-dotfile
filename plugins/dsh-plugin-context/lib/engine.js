@@ -10,11 +10,11 @@ import { BasicCompactionEngine } from "@deepseek-ai/dsh-compaction-basic";
 import { isCompactCheckpointSource, ManualCompactionError } from "@deepseek-ai/dsh-compaction";
 import { CONTEXT_WINDOW_EXCEEDED_CODE, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { openDatabase } from "./db.js";
-import { selectCompartmentRange } from "./range.js";
-import { landCompartment } from "./landing.js";
+import { selectCompartmentRange, selectManualCompartmentRange } from "./range.js";
+import { estimateFramedSummaryTokens, landCompartment } from "./landing.js";
 import { summarizeCompartment } from "./summarizer.js";
 import { createParagraphAssigner, installParagraphInjector, PARAGRAPH_SECTION } from "./paragraphs.js";
-import { createReduceTool } from "./tools.js";
+import { createExpandTool, createReduceTool } from "./tools.js";
 import {
 	DEFAULT_MEMORY_CONFIG,
 	MEMORY_SECTION,
@@ -25,14 +25,25 @@ import {
 	renderInjectionText,
 	selectInjectionMemories,
 } from "./memory.js";
-import { EmbeddingClient, RerankClient } from "./retrieval.js";
-import { runArchival, runDreamer } from "./dreamer.js";
+import {
+	EmbeddingClient,
+	LocalEmbeddingClient,
+	LocalRerankClient,
+	LOCAL_EMBEDDING_PRESETS,
+	LOCAL_RERANK_PRESETS,
+	RerankClient,
+} from "./retrieval.js";
+import { buildDreamerBrief, runArchival, runDreamer } from "./dreamer.js";
+import { injectContextNotice } from "./notifications.js";
+import { mergeContextConfig } from "./settings.js";
+import { clearContextUsage, setContextUsage } from "./usage.js";
+import { sessionMemoryScope } from "./scope.js";
+import { installContextCommands } from "./commands.js";
 
 const DEFAULT_GENERATE_THRESHOLD = 0.65;
 const DEFAULT_RETAIN_ROUNDS = 20;
 const DEFAULT_WAIT_READY_TIMEOUT_MS = 60000;
 const DEFAULT_DREAMER_IDLE_MINUTES = 15;
-const DEFAULT_DREAMER_INTERVAL_HOURS = 24;
 const DEFAULT_DREAMER_MAX_ROUNDS = 20;
 const DEFAULT_DREAMER_TIMEOUT_MS = 600000;
 const DEFAULT_VERIFY_INTERVAL_DAYS = 30;
@@ -48,6 +59,8 @@ const OWN_KEYS = new Set([
 	"injectBudgetTokens",
 	"archiveThreshold",
 	"halfLives",
+	"embeddingPreset",
+	"rerankPreset",
 	"embeddingModel",
 	"embeddingBaseUrl",
 	"embeddingApiKeyEnv",
@@ -59,14 +72,13 @@ const OWN_KEYS = new Set([
 	"rerankInputTopK",
 	"ftsTopK",
 	"vecTopK",
+	"vecMinScore",
 	"rrfK",
 	"dreamerIdleMinutes",
-	"dreamerIntervalHours",
 	"dreamerMaxRounds",
 	"dreamerTimeoutMs",
 	"verifyIntervalDays",
 	"compartmentBudgetTokens",
-	"dreamerWorkspaceRoot",
 	"dreamerProvider",
 	"dreamerModel",
 ]);
@@ -74,7 +86,8 @@ const OWN_KEYS = new Set([
 /** Resolve the exact provider/model durably routed for the latest request. */
 function routedTarget(session) {
 	const config = session.requestHeader()?.config;
-	if (config === undefined || config.provider.length === 0 || config.model.length === 0) return undefined;
+	if (typeof config?.provider !== "string" || config.provider.length === 0
+		|| typeof config.model !== "string" || config.model.length === 0) return undefined;
 	return { provider: config.provider, model: config.model };
 }
 
@@ -87,6 +100,26 @@ function delay(ms, signal) {	return new Promise((resolve) => {
 	});
 }
 
+function waitForSignal(promise, signal) {
+	if (signal === undefined) return promise;
+	signal.throwIfAborted();
+	return new Promise((resolve, reject) => {
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		const onAbort = () => {
+			cleanup();
+			reject(signal.reason ?? new Error("operation aborted"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then((value) => {
+			cleanup();
+			resolve(value);
+		}, (error) => {
+			cleanup();
+			reject(error);
+		});
+	});
+}
+
 /** Join the text blocks of one message content value. */
 function extractText(content) {
 	if (!Array.isArray(content)) return "";
@@ -94,7 +127,7 @@ function extractText(content) {
 }
 
 export class ContextEngine extends BasicCompactionEngine {
-	static inject = ["llm", "tokenMeter", "sessions", "systemPrompt", "tools", "timer"];
+	static inject = ["llm", "tokenMeter", "sessions", "systemPrompt", "tools", "commands"];
 	static Config = z.object({
 		thresholdRatio: z.number(),
 		retainRatio: z.number(),
@@ -131,6 +164,8 @@ export class ContextEngine extends BasicCompactionEngine {
 			CONVENTIONS: z.number(),
 			PREFERENCES: z.number(),
 		}),
+		embeddingPreset: z.string(),
+		rerankPreset: z.string(),
 		embeddingModel: z.string(),
 		embeddingBaseUrl: z.string(),
 		embeddingApiKeyEnv: z.string(),
@@ -142,14 +177,13 @@ export class ContextEngine extends BasicCompactionEngine {
 		rerankInputTopK: z.number().step(1).min(1),
 		ftsTopK: z.number().step(1).min(1),
 		vecTopK: z.number().step(1).min(1),
+		vecMinScore: z.number().min(0).max(1),
 		rrfK: z.number().step(1).min(1),
 		dreamerIdleMinutes: z.number().step(1).min(1),
-		dreamerIntervalHours: z.number().step(1).min(1),
 		dreamerMaxRounds: z.number().step(1).min(1),
 		dreamerTimeoutMs: z.number().step(1).min(1000),
 		verifyIntervalDays: z.number().step(1).min(1),
 		compartmentBudgetTokens: z.number().step(1).min(1),
-		dreamerWorkspaceRoot: z.string(),
 		dreamerProvider: z.string(),
 		dreamerModel: z.string(),
 	});
@@ -159,18 +193,21 @@ export class ContextEngine extends BasicCompactionEngine {
 	agentBySession = new WeakMap();
 	inFlight = new Map(); // sessionId -> Promise
 	overflowRetries = new WeakMap();
-	injection = new WeakMap(); // session -> { text }
-	idleTimers = new WeakMap(); // session -> timer
+	injection = new WeakMap(); // session -> { text, consumed }
+	idleTimers = new Map(); // session -> timer
 	dreamerBusy = false;
 
 	constructor(ctx, config = {}) {
+		const configured = mergeContextConfig(config);
 		const own = {};
 		for (const key of OWN_KEYS) {
-			if (config[key] !== undefined) own[key] = config[key];
+			if (configured[key] !== undefined) own[key] = configured[key];
 		}
-		const basicConfig = { ...config };
+		const basicConfig = { ...configured };
 		for (const key of OWN_KEYS) delete basicConfig[key];
 		super(ctx, { ...basicConfig, auto: false });
+		const embeddingPreset = LOCAL_EMBEDDING_PRESETS[configured.embeddingPreset];
+		const rerankPreset = LOCAL_RERANK_PRESETS[configured.rerankPreset];
 		this.ownConfig = {
 			generateThreshold: own.generateThreshold ?? DEFAULT_GENERATE_THRESHOLD,
 			retainRounds: own.retainRounds ?? DEFAULT_RETAIN_ROUNDS,
@@ -185,42 +222,56 @@ export class ContextEngine extends BasicCompactionEngine {
 			retrievalConfig: {
 				ftsTopK: own.ftsTopK ?? 20,
 				vecTopK: own.vecTopK ?? 20,
+				vecMinScore: own.vecMinScore ?? 0.35,
 				rrfK: own.rrfK ?? 60,
 				rerankTopN: own.rerankTopN ?? 5,
 				rerankInputTopK: own.rerankInputTopK ?? 20,
-				embedding: typeof own.embeddingModel === "string" && own.embeddingModel.length > 0 && typeof own.embeddingBaseUrl === "string" && own.embeddingBaseUrl.length > 0
-					? new EmbeddingClient({
-						baseUrl: own.embeddingBaseUrl,
-						model: own.embeddingModel,
-						...(typeof own.embeddingApiKeyEnv === "string" && own.embeddingApiKeyEnv.length > 0
-							? { apiKey: process.env[own.embeddingApiKeyEnv] }
-							: {}),
-					})
-					: undefined,
-				rerank: typeof own.rerankModel === "string" && own.rerankModel.length > 0 && typeof own.rerankBaseUrl === "string" && own.rerankBaseUrl.length > 0
-					? new RerankClient({
-						baseUrl: own.rerankBaseUrl,
-						model: own.rerankModel,
-						...(typeof own.rerankApiKeyEnv === "string" && own.rerankApiKeyEnv.length > 0
-							? { apiKey: process.env[own.rerankApiKeyEnv] }
-							: {}),
-					})
-					: undefined,
+				embedding: embeddingPreset !== undefined
+					? new LocalEmbeddingClient({ preset: embeddingPreset.id })
+					: typeof own.embeddingModel === "string" && own.embeddingModel.length > 0 && typeof own.embeddingBaseUrl === "string" && own.embeddingBaseUrl.length > 0
+						? new EmbeddingClient({
+							baseUrl: own.embeddingBaseUrl,
+							model: own.embeddingModel,
+							...(typeof own.embeddingApiKeyEnv === "string" && own.embeddingApiKeyEnv.length > 0
+								? { apiKey: process.env[own.embeddingApiKeyEnv] }
+								: {}),
+						})
+						: undefined,
+				rerank: rerankPreset !== undefined
+					? new LocalRerankClient({ preset: rerankPreset.id })
+					: typeof own.rerankModel === "string" && own.rerankModel.length > 0 && typeof own.rerankBaseUrl === "string" && own.rerankBaseUrl.length > 0
+						? new RerankClient({
+							baseUrl: own.rerankBaseUrl,
+							model: own.rerankModel,
+							...(typeof own.rerankApiKeyEnv === "string" && own.rerankApiKeyEnv.length > 0
+								? { apiKey: process.env[own.rerankApiKeyEnv] }
+								: {}),
+						})
+						: undefined,
 			},
 			dreamerConfig: {
 				idleMinutes: own.dreamerIdleMinutes ?? DEFAULT_DREAMER_IDLE_MINUTES,
-				intervalHours: own.dreamerIntervalHours ?? DEFAULT_DREAMER_INTERVAL_HOURS,
 				maxRounds: own.dreamerMaxRounds ?? DEFAULT_DREAMER_MAX_ROUNDS,
 				timeoutMs: own.dreamerTimeoutMs ?? DEFAULT_DREAMER_TIMEOUT_MS,
 				verifyIntervalDays: own.verifyIntervalDays ?? DEFAULT_VERIFY_INTERVAL_DAYS,
 				compartmentBudgetTokens: own.compartmentBudgetTokens ?? DEFAULT_COMPARTMENT_BUDGET_TOKENS,
-				workspaceRoot: own.dreamerWorkspaceRoot ?? "",
 				provider: own.dreamerProvider ?? "",
 				model: own.dreamerModel ?? "",
 			},
 		};
-		this.cdb = openDatabase(resolveDshHome());
-		ctx.effect(() => () => this.cdb.close(), "dsh-plugin-context db");
+		this.cdb = openDatabase(resolveDshHome(), { embeddingDim: embeddingPreset?.embeddingDim ?? own.embeddingDim });
+		ctx.effect(() => () => {
+			for (const timer of this.idleTimers.values()) clearTimeout(timer);
+			this.idleTimers.clear();
+			this.cdb.close();
+		}, "dsh-plugin-context db");
+		installContextCommands(ctx, {
+			cdb: this.cdb,
+			memoryConfig: this.ownConfig.memoryConfig,
+			retrieval: this.ownConfig.retrievalConfig,
+			resolveScope: (session) => sessionMemoryScope(session),
+			runDreamer: (agent) => this._runDreamerForAgent(agent),
+		});
 		this._installParagraphSystem(ctx);
 		this._installMemorySystem(ctx);
 		this._registerTriggers(ctx);
@@ -228,40 +279,120 @@ export class ContextEngine extends BasicCompactionEngine {
 
 	/** Paragraph numbering (Phase 2) mounts on the engine's context. */
 	_installParagraphSystem(ctx) {
-		ctx.on("session/event", createParagraphAssigner(this.cdb));
+		const assignParagraph = createParagraphAssigner(this.cdb);
+		ctx.on("session/event", assignParagraph);
 		const wrapped = new WeakSet();
+		ctx.on("session/event", (session, event) => {
+			if (event.type !== "step/end") return;
+			const injection = this.injection.get(session);
+			if (injection !== undefined) injection.consumed = true;
+			this._refreshContextUsage(session);
+		});
+		ctx.on("session/event", (session, event) => {
+			if (event.surfaceOp !== undefined) this._refreshContextUsage(session);
+		});
 		ctx.on("agent/session-start", ({ agent }) => {
 			this.agentBySession.set(agent.session, agent);
 			const session = agent.session;
 			if (wrapped.has(session)) return;
 			wrapped.add(session);
-			this.refreshInjection(session); // new conversation: inject memories
+			for (const event of session.events) assignParagraph(session, event);
+			const resumed = session.events.some((event) => event.type === "step/end");
+			this.refreshInjection(session, { consumed: resumed });
+			this._refreshContextUsage(session);
 			installParagraphInjector(session, this.cdb, {
 				extraMessage: () => {
 					const inj = this.injection.get(session);
-					if (inj === undefined || inj.text.length === 0) return null;
+					if (inj === undefined || inj.consumed || inj.text.length === 0) return null;
 					return { role: "user", content: [{ type: "text", text: inj.text }] };
 				},
 			});
 		});
 		ctx.systemPrompt.section(PARAGRAPH_SECTION);
 		ctx.tools.register(createReduceTool(this.cdb));
+		ctx.tools.register(createExpandTool(this.cdb));
 	}
 
 	/** project_memory (Phase 5): tools, prompt section, injection refresh. */
 	_installMemorySystem(ctx) {
-		ctx.tools.register(createMemoryTool(this.cdb, this.ownConfig.retrievalConfig));
-		ctx.tools.register(createSearchTool(this.cdb, this.ownConfig.memoryConfig, this.ownConfig.retrievalConfig));
+		const resolveScope = (session) => sessionMemoryScope(session);
+		ctx.tools.register(createMemoryTool(this.cdb, this.ownConfig.retrievalConfig, { resolveScope }));
+		ctx.tools.register(createSearchTool(this.cdb, this.ownConfig.memoryConfig, this.ownConfig.retrievalConfig, { resolveScope }));
 		ctx.systemPrompt.section(MEMORY_SECTION);
 	}
 
 	/** Re-select and cache the <project_memory> injection block for one session. */
-	refreshInjection(session) {
-		const selected = selectInjectionMemories(this.cdb, this.ownConfig.memoryConfig);
+	refreshInjection(session, { consumed = false } = {}) {
+		const selected = selectInjectionMemories(this.cdb, this.ownConfig.memoryConfig, Date.now(), sessionMemoryScope(session));
 		const text = renderInjectionText(selected);
 		for (const memory of selected) recordInjectionHit(this.cdb, memory, this.ownConfig.memoryConfig);
-		this.injection.set(session, { text });
+		const memoryTokens = text.length === 0
+			? 0
+			: typeof this.ctx.tokenMeter.estimateMessage === "function"
+				? this.ctx.tokenMeter.estimateMessage(createUserMessage({ content: [{ type: "text", text }] }))
+				: estimateTokens(text);
+		this.injection.set(session, { text, consumed, memoryCount: selected.length, memoryTokens });
+		this._refreshContextUsage(session);
+		if (selected.length > 0) {
+			this._notify(
+				this.agentBySession.get(session),
+				`Inject Memory: ${selected.length} project memor${selected.length === 1 ? "y" : "ies"}`,
+				`Injected ${selected.length} project memor${selected.length === 1 ? "y" : "ies"} into the next model request.`,
+			);
+		}
 		return text;
+	}
+
+	/** Publish only checkpoint and initial-injection tokens present in the current window. */
+	_refreshContextUsage(session) {
+		const injection = this.injection.get(session);
+		if (typeof this.ctx.tokenMeter.measure !== "function" || !Array.isArray(session?.surface?.nodes)) {
+			setContextUsage(session?.id, { memories: { count: injection?.memoryCount ?? 0, tokens: injection?.memoryTokens ?? 0, consumed: injection?.consumed !== false } });
+			return;
+		}
+		const measurement = this.ctx.tokenMeter.measure(session);
+		const tokensBySeq = new Map((measurement.nodes ?? []).map((node) => [node.seq, node.tokens]));
+		let compartmentCount = 0;
+		let compartmentTokens = 0;
+		for (const [index, seq] of session.surface.nodes.entries()) {
+			const event = session.events[seq];
+			if (event?.type !== "user/message" || event.data?.source === undefined || !isCompactCheckpointSource(event.data.source)) continue;
+			compartmentCount += 1;
+			compartmentTokens += tokensBySeq.get(seq) ?? measurement.nodes?.[index]?.tokens ?? 0;
+		}
+		setContextUsage(session.id, {
+			compartments: { count: compartmentCount, tokens: compartmentTokens },
+			memories: { count: injection?.memoryCount ?? 0, tokens: injection?.memoryTokens ?? 0, consumed: injection?.consumed !== false },
+		});
+	}
+
+	/** Keep secondary UI notices from changing the compaction outcome. */
+	_notify(agent, summary, text) {
+		try {
+			injectContextNotice(agent, summary, text);
+		} catch (error) {
+			this.ctx.logger.warn(`context UI notice failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	/** Announce one checkpoint entering the model-visible surface. */
+	_announceCompartment(agent, compartment, result) {
+		this._notify(
+			agent,
+			`Inject Compartments: generation ${compartment.generation}`,
+			[
+				`Injected compartment generation ${compartment.generation} into the conversation surface.`,
+				`Covered paragraphs: ${compartment.start_para}-${compartment.end_para}.`,
+				`Replaced ${result.shadowedSeqs.length} history items (~${result.shadowedTokenCount} tokens).`,
+			].join("\n"),
+		);
+	}
+
+	_clearIdleTimer(session) {
+		const timer = this.idleTimers.get(session);
+		if (timer === undefined) return;
+		clearTimeout(timer);
+		this.idleTimers.delete(session);
 	}
 
 	_registerTriggers(ctx) {
@@ -276,11 +407,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		});
 		// Dreamer idle trigger: any session activity resets a per-session timer.
 		ctx.on("session/event", (session) => {
-			const existing = this.idleTimers.get(session);
-			if (existing !== undefined) {
-				clearTimeout(existing);
-				this.idleTimers.delete(session);
-			}
+			this._clearIdleTimer(session);
 			const timer = setTimeout(() => {
 				this.idleTimers.delete(session);
 				const agent = this.agentBySession.get(session);
@@ -291,12 +418,10 @@ export class ContextEngine extends BasicCompactionEngine {
 			}, this.ownConfig.dreamerConfig.idleMinutes * 60 * 1000);
 			this.idleTimers.set(session, timer);
 		});
-		// Dreamer periodic trigger (24h default).
-		ctx.setInterval(() => {
-			this._runDreamerGlobal().catch((error) => {
-				ctx.logger.warn(`periodic dreamer run failed: ${error instanceof Error ? error.message : String(error)}`);
-			});
-		}, this.ownConfig.dreamerConfig.intervalHours * 3600 * 1000);
+		ctx.on("session/disposed", (session) => {
+			this._clearIdleTimer(session);
+			clearContextUsage(session?.id);
+		});
 		// 80%: land a ready compartment before the next step.
 		ctx.on("agent/pre-step", async ({ agent, signal }, next) => {
 			if (!signal.aborted) {
@@ -346,45 +471,103 @@ export class ContextEngine extends BasicCompactionEngine {
 		return info.context?.contextWindow;
 	}
 
-	/** 65% trigger: start the background organizer for a new generation. */
-	async maybeGenerate(agent) {
+	/** Remove ready rows whose stored checkpoint can never shrink its source span. */
+	_readyCompartments(sessionId) {
+		const ready = this.cdb.readyCompartments(sessionId);
+		return ready.filter((compartment) => {
+			const shadowedTokens = Number(compartment.shadowed_tokens);
+			if (!Number.isFinite(shadowedTokens) || shadowedTokens <= 0) return true;
+			const framedTokens = estimateFramedSummaryTokens(this.ctx.tokenMeter, compartment.summary);
+			if (framedTokens < shadowedTokens) return true;
+			this.cdb.setCompartmentStatus(compartment.id, "failed");
+			this.ctx.logger.warn(`compartment ${compartment.id} is not shrinkable: ${framedTokens} framed tokens >= ${shadowedTokens} source tokens`);
+			return false;
+		});
+	}
+
+	/** Create one fixed-range compartment and finish its summary lifecycle. */
+	async _createAndSummarize(agent, range, shadowedTokens) {
 		const session = agent.session;
 		const id = session.id;
-		if (this.inFlight.has(id)) return;
+		const minimumFramedTokens = estimateFramedSummaryTokens(this.ctx.tokenMeter, "");
+		if (shadowedTokens <= minimumFramedTokens) {
+			this.ctx.logger.warn(`compartment generation skipped: ${shadowedTokens} source tokens cannot fit the ${minimumFramedTokens}-token checkpoint framing`);
+			return null;
+		}
+		const generation = this.cdb.maxGeneration(id) + 1;
+		const compartmentId = this.cdb.insertCompartment({
+			sessionId: id,
+			scopePath: sessionMemoryScope(session),
+			generation,
+			startSeq: range.start,
+			endSeq: range.end,
+			startPara: this.cdb.paragraphFor(id, range.start) ?? 0,
+			endPara: this.cdb.paragraphFor(id, range.end) ?? 0,
+			summary: "",
+			shadowedTokens,
+		});
+		this._notify(
+			agent,
+			`Compartment generation started: generation ${generation}`,
+			`Started background summary generation for compartment generation ${generation}.`,
+		);
+		try {
+			const target = this.config.summarizationProvider.length > 0 && this.config.summarizationModel.length > 0
+				? { provider: this.config.summarizationProvider, model: this.config.summarizationModel }
+				: routedTarget(session);
+			const parsed = await summarizeCompartment(this.ctx, this.cdb, {
+				session,
+				compartment: this.cdb.compartmentById(compartmentId),
+				range,
+				scopePath: sessionMemoryScope(session),
+				target,
+			});
+			this._notify(
+				agent,
+				`Compartment summary ready: #${compartmentId}`,
+				[
+					`Compartment ${compartmentId} summary completed.`,
+					`Captured range: ${range.start}-${range.end}.`,
+					`Extracted ${parsed.facts.length} project fact${parsed.facts.length === 1 ? "" : "s"}.`,
+				].join("\n"),
+			);
+		} catch (error) {
+			this.cdb.setCompartmentStatus(compartmentId, "failed");
+			throw error;
+		}
+		return compartmentId;
+	}
+
+	/** 65% trigger: reserve the session before any asynchronous work. */
+	maybeGenerate(agent) {
+		const id = agent.session.id;
+		const existing = this.inFlight.get(id);
+		if (existing !== undefined) return existing;
+		const task = this._maybeGenerate(agent);
+		this.inFlight.set(id, task);
+		const clear = () => {
+			if (this.inFlight.get(id) === task) this.inFlight.delete(id);
+		};
+		task.then(clear, clear);
+		return task;
+	}
+
+	async _maybeGenerate(agent) {
+		const session = agent.session;
+		const id = session.id;
 		this._registerUnownedCheckpoints(agent); // migrate legacy checkpoints once
-		if (this.cdb.readyCompartments(id).length > 0) return;
+		if (this._readyCompartments(id).length > 0) return;
 		const contextWindow = await this._contextWindow(agent);
 		if (contextWindow === undefined) return;
 		const measurement = this.ctx.tokenMeter.measure(session);
 		if (measurement.totalTokens < this.ownConfig.generateThreshold * contextWindow) return;
-		const range = selectCompartmentRange(session, { retainRounds: this.ownConfig.retainRounds });
+		const paragraphFor = (sessionId, seq) => this.cdb.paragraphFor(sessionId, seq);
+		const range = selectCompartmentRange(session, { retainRounds: this.ownConfig.retainRounds, paragraphFor })
+			?? selectManualCompartmentRange(session, { retainRounds: this.ownConfig.retainRounds, paragraphFor });
 		if (range === null) return;
 		const shadowedTokens = measurement.nodes.slice(range.startIdx, range.endIdx + 1)
 			.reduce((total, node) => total + node.tokens, 0);
-		const generation = this.cdb.activeCompartments(id).length + 1;
-		const compartmentId = this.cdb.insertCompartment({
-			sessionId: id,
-			generation,
-			startSeq: range.start,
-			endSeq: range.end,
-			startPara: this.cdb.paragraphFor(id, range.start),
-			endPara: this.cdb.paragraphFor(id, range.end),
-			summary: "",
-			shadowedTokens,
-		});
-		const promise = summarizeCompartment(this.ctx, this.cdb, {
-			session,
-			compartment: this.cdb.compartmentById(compartmentId),
-			range,
-		})
-			.catch((error) => {
-				this.cdb.setCompartmentStatus(compartmentId, "failed");
-				throw error;
-			})
-			.finally(() => {
-				this.inFlight.delete(id);
-			});
-		this.inFlight.set(id, promise);
+		await this._createAndSummarize(agent, range, shadowedTokens);
 	}
 
 	/**
@@ -406,6 +589,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			const text = extractText(event.data.content);
 			const id = this.cdb.insertCompartment({
 				sessionId: session.id,
+				scopePath: sessionMemoryScope(session),
 				generation: this.cdb.maxGeneration(session.id) + 1,
 				startSeq: seq,
 				endSeq: seq,
@@ -426,25 +610,27 @@ export class ContextEngine extends BasicCompactionEngine {
 		if (contextWindow === undefined) return;
 		const measurement = this.ctx.tokenMeter.measure(session);
 		if (measurement.totalTokens < this.config.thresholdRatio * contextWindow) return;
-		let ready = this.cdb.readyCompartments(session.id);
+		let ready = this._readyCompartments(session.id);
 		if (ready.length === 0) {
 			const inFlight = this.inFlight.get(session.id);
 			if (inFlight === undefined) return;
 			await Promise.race([inFlight, delay(this.ownConfig.waitReadyTimeoutMs, signal)]);
-			ready = this.cdb.readyCompartments(session.id);
+			ready = this._readyCompartments(session.id);
 			if (ready.length === 0) return; // still not ready: skip this landing round
 		}
+		signal?.throwIfAborted();
 		await this.land(agent, ready[0], signal);
 	}
 
 	/** One landing (automatic owner). */
 	async land(agent, compartment, signal) {
-		await landCompartment(
+		const result = await landCompartment(
 			{ session: agent.session, cdb: this.cdb, meter: this.ctx.tokenMeter, agent },
 			compartment,
 			{ owner: "current-turn", signal },
 		);
-		this.refreshInjection(agent.session); // landing: re-select memories
+		this._announceCompartment(agent, compartment, result);
+		return result;
 	}
 
 	/** Remove archived checkpoint nodes from the surface (compaction/prune protocol). */
@@ -482,13 +668,28 @@ export class ContextEngine extends BasicCompactionEngine {
 			: routedTarget(agent.session);
 		if (target === undefined) return { skipped: true, reason: "no route" };
 		if (this.dreamerBusy) return { skipped: true, reason: "busy" };
+		const scopePath = sessionMemoryScope(agent.session);
+		const material = buildDreamerBrief(this.cdb, dreamer.verifyIntervalDays, scopePath);
+		if (material.facts.length === 0 && material.memories.length === 0 && material.compartments.length === 0) {
+			return { skipped: true, rounds: 0, ...material };
+		}
 		this.dreamerBusy = true;
+		this._notify(
+			agent,
+			"Dreamer started",
+			[
+				"Dreamer started its background memory-maintenance pass.",
+				`Pending facts: ${material.facts.length}; memories to verify: ${material.memories.length}; compartments to distill: ${material.compartments.length}.`,
+			].join("\n"),
+		);
 		try {
+			const workspaceRoot = agent.session.header?.cwd;
 			const result = await runDreamer(this.ctx, this.cdb, {
 				agent,
 				provider: target.provider,
 				model: target.model,
-				workspaceRoot: dreamer.workspaceRoot,
+				workspaceRoot,
+				scopePath,
 				maxRounds: dreamer.maxRounds,
 				timeoutMs: dreamer.timeoutMs,
 				verifyIntervalDays: dreamer.verifyIntervalDays,
@@ -501,45 +702,28 @@ export class ContextEngine extends BasicCompactionEngine {
 		}
 	}
 
-	/** Periodic Dreamer pass over any agent that has material. */
-	async _runDreamerGlobal() {
-		for (const agent of this.agentBySession.values()) {
-			if (this.dreamerBusy) return;
-			const material = this.cdb.pendingFacts().length + this.cdb.memoriesNeedingVerification(Date.now(), this.ownConfig.dreamerConfig.verifyIntervalDays).length + this.cdb.unpromotedCompartments().length;
-			if (material === 0) return;
-			await this._runDreamerForAgent(agent);
-			return;
-		}
-	}
-
 	/** Overflow / manual fallback: land a ready compartment or generate synchronously. */
 	async forceCompact(agent, signal) {
+		signal?.throwIfAborted();
 		const session = agent.session;
-		let ready = this.cdb.readyCompartments(session.id);
+		let ready = this._readyCompartments(session.id);
 		if (ready.length === 0) {
-			const range = selectCompartmentRange(session, { retainRounds: this.ownConfig.retainRounds });
-			if (range === null) return null;
-			const measurement = this.ctx.tokenMeter.measure(session);
-			const shadowedTokens = measurement.nodes.slice(range.startIdx, range.endIdx + 1)
-				.reduce((total, node) => total + node.tokens, 0);
-			const generation = this.cdb.activeCompartments(session.id).length + 1;
-			const compartmentId = this.cdb.insertCompartment({
-				sessionId: session.id,
-				generation,
-				startSeq: range.start,
-				endSeq: range.end,
-				startPara: this.cdb.paragraphFor(session.id, range.start),
-				endPara: this.cdb.paragraphFor(session.id, range.end),
-				summary: "",
-				shadowedTokens,
-			});
-			await summarizeCompartment(this.ctx, this.cdb, {
-				session,
-				compartment: this.cdb.compartmentById(compartmentId),
-				range,
-			});
-			ready = this.cdb.readyCompartments(session.id);
-			if (ready.length === 0) return null;
+			const inFlight = this.inFlight.get(session.id);
+			if (inFlight !== undefined) {
+				await waitForSignal(inFlight.catch(() => {}), signal);
+				ready = this._readyCompartments(session.id);
+			}
+			if (ready.length === 0) {
+				const paragraphFor = (sessionId, seq) => this.cdb.paragraphFor(sessionId, seq);
+				const range = selectManualCompartmentRange(session, { retainRounds: this.ownConfig.retainRounds, paragraphFor });
+				if (range === null) return null;
+				const measurement = this.ctx.tokenMeter.measure(session);
+				const shadowedTokens = measurement.nodes.slice(range.startIdx, range.endIdx + 1)
+					.reduce((total, node) => total + node.tokens, 0);
+				await this._createAndSummarize(agent, range, shadowedTokens);
+				ready = this._readyCompartments(session.id);
+				if (ready.length === 0) return null;
+			}
 		}
 		return this.land(agent, ready[0], signal);
 	}
@@ -551,37 +735,28 @@ export class ContextEngine extends BasicCompactionEngine {
 			return await agent.runMaintenance(async (agentSignal) => {
 				const operationSignal = AbortSignal.any([agentSignal, signal]);
 				operationSignal.throwIfAborted();
-				let ready = this.cdb.readyCompartments(agent.session.id);
+				let ready = this._readyCompartments(agent.session.id);
 				let compartment;
 				if (ready.length > 0) {
 					compartment = ready[0];
 				} else {
-					const range = selectCompartmentRange(agent.session, { retainRounds: this.ownConfig.retainRounds });
-					if (range === null) return null;
-					const measurement = this.ctx.tokenMeter.measure(agent.session);
-					const shadowedTokens = measurement.nodes.slice(range.startIdx, range.endIdx + 1)
-						.reduce((total, node) => total + node.tokens, 0);
-					const generation = this.cdb.activeCompartments(agent.session.id).length + 1;
-					const compartmentId = this.cdb.insertCompartment({
-						sessionId: agent.session.id,
-						generation,
-						startSeq: range.start,
-						endSeq: range.end,
-						startPara: this.cdb.paragraphFor(agent.session.id, range.start),
-						endPara: this.cdb.paragraphFor(agent.session.id, range.end),
-						summary: "",
-						shadowedTokens,
-					});
-					await summarizeCompartment(this.ctx, this.cdb, {
-						session: agent.session,
-						compartment: this.cdb.compartmentById(compartmentId),
-						range,
-					});
-					ready = this.cdb.readyCompartments(agent.session.id);
-					if (ready.length === 0) return null;
+					const inFlight = this.inFlight.get(agent.session.id);
+					if (inFlight !== undefined) await waitForSignal(inFlight.catch(() => {}), operationSignal);
+					ready = this._readyCompartments(agent.session.id);
+					if (ready.length === 0) {
+						const paragraphFor = (sessionId, seq) => this.cdb.paragraphFor(sessionId, seq);
+						const range = selectManualCompartmentRange(agent.session, { retainRounds: this.ownConfig.retainRounds, paragraphFor });
+						if (range === null) return null;
+						const measurement = this.ctx.tokenMeter.measure(agent.session);
+						const shadowedTokens = measurement.nodes.slice(range.startIdx, range.endIdx + 1)
+							.reduce((total, node) => total + node.tokens, 0);
+						await this._createAndSummarize(agent, range, shadowedTokens);
+						ready = this._readyCompartments(agent.session.id);
+						if (ready.length === 0) return null;
+					}
 					compartment = ready[0];
 				}
-				return await landCompartment(
+				const result = await landCompartment(
 					{ session: agent.session, cdb: this.cdb, meter: this.ctx.tokenMeter, agent },
 					compartment,
 					{
@@ -593,6 +768,8 @@ export class ContextEngine extends BasicCompactionEngine {
 						},
 					},
 				);
+				this._announceCompartment(agent, compartment, result);
+				return result;
 			});
 		} catch (error) {
 			if (error instanceof ManualCompactionError) throw error;

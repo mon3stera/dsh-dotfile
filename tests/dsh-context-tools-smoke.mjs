@@ -1,5 +1,5 @@
-// dsh-plugin-context ctx_reduce tool smoke test.
-import { parseParagraphList, createReduceTool } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/tools.js";
+// dsh-plugin-context ctx_reduce/ctx_expand tool smoke test.
+import { parseParagraphList, createExpandTool, createReduceTool, renderOriginalMessage } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/tools.js";
 
 let failed = 0;
 const check = (label, ok) => {
@@ -34,6 +34,33 @@ check("parse rejects reversed range", (() => { try { parseParagraphList("5-2"); 
 	check("no session empty result", JSON.stringify(none) === '{"marked":[],"rejected":[]}');
 	// tool shape
 	check("tool metadata", tool.name === "ctx_reduce" && typeof tool.execute === "function" && tool.description.includes("paragraph"));
+}
+
+// ── ctx_expand: retrieve original log content, including hidden paragraphs ───
+{
+	const cdb = {
+		seqForParagraph: (sid, no) => ({ s1: { 7: 0, 8: 1 } })[sid]?.[no],
+	};
+	const events = {
+		0: { type: "user/message", data: { role: "user", content: [{ type: "text", text: "original hidden paragraph" }] } },
+		1: { type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: "visible answer" }] } } },
+	};
+	const session = {
+		id: "s1",
+		surface: { nodes: [1] },
+		events,
+		deriveEventMessage: (event) => event.type === "user/message" ? event.data : event.data.message,
+	};
+	const tool = createExpandTool(cdb);
+	const hidden = await tool.execute({ paragraph: 7 }, { agent: { session } });
+	check("expand hidden paragraph", hidden.found === true && hidden.seq === 0 && hidden.role === "user" && hidden.content === "original hidden paragraph");
+	const visible = await tool.execute({ paragraph: 8 }, { agent: { session } });
+	check("expand visible paragraph", visible.found === true && visible.content === "visible answer");
+	const missing = await tool.execute({ paragraph: 99 }, { agent: { session } });
+	check("expand missing paragraph", missing.found === false && missing.content.includes("not available"));
+	check("expand renders original message", renderOriginalMessage({ role: "assistant", content: [{ type: "text", text: "raw" }] }) === "raw");
+	check("expand rejects invalid number", (() => tool.execute({ paragraph: 0 }, { agent: { session } }).then(() => false, () => true))());
+	check("expand tool metadata", tool.name === "ctx_expand" && tool.description.includes("ctx_reduce"));
 }
 
 if (failed > 0) {

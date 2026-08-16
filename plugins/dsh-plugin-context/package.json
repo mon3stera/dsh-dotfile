@@ -7,9 +7,24 @@
   "exports": {
     ".": "./lib/index.js",
     "./db": "./lib/db.js",
+    "./settings": "./lib/settings.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "sqlite-vec": "^0.1.6"
   },
   "license": "MIT"

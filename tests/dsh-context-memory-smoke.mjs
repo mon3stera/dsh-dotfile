@@ -9,8 +9,10 @@ import {
 	maybeUnarchive,
 	estimateTokens,
 	DEFAULT_MEMORY_CONFIG,
+	DEFAULT_RETRIEVAL,
 	createMemoryTool,
 	createSearchTool,
+	searchMemories,
 } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/memory.js";
 import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/db.js";
 
@@ -66,7 +68,10 @@ const now = Date.now();
 		check("estimateTokens", estimateTokens("abcd") === 1 && estimateTokens("abcdefgh") === 2);
 
 		// ctx_memory tool
-		const memTool = createMemoryTool(cdb);
+		const memTool = createMemoryTool(cdb, {}, { resolveScope: () => "/repo/a" });
+		const unscopedTool = createMemoryTool(cdb);
+		const unscopedWrite = await unscopedTool.execute({ action: "write", category: "ARCHITECTURE", summary: "missing scope", content: "should reject", importance: 1 });
+		check("project write rejects missing scope", unscopedWrite.ok === false);
 		const wrote = await memTool.execute({ action: "write", category: "CONSTRAINTS", summary: "no prod writes", content: "never write the prod DB directly", importance: 7 });
 		check("ctx_memory write", wrote.ok === true && typeof wrote.id === "number" && cdb.memoryById(wrote.id).category === "CONSTRAINTS");
 		const badWrite = await memTool.execute({ action: "write", category: "CONSTRAINTS" });
@@ -81,6 +86,29 @@ const now = Date.now();
 		const res = await searchTool.execute({ query: "auth", limit: 5 });
 		check("ctx_search finds auth", res.results.length === 1 && res.results[0].id === a && res.results[0].category === "ARCHITECTURE");
 		check("ctx_search records hit", cdb.memoryById(a).hits > 1);
+		const crossField = await memTool.execute({
+			action: "write",
+			category: "ENVIRONMENT",
+			summary: "临时工具连通性测试记忆",
+			content: "唯一测试标记：ctx-test-2025-02-14-works。",
+			importance: 1,
+		});
+		const crossFieldResult = await searchTool.execute({ query: "ctx-test-2025-02-14-works 临时工具连通性测试记忆" });
+		check("ctx_search joins summary and content terms", crossFieldResult.results.length === 1 && crossFieldResult.results[0].id === crossField.id);
+		await memTool.execute({ action: "delete", id: crossField.id });
+		const scopedA = cdb.writeMemory({ category: "ARCHITECTURE", scopePath: "/repo/a", summary: "scope marker alpha", content: "project A", importance: 8 });
+		const scopedB = cdb.writeMemory({ category: "ARCHITECTURE", scopePath: "/repo/b", summary: "scope marker beta", content: "project B", importance: 8 });
+		const selectedA = selectInjectionMemories(cdb, { ...cfg, injectBudgetTokens: 1000 }, now, "/repo/a");
+		const selectedB = selectInjectionMemories(cdb, { ...cfg, injectBudgetTokens: 1000 }, now, "/repo/b");
+		const selectedUnknown = selectInjectionMemories(cdb, { ...cfg, injectBudgetTokens: 1000 }, now, null);
+		check("scoped injection isolates project memories", selectedA.some((row) => row.id === scopedA) && !selectedA.some((row) => row.id === scopedB) && selectedB.some((row) => row.id === scopedB) && !selectedB.some((row) => row.id === scopedA));
+		check("preferences remain global", selectedA.some((row) => row.id === b) && selectedB.some((row) => row.id === b) && !selectedUnknown.some((row) => row.id === scopedA) && selectedUnknown.some((row) => row.id === b));
+		const scopedSearchA = await searchMemories(cdb, cfg, DEFAULT_RETRIEVAL, "scope marker", 10, "/repo/a");
+		check("scoped search excludes other project", scopedSearchA.some((row) => row.id === scopedA) && !scopedSearchA.some((row) => row.id === scopedB));
+		const scopedTool = createMemoryTool(cdb, {}, { resolveScope: () => "/repo/a" });
+		const crossDelete = await scopedTool.execute({ action: "delete", id: scopedB }, { agent: { session: {} } });
+		check("scoped delete rejects cross-project memory", crossDelete.ok === false && cdb.memoryById(scopedB).scope_path === "/repo/b");
+		check("scoped update rejects cross-project memory", cdb.updateMemory(scopedB, { summary: "wrong" }, "/repo/a") === false);
 		const none = await searchTool.execute({ query: "nonexistentxyz" });
 		check("ctx_search empty", none.results.length === 0);
 		cdb.close();

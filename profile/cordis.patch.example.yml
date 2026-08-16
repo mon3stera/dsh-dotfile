@@ -9,3 +9,5 @@
       name: dsh-plugin-font
     - id: dsh-plugin-hide-session-titles
       name: dsh-plugin-hide-session-titles
+    - id: dsh-plugin-context-settings
+      name: dsh-plugin-context/settings

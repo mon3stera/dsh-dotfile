@@ -20,7 +20,7 @@ try {
 	const cwd = workspace;
 
 	// ── internal tools ───────────────────────────────────────────────────────
-	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot: workspace });
+	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot: workspace, scopePath: workspace });
 	const run = (name, args) => byName.get(name).execute(args);
 
 	check("fs_list", JSON.stringify((await run("fs_list", { path: "." })).map((e) => e.name).sort()) === '["src"]');
@@ -38,17 +38,17 @@ try {
 	cdb.updateMemory(wrote.id, { archived: 0 });
 
 	// facts + compartments
-	const factId = cdb.insertFact({ sessionId: "s", fact: "auth uses TOKEN_TTL 3600s", importance: 6 });
+	const factId = cdb.insertFact({ sessionId: "s", scopePath: workspace, fact: "auth uses TOKEN_TTL 3600s", importance: 6 });
 	const promoted = await run("promote_fact", { factId, category: "ARCHITECTURE", summary: "auth ttl", content: "TOKEN_TTL=3600 in src/auth.ts", importance: 8 });
 	check("promote_fact", promoted.id !== undefined && cdb.pendingFacts().length === 0 && cdb.memoryById(promoted.id) !== undefined);
-	const c1 = cdb.insertCompartment({ sessionId: "s", generation: 1, startSeq: 1, endSeq: 5, startPara: 1, endPara: 5, summary: "x".repeat(20000) });
+	const c1 = cdb.insertCompartment({ sessionId: "s", scopePath: workspace, generation: 1, startSeq: 1, endSeq: 5, startPara: 1, endPara: 5, summary: "x".repeat(20000) });
 	cdb.setCompartmentStatus(c1, "ready");
 	cdb.markCompartmentLanded(c1, 42);
 	check("compartment_mark processed", (await run("compartment_mark", { compartmentId: c1, processed: true })).ok === true && cdb.compartmentById(c1).has_promoted_facts === 1);
 	check("compartment_mark archive", (await run("compartment_mark", { compartmentId: c1, archive: true, importance: 1 })).ok === true && cdb.compartmentById(c1).archive_flagged === 1);
 
 	// ── archival budget ──────────────────────────────────────────────────────
-	const c2 = cdb.insertCompartment({ sessionId: "s", generation: 2, startSeq: 6, endSeq: 9, startPara: 6, endPara: 9, summary: "y".repeat(10000) });
+	const c2 = cdb.insertCompartment({ sessionId: "s", scopePath: workspace, generation: 2, startSeq: 6, endSeq: 9, startPara: 6, endPara: 9, summary: "y".repeat(10000) });
 	cdb.setCompartmentStatus(c2, "ready");
 	cdb.markCompartmentLanded(c2, 43);
 	const result = runArchival(cdb, { budgetTokens: 5000 }); // both summaries exceed budget
@@ -58,7 +58,7 @@ try {
 	check("archival candidates ordered", cdb.archivalCandidates().every((c) => c.archived === 0));
 
 	// ── dreamer loop with a mock LLM ────────────────────────────────────────
-	cdb.insertFact({ sessionId: "s", fact: "deploy uses rsync", importance: 5 });
+	cdb.insertFact({ sessionId: "s", scopePath: workspace, fact: "deploy uses rsync", importance: 5 });
 	const brief = buildDreamerBrief(cdb, 30);
 	check("brief lists material", brief.facts.length === 1 && brief.brief.includes("PENDING SESSION FACTS (1)"));
 	// Mock LLM: on the first stream, emit one tool call (promote the pending
@@ -82,6 +82,7 @@ try {
 		provider: "p",
 		model: "m",
 		workspaceRoot: workspace,
+		scopePath: workspace,
 		maxRounds: 5,
 		timeoutMs: 5000,
 		verifyIntervalDays: 30,

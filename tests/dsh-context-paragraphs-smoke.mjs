@@ -48,8 +48,22 @@ const check = (label, ok) => {
 	const mixedResult4 = { type: "tool/result", seq: 12, surfaceOp: "append", data: { callId: "c4", message: { content: [{ type: "text", text: "r4" }] } } };
 	const checkpoint = { type: "user/message", seq: 13, surfaceOp: { op: "replace", start: 1, end: 12 }, data: { content: [{ type: "text", text: "checkpoint" }] } };
 	const logOnly = { type: "compaction/start", seq: 14, data: { compactionId: "x", turn: null } };
-	for (const e of [userMsg, asstMsg, toolCall1, toolResult1, reduceAsst, reduceCall, reduceResult, mixedAsst, mixedCall3, mixedCall4, mixedResult3, mixedResult4, checkpoint, logOnly]) assigner(sess, e);
-	check("assigner: user+assistant+tool-result+checkpoint numbered, ctx_reduce excluded", JSON.stringify(calls) === JSON.stringify([["s1", 1], ["s1", 2], ["s1", 4], ["s1", 8], ["s1", 12], ["s1", 13]]));
+	const expandAsst = { type: "assistant/message", seq: 15, surfaceOp: "append", data: { message: { content: [{ type: "tool-call", name: "ctx_expand", callId: "c5", arguments: "{\"paragraph\":7}" }] } } };
+	const expandCall = { type: "tool/call", seq: 16, data: { callId: "c5", name: "ctx_expand", arguments: "{\"paragraph\":7}" } };
+	const expandResult = { type: "tool/result", seq: 17, surfaceOp: "append", data: { callId: "c5", message: { content: [{ type: "text", text: "expanded" }] } } };
+	for (const e of [userMsg, asstMsg, toolCall1, toolResult1, reduceAsst, reduceCall, reduceResult, mixedAsst, mixedCall3, mixedCall4, mixedResult3, mixedResult4, checkpoint, logOnly, expandAsst, expandCall, expandResult]) assigner(sess, e);
+	check("assigner: user+assistant+tool-result+checkpoint numbered, ctx_reduce/ctx_expand excluded", JSON.stringify(calls) === JSON.stringify([["s1", 1], ["s1", 2], ["s1", 4], ["s1", 8], ["s1", 12], ["s1", 13]]));
+	const restoredCalls = [];
+	const restoredAssigner = createParagraphAssigner({ assignParagraph: (sid, seq) => restoredCalls.push([sid, seq]) });
+	const restoredSession = {
+		id: "restored",
+		events: [
+			{ type: "tool/call", seq: 0, data: { callId: "old-reduce", name: "ctx_reduce", arguments: "{}" } },
+			{ type: "tool/result", seq: 1, surfaceOp: "append", data: { message: { source: { callId: "old-reduce" }, content: [{ type: "text", text: "marked" }] } } },
+		],
+	};
+	restoredAssigner(restoredSession, restoredSession.events[1]);
+	check("assigner backtracks restored tool calls", restoredCalls.length === 0);
 }
 
 // ── injector: prefix injection + incremental cache + determinism ────────────

@@ -66,8 +66,8 @@ export function maybeUnarchive(cdb, memory, config, now = Date.now()) {
  * (archiving them lazily), sort by score, and fill the token budget with
  * summaries only. Returns the selected rows (caller records hits).
  */
-export function selectInjectionMemories(cdb, config, now = Date.now()) {
-	const scored = cdb.allInjectableMemories()
+export function selectInjectionMemories(cdb, config, now = Date.now(), scopePath) {
+	const scored = cdb.allInjectableMemories(scopePath)
 		.map((memory) => ({ memory, score: scoreMemory(memory, config, now) }))
 		.filter(({ memory, score }) => {
 			if (score < config.archiveThreshold) {
@@ -102,12 +102,14 @@ export function recordInjectionHit(cdb, memory, config, now = Date.now()) {
 }
 
 /** Build the registered ctx_memory tool (write / delete). */
-export function createMemoryTool(cdb, retrieval = {}) {
+export function createMemoryTool(cdb, retrieval = {}, { resolveScope } = {}) {
+	const scopeOf = (exec) => typeof resolveScope === "function" ? resolveScope(exec?.agent?.session) : undefined;
 	return defineTool({
 		name: "ctx_memory",
 		description: [
 			"Write a new project memory or delete an existing one.",
 			"Write requires category (ARCHITECTURE/CONSTRAINTS/CONVENTIONS/PREFERENCES/ENVIRONMENT), summary (short, injected into future contexts), content (full detail), and importance (0-10, your assessment of long-term value).",
+			"PREFERENCES are global; all other categories bind automatically to the current Git workspace.",
 			"Delete requires the numeric id of an existing memory — use ctx_search to find ids.",
 		].join(" "),
 		parameters: {
@@ -130,21 +132,23 @@ export function createMemoryTool(cdb, retrieval = {}) {
 			},
 			render: (args, value) => [{ type: "text", text: value.message }],
 		},
-		async execute(args) {
+		async execute(args, exec) {
+			const scopePath = scopeOf(exec);
 			if (args.action === "delete") {
 				if (typeof args.id !== "number") return { ok: false, message: "ctx_memory delete requires a numeric id (use ctx_search to find it)" };
-				if (cdb.memoryById(args.id) === undefined) return { ok: false, message: `memory ${args.id} does not exist` };
+				if (cdb.memoryById(args.id, scopePath) === undefined) return { ok: false, message: `memory ${args.id} does not exist in this workspace` };
 				cdb.deleteMemory(args.id);
 				return { ok: true, id: args.id, message: `deleted memory ${args.id}` };
 			}
 			if (typeof args.category !== "string" || typeof args.summary !== "string" || typeof args.content !== "string" || typeof args.importance !== "number") {
 				return { ok: false, message: "ctx_memory write requires category, summary, content, importance" };
 			}
-			const id = cdb.writeMemory({ category: args.category, summary: args.summary, content: args.content, importance: args.importance });
+			if (args.category !== "PREFERENCES" && typeof scopePath !== "string") return { ok: false, message: "project memory write requires a session workspace scope" };
+			const id = cdb.writeMemory({ category: args.category, scopePath, summary: args.summary, content: args.content, importance: args.importance });
 			if (retrieval.embedding !== undefined && cdb.vecEnabled) {
 				try {
-					const vector = await retrieval.embedding.embed(`${args.summary}\n${args.content}`);
-					cdb.setEmbedding(id, JSON.stringify(vector));
+					const vector = await retrieval.embedding.embed(args.summary);
+					cdb.setEmbedding(id, vector);
 				} catch {
 					// embedding is best-effort; the memory stays FTS-searchable
 				}
@@ -154,12 +158,17 @@ export function createMemoryTool(cdb, retrieval = {}) {
 	});
 }
 
-const MAX_CONTENT_CHARS = 4000;
+/** Render search rows identically for the agent tool and the user command. */
+export function formatSearchResults(results) {
+	if (results.length === 0) return "No memories matched.";
+	return results.map((row) => `#${row.id} [${row.category}] ${row.summary}\n${row.content}`).join("\n\n");
+}
 
 /** Retrieval defaults when no embedding/rerank configuration is present. */
 export const DEFAULT_RETRIEVAL = {
 	ftsTopK: 20,
 	vecTopK: 20,
+	vecMinScore: 0.35,
 	rrfK: 60,
 	rerankTopN: 5,
 	rerankInputTopK: 20,
@@ -171,40 +180,46 @@ export const DEFAULT_RETRIEVAL = {
  * Hybrid memory search: FTS5 top-K (+ optional vector top-K fused with RRF),
  * optional rerank to rerankTopN, hits recorded on the returned rows.
  */
-export async function searchMemories(cdb, memoryConfig, retrieval = DEFAULT_RETRIEVAL, query, limit) {
-	const fts = cdb.ftsSearch(query, retrieval.ftsTopK);
+export async function searchMemories(cdb, memoryConfig, retrieval = DEFAULT_RETRIEVAL, query, limit = 5, scopePath) {
+	const fts = cdb.ftsSearch(query, retrieval.ftsTopK, scopePath);
 	let ranked = fts.map((row) => row.id);
 	if (retrieval.embedding !== undefined && cdb.vecEnabled) {
 		try {
 			const vector = await retrieval.embedding.embed(query);
-			const vec = cdb.vecSearch(JSON.stringify(vector), retrieval.vecTopK).map((row) => row.rowid);
+			const vec = cdb.vecSearch(vector, retrieval.vecTopK, { minSimilarity: retrieval.vecMinScore ?? DEFAULT_RETRIEVAL.vecMinScore })
+				.map((row) => cdb.memoryById(row.rowid, scopePath))
+				.filter((row) => row !== undefined)
+				.map((row) => row.id);
 			ranked = rrfMerge([ranked, vec], retrieval.rrfK);
 		} catch {
 			// vector path failed: keep FTS-only ranking
 		}
 	}
-	let rows = ranked.map((id) => cdb.memoryById(id)).filter((row) => row !== undefined);
+	let rows = ranked.map((id) => cdb.memoryById(id, scopePath)).filter((row) => row !== undefined);
+	const maxResults = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 5;
 	if (retrieval.rerank !== undefined && rows.length > 0) {
 		try {
 			const docs = rows.slice(0, retrieval.rerankInputTopK).map((row) => `${row.summary}\n${row.content}`);
 			const order = await retrieval.rerank.rerank(query, docs);
-			rows = order.slice(0, retrieval.rerankTopN).map((entry) => rows[entry.index]).filter((row) => row !== undefined);
+			rows = order.slice(0, Math.min(maxResults, retrieval.rerankTopN)).map((entry) => rows[entry.index]).filter((row) => row !== undefined);
 		} catch {
-			rows = rows.slice(0, retrieval.rerankTopN);
+			rows = rows.slice(0, Math.min(maxResults, retrieval.rerankTopN));
 		}
 	} else {
-		rows = rows.slice(0, limit);
+		rows = rows.slice(0, maxResults);
 	}
 	const now = Date.now();
 	for (const row of rows) {
 		cdb.recordMemoryHit(row.id, now);
-		if (row.archived !== 0) maybeUnarchive(cdb, row, memoryConfig, now);
+		const updated = cdb.memoryById(row.id, scopePath);
+		if (updated?.archived !== 0) maybeUnarchive(cdb, updated, memoryConfig, now);
 	}
 	return rows;
 }
 
 /** Build the registered ctx_search tool (FTS5 + optional vec/RRF/rerank). */
-export function createSearchTool(cdb, memoryConfig = DEFAULT_MEMORY_CONFIG, retrieval = DEFAULT_RETRIEVAL) {
+export function createSearchTool(cdb, memoryConfig = DEFAULT_MEMORY_CONFIG, retrieval = DEFAULT_RETRIEVAL, { resolveScope } = {}) {
+	const scopeOf = (exec) => typeof resolveScope === "function" ? resolveScope(exec?.agent?.session) : undefined;
 	return defineTool({
 		name: "ctx_search",
 		description: [
@@ -236,21 +251,17 @@ export function createSearchTool(cdb, memoryConfig = DEFAULT_MEMORY_CONFIG, retr
 					},
 				},
 			},
-			render: (args, value) => {
-				if (value.results.length === 0) return [{ type: "text", text: "No memories matched." }];
-				const text = value.results.map((r) => `#${r.id} [${r.category}] ${r.summary}\n${r.content}`).join("\n\n");
-				return [{ type: "text", text }];
-			},
+			render: (args, value) => [{ type: "text", text: formatSearchResults(value.results) }],
 		},
-		async execute(args) {
+		async execute(args, exec) {
 			const limit = typeof args.limit === "number" ? Math.max(1, Math.min(10, Math.floor(args.limit))) : 5;
-			const rows = await searchMemories(cdb, memoryConfig, retrieval, args.query, limit);
+			const rows = await searchMemories(cdb, memoryConfig, retrieval, args.query, limit, scopeOf(exec));
 			return {
 				results: rows.map((row) => ({
 					id: row.id,
 					category: row.category,
 					summary: row.summary,
-					content: row.content.slice(0, MAX_CONTENT_CHARS),
+					content: row.content,
 				})),
 			};
 		},
@@ -262,7 +273,8 @@ export const MEMORY_SECTION = {
 	name: "context-project-memory",
 	order: 101,
 	text: [
-		"<project_memory> blocks at the top of the context contain this project's durable memories (summary only, most relevant first).",
+		"<project_memory> blocks at the top of the context contain durable memories for the current Git workspace (summary only, most relevant first).",
+		"PREFERENCES are global; ARCHITECTURE, CONSTRAINTS, CONVENTIONS, and ENVIRONMENT memories are bound to the current Git worktree and are never shared across projects.",
 		"Ask ctx_search for full details; write durable facts (architecture decisions, constraints, conventions, preferences, environment) with ctx_memory so they survive compaction and future sessions.",
 	].join(" "),
 };

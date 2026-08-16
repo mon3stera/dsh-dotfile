@@ -6,7 +6,7 @@
 
 1. **压缩异步化**：摘要生成不阻塞 agent loop；阈值到达时落地只是投影替换（秒级）。
 2. **细粒度、可召回**：压缩产物按 Compartment 切分，原始信息永远可从会话日志召回。
-3. **长期记忆**：`<project_memory>` 记忆库，跨会话/跨压缩保留重要事实。
+3. **长期记忆**：`<project_memory>` 记忆库，在同一 workspace scope 内跨会话/跨压缩保留重要事实；`PREFERENCES` 可跨 workspace。
 
 ## 2. 架构总览
 
@@ -23,7 +23,7 @@
   请求组装 ────────►│  [注入层] 段落号 §N§ + <project_memory> 块        │
    (deriveMessages)│   (视图层包装, 不进 session 日志)                 │
                     │                                                │
-  工具调用 ────────►│  [工具] ctx_reduce / ctx_memory / ctx_search     │
+  工具调用 ────────►│  [工具] ctx_reduce / ctx_expand / memory       │
                     │                                                │
                     └───────────────┬────────────────────────────────┘
                                     │
@@ -45,7 +45,7 @@ surface 增长
    │     totalTokens ≥ 0.65 × contextWindow 且当前无 in-flight 生成
    │     → 后台启动整理者（不阻塞回合）
    │
-   ├─ 整理者: 对 [最后一个 checkpoint 之后 … 最近 N 轮之前] 的轮次
+   ├─ 整理者: 对 [最后一个 checkpoint 之后 … 最近 N 个段落之前] 的段落
    │     ① 生成 Compartment 摘要（排除 Skip 段落）
    │     ② 提取重要事实 → 写入 session_facts（status=pending，
    │        是否提升为正式记忆由 Dreamer 决定，见 §4.7）
@@ -58,8 +58,8 @@ surface 增长
 
 Compartment 状态机：`generating → ready → landed`；`generating → failed`（可重试）。
 
-- **覆盖范围固化**：Compartment 在 65% 生成时刻确定 `start_seq..end_seq`（end = 最近 N 轮起点的轮次边界，即 turn 边界，天然平衡切割）。落地时替换**就是**这个固化范围，绝不外扩。
-- **保留尾**：生成时刻的最近 N 轮 + 生成之后所有新增轮次，全部原文保留。
+- **覆盖范围固化**：Compartment 在 65% 生成时刻确定 `start_seq..end_seq`（保留最近 N 个有 paragraph number 的 model-visible 消息，并在 tool pairing 安全边界截断）。落地时替换**就是**这个固化范围，绝不外扩。
+- **保留尾**：生成时刻的最近 N 个段落 + 生成之后所有新增内容，全部原文保留。
 - **链式多代**：每代 checkpoint 节点永久留在 surface：`[C1][C2]…[Ck] + 原文尾`。下一代只摘要上一代落地点之后的新内容，**不对旧 checkpoint 二次摘要**（避免信息损失）。后续单独设计"重整"机制（数据库按代次/覆盖 seqs/段落号区间建立索引，为重整预留）。
 - **落地后**：若 surface 仍高于 65%（极端保留尾过大），立即进入下一代生成循环，自洽无需特殊处理。
 - **Dreamer 归档**：旧 checkpoint 节点由 Dreamer 标记、代码逻辑真实归档（§4.7），归档会从 surface 移除 checkpoint 节点并更新预算——这是落地之外唯一允许的 surface 变更。
@@ -70,27 +70,38 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 - **注入**：`deriveMessages()` 包装层，对每个消息第一个 text block 加 `§N§ ` 前缀。纯视图层，**不写入 session 日志**。
 - **排除规则**（不分配号）：
   - 辅助 LLM 调用（摘要、标题等）——它们不走 `deriveMessages`，天然排除（实现时验证所有调用点）。
-  - `ctx_reduce` 工具调用自身：assistant 节点若含 `ctx_reduce` tool-call 跳过；对应的 tool/result 通过 callId 回溯 `tool/call` 的 name 判断跳过。
-- **失效**：落地后 checkpoint 节点占一个新号；旧号保留在库中但不可见。`ctx_reduce` 引用不可见号 → 返回错误"段落 X 不在当前上下文"，不静默。
-- **系统提示词**（注册 systemPrompt 段）：说明 §N§ 格式、编号单调递增、落地后旧号失效、ctx_reduce 用法。
+  - `ctx_reduce` / `ctx_expand` 工具调用自身：assistant 节点若含对应 tool-call 跳过；对应的 tool/result 通过 callId 回溯 `tool/call` 的 name 判断跳过。
+- **失效**：落地后 checkpoint 节点占一个新号；旧号保留在库中但不可见。`ctx_reduce` 对不可见号返回 `rejected`，不写入 `skip_marks`；`ctx_expand` 仍可从 session log 回查旧号。
+- **系统提示词**（注册 systemPrompt 段）：说明 §N§ 格式、编号单调递增、落地后旧号行为、ctx_reduce 和 ctx_expand 用法。
 - **token 计量偏差**：tokenMeter 计价不含 §N§ 前缀（每消息约 +5~15 token），阈值判定偏差可接受；如需精确可在配置中加 offset。
+
+### 3.2.1 Composer 占用明细
+
+输入框下方的 Context Compact 行只统计当前 model-visible window 中真实存在的内容：
+
+- `Compartments`：当前 surface 中实际存在的 Compartment checkpoint 节点及其 token-meter token。
+- `Memories`：session 开始时注入的初始 memory block；只有尚未消费、仍会进入当前 model request 时计入，`ctx_memory` 后续检索不计入。
+- generating、ready、archived、已从 surface 移除的 Compartment，以及不在当前 request 中的 memory，都显示为不占用。
 
 ### 3.3 落地事务（事件契约，与内置一致）
 
 `compaction/start`（锁）→ `compaction/summary`（含代次、覆盖范围、shadowedSeqs、摘要）→ `user/message`（`surfaceOp:{op:"replace",start,end}` + `compactCheckpointSource(compactionId)` + `sourceEventSeqs`）→ `compaction/end`。复用 `BasicCompactionEngine` 的事务、稳定性断言、`/compact`（`compactNow` → `runMaintenance`）。
 
-### 3.4 ctx_reduce 工具
+### 3.4 ctx_reduce / ctx_expand 工具
 
-- schema：`{paragraphs: string}`，格式 `"1-2,5,11-12"`。
-- handler：解析区间 → 校验在可见范围内 → 写入 `skip_marks`（seq + paragraph_no）→ 返回标记结果。
+- `ctx_reduce` schema：`{paragraphs: string}`，格式 `"1-2,5,11-12"`。
+- `ctx_reduce` handler：解析区间 → 校验在可见范围内 → 写入 `skip_marks`（seq + paragraph_no）→ 返回标记结果。
+- `ctx_expand` schema：`{paragraph: number}`，传入一个段落号。
+- `ctx_expand` handler：通过 `paragraphs(session_id, paragraph_no) -> seq` 回查 session log，返回原始 role 和 content；不要求段落仍在当前 surface，因此可恢复已被 checkpoint 替换的历史内容。
 - 生效：整理者生成摘要时从输入中过滤 Skip 段落。
-- 召回：Skip 只影响摘要输入；原文永远在日志中可召回。
+- 召回：Skip 只影响摘要输入；原文永远在日志中可通过 `ctx_expand` 召回。
 
 ### 3.5 降级策略
 
+- 65% 自动生成：优先保留配置的 `retainRounds` 个段落；如果可见段落不足，则降级到短历史策略，至少保留最近一个段落并压缩更早内容。长 tool-heavy turn 因此也能生成 Compartment。
 - 落地时 Compartment 未就绪（仍在生成/失败）→ 等待在途生成（限时 60s）→ 仍失败则**跳过本次落地**，日志告警，等待下一轮触发。不阻塞回合。
 - `context-window-exceeded` 溢出恢复：优先用就绪 Compartment；没有则**同步生成**（溢出时必须立刻释放空间，允许阻塞）。
-- `/compact` 手动：有就绪 Compartment 则落地；否则同步生成（用户预期立即生效）。
+- `/compact` 手动：有就绪 Compartment 则落地；否则同步生成（用户预期立即生效）。历史少于 `retainRounds` 时，手动/溢出路径会降低保留尾部但至少保留最近一个段落；候选范围还必须大于固定 checkpoint framing，否则直接跳过，不发起必然失败的摘要请求。
 
 ## 4. 子系统 B：project_memory
 
@@ -101,7 +112,8 @@ CREATE TABLE IF NOT EXISTS memories (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   category    TEXT NOT NULL CHECK(category IN
                 ('ARCHITECTURE','CONSTRAINTS','CONVENTIONS','PREFERENCES','ENVIRONMENT')),
-  summary     TEXT NOT NULL,        -- 简短总结（注入用）
+  scope_path  TEXT,                 -- canonical Git worktree root; NULL for global preferences/legacy rows
+   summary     TEXT NOT NULL,        -- 简短总结（注入用）
   content     TEXT NOT NULL,        -- 详细内容（召回用）
   importance  REAL NOT NULL DEFAULT 5,   -- I₀，ctx_memory 时 LLM 给定 (0~10)
   hits        INTEGER NOT NULL DEFAULT 0, -- k
@@ -137,7 +149,8 @@ CREATE TABLE IF NOT EXISTS skip_marks (
 CREATE TABLE IF NOT EXISTS compartments (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id   TEXT NOT NULL,
-  generation   INTEGER NOT NULL,
+  scope_path   TEXT,                 -- Git worktree root of the source session
+   generation   INTEGER NOT NULL,
   start_seq    INTEGER NOT NULL,
   end_seq      INTEGER NOT NULL,
   start_para   INTEGER NOT NULL,
@@ -160,7 +173,8 @@ CREATE TABLE IF NOT EXISTS compartments (
 CREATE TABLE IF NOT EXISTS session_facts (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id   TEXT NOT NULL,
-  compartment_id INTEGER,           -- 来源 Compartment；可为 NULL
+  scope_path   TEXT,                 -- Git worktree root of the source session
+   compartment_id INTEGER,           -- 来源 Compartment；可为 NULL
   fact         TEXT NOT NULL,       -- 事实内容（面向 Dreamer，可带上下文引用）
   importance   REAL NOT NULL DEFAULT 5,  -- 整理者初步评分（Dreamer 可覆盖）
   status       TEXT NOT NULL DEFAULT 'pending',  -- pending / promoted / discarded
@@ -168,6 +182,14 @@ CREATE TABLE IF NOT EXISTS session_facts (
   promoted_memory_id INTEGER        -- 提升后对应的 memories.id
 );
 ```
+
+### 4.1.1 Scope 规则
+
+- session 的绝对 `cwd` 解析为 canonical Git worktree root；非 Git workspace 使用 canonical cwd。
+- `PREFERENCES` 的 `scope_path` 永远为 NULL，跨 workspace 共享。
+- `ARCHITECTURE`、`CONSTRAINTS`、`CONVENTIONS`、`ENVIRONMENT` 必须匹配当前 Git root 才能注入或被 `ctx_search` 返回。
+- 当前 scope 未知时只允许全局偏好；旧数据库中没有 `scope_path` 的非偏好记忆不会自动注入，避免跨项目泄漏。
+- 同一 scope 下的 FTS、vector、Dreamer verification、fact promotion 都使用同一过滤规则。
 
 ### 4.2 重要性时间衰减 S(t)
 
@@ -201,10 +223,12 @@ S(t) = I₀ · (1 + α·ln(1+k)) · exp(−(ln2/τ_eff)·Δt)
 ### 4.4 召回（ctx_search）
 
 1. **双通路**：FTS5 全文（`memories_fts MATCH`）top-K；向量检索（`memories_vec MATCH` + k，配置 embedding 后启用）top-K。
-2. **RRF 合并**：`RRF(d) = Σ 1/(60 + rank_i(d))`，两通路排序合并。
-3. **rerank**（配置模型后启用）：RRF 合并后的 top-K′ 与查询原文送入 rerank 模型，选出最相关 5 条。
-4. 命中的 5 条 k+1。
-5. 无 embedding/rerank 配置时自动降级为纯 FTS5 检索。
+2. **向量语义**：写入向量只对 `summary` embedding；sqlite-vec 返回 memory rowid 后再回查完整 `content`。
+3. **最低匹配度**：向量统一单位化，sqlite-vec L2 distance 换算为 cosine similarity；低于 `vecMinScore`（默认 `0.35`）的 vector 结果在进入 RRF 前丢弃。
+4. **RRF 合并**：`RRF(d) = Σ 1/(60 + rank_i(d))`，两通路排序合并。
+5. **rerank**（配置模型后启用）：RRF 合并后的 top-K′ 与查询原文及完整 memory content 送入 rerank 模型，选出最相关 5 条。
+6. 命中的结果 k+1；`ctx_search` 返回完整 `content`。
+7. 无 embedding/rerank 配置时自动降级为纯 FTS5 检索。
 
 ### 4.5 ctx_memory 工具
 
@@ -251,7 +275,7 @@ FROM compartments WHERE has_promoted_facts = 0 ORDER BY created_at;
 | 工具 | 作用 |
 |---|---|
 | `sql_query` | 只读 SQL（校验必须以 SELECT 开头），进一步检索数据库 |
-| `fs_read` / `fs_grep` / `fs_glob` | 只读扫描代码库（根 = 配置的 workspaceRoot，**无写工具**） |
+| `fs_list` / `fs_read` / `fs_grep` | 只读扫描代码库（根 = 配置的 workspaceRoot，**无写工具**） |
 | `memory_write` | 直接写记忆（合并时用） |
 | `memory_update` | 修正已有记忆（id + 字段） |
 | `memory_archive` | 注销过时记忆 |
@@ -263,7 +287,8 @@ FROM compartments WHERE has_promoted_facts = 0 ORDER BY created_at;
 **触发**
 
 1. **会话空闲**：`session/event` 监听重置计时器，会话 15 分钟（可配）无新事件且存在 pending 素材/待校验记忆 → 触发该会话的 Dreamer run。
-2. **定时**：每 24 小时（可配，cordis timer）→ 全局一次，汇总所有会话的素材处理。
+
+当前暂不启用全局定时触发；Dreamer 只在有活动会话进入 idle 后运行。
 
 **真实归档（Dreamer 结束后，代码逻辑）**
 
@@ -280,9 +305,9 @@ FROM compartments WHERE has_promoted_facts = 0 ORDER BY created_at;
 | 引擎 | `class ContextEngine extends BasicCompactionEngine`；覆盖 `summarize()`（返回预存 Compartment）与 `compactIfNeeded()`（选段 = 固化范围；继承 pre-step/溢出/compactNow 框架） |
 | 65% 触发 | `ctx.on("session/event")` 在 `step/end`/`turn/end` 低频检查 tokenMeter（single-flight 防重） |
 | 段落号+memory 注入 | 包装 `session.deriveMessages()`（agent/session-start 时对 session 实例包装；闭包捕获 ctx 拿 tokenMeter/数据库） |
-| 工具 | `ctx.tools.register()`：ctx_reduce / ctx_memory / ctx_search（含 presentResult） |
+| 工具 | `ctx.tools.register()`：ctx_reduce / ctx_expand / ctx_memory / ctx_search（含 presentResult） |
 | 系统提示词 | `ctx.systemPrompt` 注册两个 section（段落号说明、memory 说明） |
-| Dreamer loop | 自建轻量工具循环（`ctx.llm.stream` 多轮），辅助调用不占段落号；空闲触发 = `session/event` 计时器，定时 = cordis timer；single-flight |
+| Dreamer loop | 自建轻量工具循环（`ctx.llm.stream` 多轮），辅助调用不占段落号；空闲触发 = `session/event` 计时器；single-flight |
 | 数据库 | `node:sqlite` + `{allowExtension:true}` + `sqlite-vec`（`sqlite-vec` + `sqlite-vec-linux-x64` npm 包）；FTS5 原生 |
 | 挂载 | `~/.dsh/.agent-presets/my-compact/agent.cordis.yml` 替换 `compaction-basic` 行（保留 command-compact、tool-result-pruner），`cordis.patch.yml` 设 default；host 侧插件需重启 |
 
@@ -293,63 +318,83 @@ FROM compartments WHERE has_promoted_facts = 0 ORDER BY created_at;
 ## 6. 配置（插件 Config schema）
 
 ```yaml
-engine:
-  generateThreshold: 0.65     # 生成阈值
-  landThreshold: 0.8          # 落地阈值（= basic thresholdRatio）
-  retainRounds: 20            # 最近 N 轮（生成时刻锁定）
-  waitReadyTimeoutMs: 60000   # 落地时等待在途摘要上限
-memory:
-  injectBudgetTokens: 4000
-  alpha: 0.4
-  beta: 0.2
-  halfLives: { ARCHITECTURE: null, CONSTRAINTS: null, ENVIRONMENT: null,
-               CONVENTIONS: 30, PREFERENCES: 14 }   # null = ∞（天）
-  archiveThreshold: 0.15
-  ftsTopK: 20
-  vecTopK: 20
-  rrfK: 60
-  rerankTopN: 5
-  embeddingModel: ''          # 空 = 关闭向量通路
-  embeddingDim: 1024
-  rerankModel: ''             # 空 = 关闭 rerank
-dreamer:
-  idleMinutes: 15             # 会话空闲触发
-  intervalHours: 24           # 定时触发
-  maxRounds: 20               # 工具循环轮次上限
-  timeoutMs: 600000           # 总超时
-  verifyIntervalDays: 30      # 记忆校验周期
-  compartmentBudgetTokens: 40000   # 未归档 Compartments 总预算
-  workspaceRoot: ''           # 代码库扫描根；空 = 跟随会话 cwd
-  provider: ''                # 空 = 跟随会话路由
-  model: ''
+# ContextEngine 当前接收扁平配置；未列出的字段使用插件默认值。
+thresholdRatio: 0.8            # 落地阈值（BasicCompactionEngine）
+generateThreshold: 0.65         # 后台生成阈值
+retainRounds: 20               # 最近 N 个段落（生成时刻锁定）
+waitReadyTimeoutMs: 60000      # 落地时等待在途摘要上限
+alpha: 0.4
+beta: 0.2
+injectBudgetTokens: 4000
+archiveThreshold: 0.15
+halfLives:
+  CONVENTIONS: 30
+  PREFERENCES: 14              # 其他类别省略 = 永不衰减
+ftsTopK: 20
+vecTopK: 20
+rrfK: 60
+embeddingPreset: ''             # bge-m3 = 本地 BGE-M3，自动下载到 $DSH_HOME/context/.cache
+rerankPreset: ''                # bge-reranker-v2-m3 = 本地 rerank，独立下载到同一缓存
+rerankTopN: 5
+rerankInputTopK: 20
+embeddingModel: ''             # 空 = 关闭向量通路
+embeddingBaseUrl: ''
+embeddingApiKeyEnv: ''
+embeddingDim: 1024
+rerankModel: ''                # 空 = 关闭 rerank
+rerankBaseUrl: ''
+rerankApiKeyEnv: ''
+dreamerIdleMinutes: 15          # 会话空闲触发
+dreamerMaxRounds: 20            # 工具循环轮次上限
+dreamerTimeoutMs: 600000        # 总超时
+verifyIntervalDays: 30          # 记忆校验周期
+compartmentBudgetTokens: 40000  # 未归档 Compartments 总预算
+dreamerProvider: ''             # 空 = 跟随会话路由
+dreamerModel: ''
 ```
 
-## 7. UI 展示
+`embeddingPreset: bge-m3` 和 `rerankPreset: bge-reranker-v2-m3` 分别使用 `Xenova/bge-m3` 与 `onnx-community/bge-reranker-v2-m3-ONNX` 的 q8 ONNX 权重；每个预设独立由 Web host 后台下载，模型缓存位于 `$DSH_HOME/context/.cache`。
 
-系统事件需要在会话界面中可见（不污染 session 日志——展示事件为 log-only ignorable，记忆注入内容本身不入日志的设计不变）。
+## 7. 用户命令
+
+ContextEngine 为当前 agent 注册用户侧命令：
+
+```text
+/ctx-search <query> [--limit N]
+```
+
+它复用 `ctx_search` 的 FTS/vector/RRF/rerank 路径、结果格式和 memory hit 记录；`N` 范围为 1-10，默认 5。
+
+```text
+/dream
+```
+
+立即对当前 session 运行一次 Dreamer 整合；无参数，执行结果会返回本次轮数和待处理 material 数量。已有 Dreamer 运行时会返回 busy，无 provider/model route 时会返回跳过原因。
+
+## 8. UI 展示
+
+已接入 DSH 现有的上下文注入 UI。通知使用 `agent.inject(createUserMessage(...))` 排队到下一次 pre-step，并以 `source: { kind: "plugin", plugin: "dsh-plugin-context", form: "notice" }` 写入 session；Web 的 `ContextInjectionRow` 会将它显示为默认折叠的上下文注入行。
 
 **展示内容**
 
 | 事件 | 内容 |
 |---|---|
-| Inject Memories | 本次注入的记忆列表（`[ARCHITECTURE] 摘要…`，可展开看类别/重要性），注入时机：新对话首轮 + Compartment 落地后 |
-| Inject Compartments | 落地/就绪的 Compartment：代次、覆盖段落区间、摘要预览、保留尾轮数 |
-| Dreamer | 启动（原因：空闲 15min / 定时 24h）、阶段（校验/提升/合并/归档）、结果统计（校验 N 条、提升 M 条、归档 K 个） |
+| Inject Memory | 选中的 project memory 数量，并说明它们会进入下一次模型请求；完整 memory 文本仍由 deriveMessages 的动态注入提供 |
+| Inject Compartments | Compartment 代次、覆盖段落区间、替换的历史项数量和估算 token 数 |
+| Dreamer started | Dreamer 启动及本次维护批次中的 pending facts、待校验 memories、待整理 compartments 数量 |
+| Compartment summary ready | 总结完成的 Compartment id、捕获的事件范围和抽取出的 project facts 数量 |
 
-**机制**（Phase 8 调研 dsh-client-ui-conversation 的消息插槽后定稿）
+通知本身是模型可见的短 context message，因此与 plan-mode、jobs 等现有 context notice 行为一致；完整 checkpoint 摘要仍由内置 compaction 行渲染，memory 正文仍保持动态注入，不重复写入通知。
 
-- host 侧：事件写入数据库（已有）+ append log-only session 事件（ignorable，如 `context/memory-injected {memoryIds}`、`context/compartment-landed {compartmentId}`、`context/dreamer {phase, detail}`）+ 提供 `GET /context/events?sessionId&since` route 供客户端拉取。
-- client 侧：读取事件 → 在会话流渲染系统消息卡片；若 conversation 无消息插槽，退化为会话头部状态条（类似 stats strip 的位置）。
-
-## 8. 实现阶段
+## 9. 实现阶段
 
 1. **数据层**：node:sqlite 封装（allowExtension、DDL、迁移、vec0 绑定坑：整数 rowid 用 exec/bigint）
 2. **段落号系统**：paragraphs 表、deriveMessages 包装、排除规则、§N§ 提示词段
 3. **异步引擎**：ContextEngine 子类、65% 后台整理者、固化范围落地、降级策略
-4. **ctx_reduce**：工具注册、skip_marks、摘要输入过滤
+4. **ctx_reduce / ctx_expand**：工具注册、skip_marks、历史段落过滤与原文回查
 5. **project_memory**：S(t)、注入（时机/预算/命中）、ctx_memory/ctx_search、FTS5
 6. **向量 + rerank**（可选配置）：sqlite-vec、embedding 客户端、RRF、rerank 客户端
 7. **整理者产生 session_facts**：摘要时抽取事实写入 session_facts（pending）
 8. **挂载与测试**：my-compact preset、patch、烟雾测试（真实 GUI 验证）
-9. **Dreamer**：只读工具集（sql_query/fs_read/memory_*/promote_fact/compartment_mark）、轻量 loop、空闲+定时触发、归档例程（compaction/prune 协议 + 预算 + 优先级）
-10. **UI 展示**：log-only 事件 + `/context/events` route；调研 conversation 消息插槽 → 渲染 Inject Memories / Inject Compartments / Dreamer 卡片（无插槽则退化为会话头部状态条）；client.js + 挂载
+9. **Dreamer**：只读工具集（sql_query/fs_read/memory_*/promote_fact/compartment_mark）、轻量 loop、会话空闲触发、归档例程（compaction/prune 协议 + 预算 + 优先级）
+10. **UI 展示**：复用 DSH `agent.inject()` + `form: "notice"` 的 ContextInjectionRow，接入 Inject Memory、Inject Compartments、Dreamer started 和 Compartment summary ready 四类通知

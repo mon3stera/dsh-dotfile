@@ -2,6 +2,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { parseOrganizerOutput, buildSummarizationInput } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/summarizer.js";
 import { ContextEngine } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/engine.js";
+import { getContextUsage } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/usage.js";
 
 let failed = 0;
 const check = (label, ok) => {
@@ -64,20 +65,43 @@ const check = (label, ok) => {
 		// Load ContextEngine against a stub context; it must not throw and must
 		// split own keys out of the basic config (auto forced false).
 		const stubs = [];
+		const registeredTools = [];
 		const fakeCtx = {
 			effect: () => () => {},
 			logger: { warn: () => {} },
+			tokenMeter: { estimateMessage: () => 178 },
 			on: (name, handler) => { stubs.push([name, handler]); },
-			setInterval: () => {},
 			systemPrompt: { section: () => {} },
-			tools: { register: () => {} },
+			tools: { register: (tool) => registeredTools.push(tool) },
 			reflect: { provide: () => () => {} },
 		};
-		const engine = new ContextEngine(fakeCtx, { generateThreshold: 0.7, retainRounds: 10, thresholdRatio: 0.8 });
+		const engine = new ContextEngine(fakeCtx, { generateThreshold: 0.7, retainRounds: 10, thresholdRatio: 0.8, embeddingDim: 4 });
 		check("own config split", engine.ownConfig.generateThreshold === 0.7 && engine.ownConfig.retainRounds === 10);
 		check("basic auto disabled", engine.config.auto === false);
 		check("basic threshold kept", engine.config.thresholdRatio === 0.8);
+		check("embedding dimension wired", engine.cdb.embeddingDim === 4);
+		check("context tools registered", registeredTools.some((tool) => tool.name === "ctx_reduce") && registeredTools.some((tool) => tool.name === "ctx_expand"));
 		check("triggers registered", stubs.some(([n]) => n === "agent/pre-step") && stubs.some(([n]) => n === "session/event") && stubs.some(([n]) => n === "agent/request-error"));
+		const injectionSession = {};
+		engine.injection.set(injectionSession, { text: "<project_memory>one time</project_memory>", consumed: false });
+		const injectionConsumer = stubs.find(([n, handler]) => n === "session/event" && String(handler).includes("injection"))?.[1];
+		injectionConsumer?.(injectionSession, { type: "step/end" });
+		check("memory injection consumed after first step", engine.injection.get(injectionSession).consumed === true);
+		check("periodic trigger removed", !stubs.some(([n]) => n === "timer") && !stubs.some(([n]) => n === "setInterval"));
+		const shortAgent = { session: { id: "short-history" } };
+		const shortResult = await engine._createAndSummarize(shortAgent, { start: 1, end: 2 }, 100);
+		check("short source skips impossible summary", shortResult === null && engine.cdb.readyCompartments("short-history").length === 0);
+		let releaseGeneration;
+		const generationGate = new Promise((resolve) => { releaseGeneration = resolve; });
+		let generationCalls = 0;
+		engine._maybeGenerate = async () => { generationCalls += 1; await generationGate; };
+		const singleSession = { id: "single-flight" };
+		const firstGeneration = engine.maybeGenerate({ session: singleSession });
+		const secondGeneration = engine.maybeGenerate({ session: singleSession });
+		check("generation single-flight shares promise", firstGeneration === secondGeneration);
+		releaseGeneration();
+		await firstGeneration;
+		check("generation single-flight runs once", generationCalls === 1 && !engine.inFlight.has(singleSession.id));
 
 		// legacy checkpoint migration: a checkpoint node produced by the old
 		// engine (source marker present, no compartments row) gets registered
@@ -107,7 +131,7 @@ const check = (label, ok) => {
 		check("second legacy checkpoint registered", chained2.length === 2 && chained2[1].landing_seq === 3 && chained2[1].generation === 2);
 		// session/event handlers: the paragraph assigner must ignore non-surface
 		// events; the boundary handler must ignore non-boundary events.
-		const [, boundaryHandler] = stubs.filter(([n]) => n === "session/event").map(([, h]) => h);
+		const boundaryHandler = stubs.find(([n, h]) => n === "session/event" && String(h).includes("maybeGenerate"))?.[1];
 		const called = [];
 		const agent = { session: { id: "s" } };
 		engine.agentBySession.set(agent.session, agent);
@@ -118,6 +142,57 @@ const check = (label, ok) => {
 		check("boundary handler ignores assistant/message", called.length === 0);
 		boundaryHandler(agent.session, { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } });
 		check("boundary handler fires on turn/end", called.length === 1);
+
+		// Long tool-heavy sessions can exceed the pressure threshold before they
+		// reach the default retainRounds count; automatic generation must fall back
+		// to the short-history policy instead of returning no range.
+		let seq = 0;
+		const longEvents = [];
+		const add = (type, data = {}, extra = {}) => {
+			const event = { type, seq: seq++, data, ...extra };
+			longEvents.push(event);
+			return event;
+		};
+		for (let turn = 1; turn <= 3; turn += 1) {
+			add("turn/start", { turn });
+			add("user/message", { role: "user", content: [{ type: "text", text: `q${turn}` }] }, { surfaceOp: "append" });
+			add("step/start", { turn, step: 1 });
+			add("assistant/message", { turn, step: 1, message: { role: "assistant", content: [{ type: "text", text: `a${turn}` }] } }, { surfaceOp: "append" });
+			add("step/end", { turn, step: 1 });
+			add("turn/end", { turn, reason: { kind: "completed" } });
+		}
+		const longSession = {
+			id: "long-turn-history",
+			events: longEvents,
+			surface: { nodes: [1, 3, 7, 9, 13, 15] },
+			requestHeader: () => ({ config: { provider: "p", model: "m" } }),
+		};
+		engine._maybeGenerate = ContextEngine.prototype._maybeGenerate;
+		engine._contextWindow = async () => 1000;
+		engine.ctx.tokenMeter.measure = (session) => ({ totalTokens: session.surface.nodes.length * 200, nodes: session.surface.nodes.map((node) => ({ seq: node, tokens: 200 })) });
+		const generatedRanges = [];
+		engine._createAndSummarize = async (_agent, range) => { generatedRanges.push(range); return 1; };
+		await engine._maybeGenerate({ session: longSession });
+		check("automatic generation uses paragraph tail", generatedRanges.length === 1 && generatedRanges[0].start === 1 && generatedRanges[0].end === 1);
+
+		const usageSession = {
+			id: "usage-window",
+			events: {
+				1: { seq: 1, type: "user/message", data: { content: [{ type: "text", text: "q" }] } },
+				3: { seq: 3, type: "user/message", data: { content: [{ type: "text", text: "<compacted-summary>c</compacted-summary>" }], source: { kind: "plugin", plugin: "compact", compactionId: "c1" } } },
+				5: { seq: 5, type: "user/message", data: { content: [{ type: "text", text: "latest" }] } },
+			},
+			surface: { nodes: [1, 3, 5] },
+		};
+		engine.ctx.tokenMeter.measure = () => ({ nodes: [{ seq: 1, tokens: 100 }, { seq: 3, tokens: 77 }, { seq: 5, tokens: 200 }] });
+		engine.injection.set(usageSession, { memoryCount: 6, memoryTokens: 456, consumed: false });
+		engine._refreshContextUsage(usageSession);
+		let usage = getContextUsage(usageSession.id);
+		check("usage counts only visible compartment and initial memories", usage.compartments.count === 1 && usage.compartments.tokens === 77 && usage.memories.count === 6 && usage.memories.tokens === 456 && usage.totalTokens === 533);
+		engine.injection.get(usageSession).consumed = true;
+		engine._refreshContextUsage(usageSession);
+		usage = getContextUsage(usageSession.id);
+		check("consumed initial memories leave current window usage", usage.memories.count === 0 && usage.memories.tokens === 0 && usage.totalTokens === 77);
 		engine.cdb.close();
 	} finally {
 		if (savedHome === undefined) delete process.env.DSH_HOME;

@@ -26,6 +26,14 @@ export function frameCompartmentSummary(summaryText) {
 	return `${CHECKPOINT_PREAMBLE}\n\n<compacted-summary>\n${summaryText}\n</compacted-summary>`;
 }
 
+/** Estimate the framed checkpoint size used by the landing shrink guard. */
+export function estimateFramedSummaryTokens(meter, summaryText) {
+	const checkpointMessage = createUserMessage({
+		content: [{ type: "text", text: frameCompartmentSummary(summaryText) }],
+	});
+	return meter.estimateMessage(checkpointMessage);
+}
+
 /** Rejects a landing whose replacement boundaries are no longer the stored ones. */
 export class SurfaceChangedError extends Error {
 	name = "SurfaceChangedError";
@@ -107,7 +115,7 @@ function throwManualFailure(failure) {
 export async function landCompartment(deps, compartment, opts) {
 	const { session, cdb, meter } = deps;
 	const { owner, sourceCommandId, signal, flush } = opts;
-	if (owner === null) signal?.throwIfAborted();
+	signal?.throwIfAborted();
 	let selection;
 	try {
 		selection = validateRange(session, compartment.start_seq, compartment.end_seq);
@@ -141,7 +149,7 @@ export async function landCompartment(deps, compartment, opts) {
 			content: [{ type: "text", text: frameCompartmentSummary(compartment.summary) }],
 			source: compactCheckpointSource(compactionId, sourceCommandId),
 		});
-		const framed = meter.estimateMessage(checkpointMessage);
+		const framed = estimateFramedSummaryTokens(meter, compartment.summary);
 		if (framed >= compartment.shadowed_tokens) {
 			throw new Error(`stored summary is not smaller than the shadowed content (${framed} estimated framed tokens >= ${compartment.shadowed_tokens})`);
 		}
