@@ -21,8 +21,8 @@ export function startupNotice(homeDir = resolveDshHome()) {
 	].join("\n");
 }
 
-/** Print setup guidance only while the packaged preset is absent or conflicting. */
-export function apply(ctx) {
+/** Print setup guidance to the DSH process terminal while it is needed. */
+export function apply() {
 	const message = startupNotice();
-	if (message) ctx.logger.info(message);
+	if (message) console.warn(message);
 }

@@ -36,6 +36,11 @@ The command copies `context-compact` to `$DSH_HOME/.agent-presets/` without
 changing the default preset or overwriting an existing user preset. Once it is
 installed, the startup notice is suppressed.
 
+Local Transformers.js embedding and rerank models are optional. The core bundle
+uses FTS5 and external-compatible retrieval without `@huggingface/transformers`;
+install and explicitly approve that optional peer only when local model support
+is needed.
+
 ## Enable the ContextEngine
 
 `ContextEngine` is intentionally an agent-plane service. The install command

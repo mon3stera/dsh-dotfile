@@ -9,6 +9,7 @@ const patch = readFileSync(`${packageRoot}/cordis.patch.yml`, "utf8");
 if (manifest.dsh?.bundle?.patch !== "./cordis.patch.yml") throw new Error("dsh-magic-context does not declare its bundle patch");
 if (!Array.isArray(manifest.files) || !manifest.files.includes("cordis.patch.yml") || !manifest.files.includes("preset") || !manifest.files.includes("scripts")) throw new Error("bundle assets are not included in package files");
 if (manifest.bin?.["dsh-magic-context-install-preset"] !== "scripts/install-preset.mjs") throw new Error("preset installer binary is not declared");
+if (manifest.dependencies?.["@huggingface/transformers"] !== undefined || manifest.peerDependenciesMeta?.["@huggingface/transformers"]?.optional !== true) throw new Error("Transformers.js must remain optional for clean profile installs");
 if (!/- id: dsh-magic-context-startup-notice\n      name: dsh-magic-context\/notice/.test(patch)) throw new Error("bundle patch does not mount the startup notice");
 if (!/- id: dsh-magic-context-settings\n      name: dsh-magic-context\/settings/.test(patch)) throw new Error("bundle patch does not mount the settings bridge");
 if (/name: dsh-magic-context\s*$/.test(patch)) throw new Error("bundle patch must not mount the agent-plane ContextEngine host-wide");

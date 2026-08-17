@@ -90,7 +90,7 @@ Important context behavior:
 
 - Database: `$DSH_HOME/magic-context/context.db`.
 - Tables include `memories`, `memories_fts`, optional `memories_vec`, `paragraphs`, `skip_marks`, `compartments`, and `session_facts`.
-- `sqlite-vec` is optional at runtime; FTS5 remains the fallback.
+- `sqlite-vec` and `@huggingface/transformers` are optional at runtime; FTS5 remains the fallback, and Transformers.js is only needed for local embedding/rerank models.
 - Dreamer is an auxiliary `ctx.llm.stream()` loop, not a new agent/session. It reads bounded source context with `session_context`, performs dedicated memory/fact/compartment actions, and emits started/completed/failed UI notices.
 - Dreamer idle triggering is per session and is deduplicated to one run per interaction round. Background notices must not create another run without a new `turn/start`.
 - New memory writes and fact promotions carry source session/compartment provenance when available. Old memories may have no recoverable source provenance.

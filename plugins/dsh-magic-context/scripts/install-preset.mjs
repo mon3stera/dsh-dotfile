@@ -1,20 +1,28 @@
 #!/usr/bin/env node
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 
 export const PRESET_ID = "context-compact";
 const PRESET_FILES = ["agent.cordis.yml", "preset.yml"];
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+
+function resolvePresetHome() {
+	const configured = process.env.DSH_HOME?.trim();
+	if (configured === undefined || configured.length === 0) return join(homedir(), ".dsh");
+	if (configured === "~") return homedir();
+	if (configured.startsWith("~/")) return join(homedir(), configured.slice(2));
+	return resolve(configured);
+}
 
 function targetDirectory(homeDir) {
 	return join(homeDir, ".agent-presets", PRESET_ID);
 }
 
 /** Return whether the user preset is absent, ours, or an existing conflict. */
-export function presetState(homeDir = resolveDshHome()) {
+export function presetState(homeDir = resolvePresetHome()) {
 	const directory = targetDirectory(homeDir);
 	if (!existsSync(directory)) return { state: "missing", directory };
 	try {
@@ -29,7 +37,7 @@ export function presetState(homeDir = resolveDshHome()) {
 }
 
 /** Install the packaged preset without replacing any user-owned directory. */
-export function installPreset({ homeDir = resolveDshHome(), packageRoot = PACKAGE_ROOT } = {}) {
+export function installPreset({ homeDir = resolvePresetHome(), packageRoot = PACKAGE_ROOT } = {}) {
 	const target = presetState(homeDir);
 	if (target.state === "installed") return { ...target, changed: false };
 	if (target.state === "conflict") throw new Error(`preset directory already exists and does not use dsh-magic-context: ${target.directory}`);
@@ -49,7 +57,16 @@ export function installPreset({ homeDir = resolveDshHome(), packageRoot = PACKAG
 	return { ...target, state: "installed", changed: true };
 }
 
-if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainModule() {
+	if (process.argv[1] === undefined) return false;
+	try {
+		return realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
+	} catch {
+		return false;
+	}
+}
+
+if (isMainModule()) {
 	try {
 		const result = installPreset();
 		console.log(result.changed
