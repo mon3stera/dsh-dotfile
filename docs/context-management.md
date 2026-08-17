@@ -1,6 +1,6 @@
 # DSH 上下文管理系统设计文档
 
-异步 Compartment 压缩 + project_memory 记忆系统。替换内置的同步摘要压缩（`dsh-compaction-basic`），作为一个自定义 `CompactionEngine` 插件挂载在 agent preset 中。
+异步 Compartment 压缩 + project_memory 记忆系统。整体思路受 OpenCode Magic Context 启发，但基于 DSH/Cordis API 独立实现，不是其源码或行为的一比一移植。它替换内置的同步摘要压缩（`dsh-compaction-basic`），作为一个自定义 `CompactionEngine` 插件挂载在 agent preset 中。
 
 ## 1. 目标
 
