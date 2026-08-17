@@ -1,7 +1,8 @@
 # Example loader patch for the DSH web profile.
 # Copy the insert entries below into ~/.dsh/profiles/web/cordis.patch.yml
-# (or your profile's cordis.patch.yml) and place the plugin packages under
-# ~/.dsh/profiles/node_modules/. A process restart picks them up.
+# (or your profile's cordis.patch.yml). Install dsh-magic-context as a profile
+# bundle; its bundle patch supplies the host settings bridge. A process restart
+# picks the composed layers up.
 - insert:
     - id: dsh-plugin-background
       name: dsh-plugin-background
@@ -9,8 +10,7 @@
       name: dsh-plugin-font
     - id: dsh-plugin-hide-session-titles
       name: dsh-plugin-hide-session-titles
-    - id: dsh-magic-context-settings
-      name: dsh-magic-context/settings
+    # dsh-magic-context/settings is supplied by the dsh.bundle layer.
     - id: dsh-plugin-outline
       name: dsh-plugin-outline/client
 

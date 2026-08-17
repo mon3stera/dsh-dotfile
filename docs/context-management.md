@@ -318,7 +318,7 @@ FROM compartments WHERE has_promoted_facts = 0 ORDER BY created_at;
 | 系统提示词 | `ctx.systemPrompt` 注册两个 section（段落号说明、memory 说明） |
 | Dreamer loop | 自建轻量工具循环（`ctx.llm.stream` 多轮），辅助调用不占段落号；空闲触发 = `session/event` 计时器；single-flight |
 | 数据库 | `node:sqlite` + `{allowExtension:true}` + `sqlite-vec`（`sqlite-vec` + `sqlite-vec-linux-x64` npm 包）；FTS5 原生 |
-| 挂载 | `~/.dsh/.agent-presets/context-compact/agent.cordis.yml` 替换 `compaction-basic` 行（保留 command-compact、tool-result-pruner），`cordis.patch.yml` 设 default；host 侧插件需重启 |
+| 挂载 | 安装 `dsh-magic-context` bundle 提供 host settings/client；在 `~/.dsh/.agent-presets/context-compact/agent.cordis.yml` 替换 `compaction-basic` 行（保留 command-compact、tool-result-pruner），profile patch 设 default；host 侧插件需重启 |
 
 **已知权衡**：
 - 段落号 + memory 块是视图层注入，违反"model-visible 必须走日志通道"原则（memory 有数据库兜底；段落号是纯展示）。落地 checkpoint 走正式事件契约不受影响。
@@ -412,6 +412,6 @@ ContextEngine 为当前 agent 注册用户侧命令：
 5. **project_memory**：S(t)、注入（时机/预算/命中）、ctx_memory/ctx_search、FTS5
 6. **向量 + rerank**（可选配置）：sqlite-vec、embedding 客户端、RRF、rerank 客户端
 7. **整理者产生 session_facts**：摘要时抽取事实写入 session_facts（pending）
-8. **挂载与测试**：context-compact preset、patch、烟雾测试（真实 GUI 验证）
+8. **挂载与测试**：dsh-magic-context bundle、context-compact preset、patch、烟雾测试（真实 GUI 验证）
 9. **Dreamer**：只读工具集（sql_query/fs_read/memory_*/promote_fact/compartment_mark）、轻量 loop、会话空闲触发、归档例程（compaction/prune 协议 + 预算 + 优先级）
 10. **UI 展示**：复用 DSH `agent.inject()` + `form: "notice"` 的 ContextInjectionRow，接入 Inject Memory、Inject Compartments、Dreamer started 和 Compartment summary ready 四类通知

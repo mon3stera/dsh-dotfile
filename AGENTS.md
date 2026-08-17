@@ -35,6 +35,7 @@ profile/
 
 tests/
   dsh-context-*.mjs           Context plugin component and integration smoke tests
+  dsh-context-bundle-smoke.mjs Bundle manifest and host patch smoke test
   dsh-bg-smoke.mjs            Background plugin smoke test
   dsh-font-smoke.mjs          Font plugin smoke test
   dsh-session-titles-smoke.mjs  Session title plugin smoke test
@@ -47,7 +48,8 @@ All plugins use ESM and normally have this shape:
 
 ```text
 plugins/<plugin>/
-  package.json                Package name, exports, and DSH client injection
+  package.json                Package name, exports, and DSH bundle/client manifests
+  cordis.patch.yml            Profile bundle layer when the package is installable
   lib/index.js                Node/plugin entry point
   lib/client.js               Browser/client half when the plugin has UI
 ```
@@ -56,7 +58,7 @@ The `package.json` `dsh.client.inject` list declares the client runtime packages
 
 ### `dsh-magic-context`
 
-This is the main system plugin. `lib/index.js` exports `ContextEngine`, which replaces `compaction-basic` in `context-compact`.
+This is the main system plugin and an installable DSH bundle. `cordis.patch.yml` mounts the host-side settings bridge; `lib/index.js` exports `ContextEngine`, which replaces `compaction-basic` in `context-compact`. The engine must remain inside an isolated agent-preset compaction group.
 
 ```text
 lib/
@@ -117,7 +119,7 @@ Important context behavior:
 
 ## Profile Composition
 
-`profile/cordis.patch.example.yml` is an example overlay for the Web profile. It loads the Node/client plugins and sets `context-compact` as the default preset for newly created Web sessions.
+`profile/cordis.patch.example.yml` is an example overlay for the Web profile. It loads the auxiliary Node/client plugins and sets `context-compact` as the default preset for newly created Web sessions; the dsh-magic-context bundle supplies its own host settings row.
 
 `profile/agent-presets/context-compact/agent.cordis.yml` is the agent-plane composition. Important sections include:
 
@@ -169,6 +171,7 @@ node tests/dsh-context-memory-smoke.mjs
 
 Other useful context tests:
 
+- `dsh-context-bundle-smoke.mjs`: bundle manifest and host patch
 - `dsh-context-retrieval-smoke.mjs`: embedding, rerank, RRF, and degradation behavior
 - `dsh-context-local-models-smoke.mjs`: local embedding/rerank preset clients
 - `dsh-context-settings-smoke.mjs`: settings schema, model routes, and config merge

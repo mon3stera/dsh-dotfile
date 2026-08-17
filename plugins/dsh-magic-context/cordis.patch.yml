@@ -1,0 +1,8 @@
+# dsh-magic-context bundle layer.
+#
+# The host-side settings bridge is safe to load once per profile. The
+# ContextEngine itself remains an agent-preset service and must be mounted
+# inside an isolated compaction realm, not as a process-global host row.
+- insert:
+    - id: dsh-magic-context-settings
+      name: dsh-magic-context/settings
