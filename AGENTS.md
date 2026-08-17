@@ -80,6 +80,7 @@ lib/
   scope.js                  Git-worktree/session scope resolution
   usage.js                  Context usage projection for the UI
   settings.js               File-backed settings schema and HTTP bridge
+  notice.js                 Startup setup guidance for the bundle/preset boundary
   client.js                 Web settings UI and model download controls
 ```
 

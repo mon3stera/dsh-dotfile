@@ -25,8 +25,8 @@ dsh plugin --profile web add ./dsh-magic-context-0.1.0.tgz
 ```
 
 The bundle adds the host-side settings bridge and the browser settings panel.
-It does not change the user's default agent preset. Restart DSH after installing
-the bundle.
+It does not change the user's default agent preset. On the next DSH startup it
+prints a setup notice explaining this boundary and the required preset rows.
 
 ## Enable the ContextEngine
 

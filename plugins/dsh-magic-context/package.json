@@ -22,6 +22,7 @@
     "./db": "./lib/db.js",
     "./settings": "./lib/settings.js",
     "./client": "./lib/client.js",
+    "./notice": "./lib/notice.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },

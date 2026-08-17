@@ -4,5 +4,7 @@
 # ContextEngine itself remains an agent-preset service and must be mounted
 # inside an isolated compaction realm, not as a process-global host row.
 - insert:
+    - id: dsh-magic-context-startup-notice
+      name: dsh-magic-context/notice
     - id: dsh-magic-context-settings
       name: dsh-magic-context/settings
