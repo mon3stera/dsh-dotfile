@@ -172,7 +172,7 @@ window.__ModuleLoader__.load({
 			modelWaiting: "Waiting to download",
 			modelLoading: "Downloading local model…",
 			modelReady: "Local model is ready.",
-			modelFailed: "Local model download failed; retrieval will retry on use.",
+			modelFailed: "Local model is unavailable. See the error details below.",
 		};
 		const zh = {
 			title: "上下文管理",
@@ -197,7 +197,7 @@ window.__ModuleLoader__.load({
 			modelWaiting: "等待下载",
 			modelLoading: "正在下载本地模型…",
 			modelReady: "本地模型已准备好。",
-			modelFailed: "本地模型下载失败；检索时会继续重试。",
+			modelFailed: "本地模型不可用，请查看下方错误详情。",
 		};
 
 		const CSS = [
@@ -207,6 +207,7 @@ window.__ModuleLoader__.load({
 			".dctx-group{border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 10px}",
 			".dctx-models{display:flex;flex-direction:column;gap:10px;padding:2px 2px 4px}",
 			".dctx-model-progress{display:flex;flex-direction:column;gap:5px}",
+			".dctx-model-error{color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;white-space:pre-wrap;overflow-wrap:anywhere}",
 			".dctx-progress-meta{display:flex;justify-content:space-between;gap:12px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}",
 			".dctx-progress-track{height:7px;overflow:hidden;background:var(--dsw-alias-border-l2);border-radius:99px}",
 			".dctx-progress-fill{height:100%;background:var(--dsw-alias-state-business-primary);border-radius:99px;transition:width .2s ease}",
@@ -236,18 +237,18 @@ window.__ModuleLoader__.load({
 
 		function createContextStore() {
 			return defineStore({
-				init: () => ({ status: "loading", saved: clone(DEFAULTS), draft: clone(DEFAULTS), dirty: false, saving: false, message: "", modelStatus: { embedding: "idle", rerank: "idle" }, modelProgress: { embedding: 0, rerank: 0 } }),
+				init: () => ({ status: "loading", saved: clone(DEFAULTS), draft: clone(DEFAULTS), dirty: false, saving: false, message: "", modelStatus: { embedding: "idle", rerank: "idle" }, modelProgress: { embedding: 0, rerank: 0 }, modelError: { embedding: "", rerank: "" } }),
 				actions: {
-					load: (state, config) => { state.saved = merged(config); state.draft = merged(config); state.dirty = false; state.saving = false; state.status = "ready"; state.message = ""; state.modelStatus = { embedding: "idle", rerank: "idle" }; state.modelProgress = { embedding: 0, rerank: 0 }; },
+					load: (state, config) => { state.saved = merged(config); state.draft = merged(config); state.dirty = false; state.saving = false; state.status = "ready"; state.message = ""; state.modelStatus = { embedding: "idle", rerank: "idle" }; state.modelProgress = { embedding: 0, rerank: 0 }; state.modelError = { embedding: "", rerank: "" }; },
 					edit: (state, path, value) => { setAt(state.draft, path, value); state.dirty = true; state.message = ""; },
-					reset: (state) => { state.draft = clone(DEFAULTS); state.dirty = true; state.message = ""; state.modelStatus = { embedding: "idle", rerank: "idle" }; state.modelProgress = { embedding: 0, rerank: 0 }; },
+					reset: (state) => { state.draft = clone(DEFAULTS); state.dirty = true; state.message = ""; state.modelStatus = { embedding: "idle", rerank: "idle" }; state.modelProgress = { embedding: 0, rerank: 0 }; state.modelError = { embedding: "", rerank: "" }; },
 					beginSave: (state) => { state.saving = true; state.message = ""; },
 					saved: (state, config) => { state.saved = merged(config); state.draft = merged(config); state.dirty = false; state.saving = false; state.message = "saved"; },
 					failed: (state, message) => { state.saving = false; state.message = message || "failed"; },
-					modelLoading: (state, kind) => { state.modelStatus[kind] = "loading"; state.modelProgress[kind] = 0; },
+					modelLoading: (state, kind) => { state.modelStatus[kind] = "loading"; state.modelProgress[kind] = 0; state.modelError[kind] = ""; },
 					modelProgress: (state, kind, progress) => { state.modelProgress[kind] = Math.max(0, Math.min(100, Number(progress) || 0)); },
-					modelReady: (state, kind) => { state.modelStatus[kind] = "ready"; state.modelProgress[kind] = 100; },
-					modelFailed: (state, kind) => { state.modelStatus[kind] = "error"; },
+					modelReady: (state, kind) => { state.modelStatus[kind] = "ready"; state.modelProgress[kind] = 100; state.modelError[kind] = ""; },
+					modelFailed: (state, kind, error) => { state.modelStatus[kind] = "error"; state.modelError[kind] = error || ""; },
 				},
 			});
 		}
@@ -297,7 +298,7 @@ window.__ModuleLoader__.load({
 			] });
 		}
 
-		function ModelProgress({ kind, preset, status, progress, t }) {
+		function ModelProgress({ kind, preset, status, progress, error, t }) {
 			const percent = Math.max(0, Math.min(100, Number(progress) || 0));
 			const label = kind === "embedding" ? t("embeddingModelLabel") : t("rerankModelLabel");
 			const stateText = status === "loading" ? t("modelLoading") : status === "ready" ? t("modelReady") : status === "error" ? t("modelFailed") : t("modelWaiting");
@@ -307,6 +308,7 @@ window.__ModuleLoader__.load({
 					jsx("span", { children: `${Math.round(percent)}% · ${stateText}` }),
 				] }),
 				jsx("div", { className: "dctx-progress-track", role: "progressbar", "aria-valuemin": 0, "aria-valuemax": 100, "aria-valuenow": Math.round(percent), children: jsx("div", { className: "dctx-progress-fill", style: { width: `${percent}%` } }) }),
+				...(status === "error" && error ? [jsx("div", { className: "dctx-model-error", children: error })] : []),
 			] });
 		}
 
@@ -324,7 +326,7 @@ window.__ModuleLoader__.load({
 					jsx("summary", { children: t(group.key) }),
 					jsx("div", { className: "dctx-grid", children: group.fields.map((field) => jsx(Field, { key: field[0], field, state, t, edit })) }),
 				] })),
-				...(modelRows.length > 0 ? [jsx("div", { className: "dctx-models", children: modelRows.map((row) => jsx(ModelProgress, { key: row.kind, ...row, status: state.modelStatus[row.kind], progress: state.modelProgress[row.kind], t })) })] : []),
+				...(modelRows.length > 0 ? [jsx("div", { className: "dctx-models", children: modelRows.map((row) => jsx(ModelProgress, { key: row.kind, ...row, status: state.modelStatus[row.kind], progress: state.modelProgress[row.kind], error: state.modelError[row.kind], t })) })] : []),
 				jsx("div", { className: "dctx-actions", children: [
 					jsx("button", { className: "dctx-button primary", type: "button", disabled: !state.dirty || state.saving, onClick: save, children: state.saving ? t("saving") : t("save") }),
 					jsx("button", { className: "dctx-button", type: "button", disabled: state.saving, onClick: reset, children: t("reset") }),
@@ -361,8 +363,8 @@ window.__ModuleLoader__.load({
 						await wait(1000);
 					}
 					throw new Error("model download timed out");
-				} catch {
-					bound?.modelFailed(kind);
+				} catch (error) {
+					bound?.modelFailed(kind, error instanceof Error ? error.message : String(error));
 				}
 			};
 			fetch("/magic-context/config").then((response) => response.ok ? response.json() : null).then((payload) => {

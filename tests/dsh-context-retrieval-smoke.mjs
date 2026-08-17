@@ -1,7 +1,7 @@
 // dsh-magic-context retrieval smoke test (RRF, embedding/rerank clients,
 // hybrid ctx_search).
 import { mkdtempSync, rmSync } from "node:fs";
-import { rrfMerge, EmbeddingClient, RerankClient, startMockRetrievalServer } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/retrieval.js";
+import { rrfMerge, EmbeddingClient, RerankClient, LocalEmbeddingClient, TRANSFORMERS_INSTALL_COMMAND, _setTransformersLoaderForTest, startMockRetrievalServer } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/retrieval.js";
 import { searchMemories, createMemoryTool, createSearchTool, DEFAULT_MEMORY_CONFIG } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/memory.js";
 import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/db.js";
 
@@ -33,6 +33,20 @@ const check = (label, ok) => {
 		check("rerank client scores", order[0].score >= order[1].score);
 	} finally {
 		await mock.close();
+	}
+}
+
+// ── optional Transformers.js diagnostics ────────────────────────────────────
+{
+	const missing = Object.assign(new Error("Cannot find package '@huggingface/transformers' imported from retrieval.js"), { code: "ERR_MODULE_NOT_FOUND" });
+	_setTransformersLoaderForTest(Promise.reject(missing));
+	try {
+		await new LocalEmbeddingClient().embed("missing optional dependency");
+		check("missing Transformers.js rejects", false);
+	} catch (error) {
+		check("missing Transformers.js explains installation", error instanceof Error && error.message.includes("@huggingface/transformers is not installed") && error.message.includes(TRANSFORMERS_INSTALL_COMMAND));
+	} finally {
+		_setTransformersLoaderForTest(null);
 	}
 }
 

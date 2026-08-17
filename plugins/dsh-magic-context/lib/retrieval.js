@@ -95,6 +95,7 @@ export const LOCAL_RERANK_PRESETS = Object.freeze({
 });
 
 const PRESET_MAPS = Object.freeze({ embedding: LOCAL_EMBEDDING_PRESETS, rerank: LOCAL_RERANK_PRESETS });
+export const TRANSFORMERS_INSTALL_COMMAND = "dsh plugin --profile web add --allow-build=onnxruntime-node --allow-build=protobufjs --allow-build=sharp @huggingface/transformers";
 let transformersLoader = null;
 const localPipelines = new Map();
 const localStatuses = new Map();
@@ -116,9 +117,23 @@ function statusKey(kind, id) {
 	return `${kind}:${id}`;
 }
 
+function transformersLoadError(error) {
+	const detail = error instanceof Error ? error.message : String(error);
+	if (error?.code === "ERR_MODULE_NOT_FOUND" && detail.includes("@huggingface/transformers")) {
+		return new Error(`Local Transformers.js support is unavailable because @huggingface/transformers is not installed.\nInstall it with:\n  ${TRANSFORMERS_INSTALL_COMMAND}`, { cause: error });
+	}
+	return new Error(`Local Transformers.js failed to load: ${detail}`, { cause: error });
+}
+
 async function loadTransformers() {
 	if (transformersLoader === null) transformersLoader = import("@huggingface/transformers");
-	const module = await transformersLoader;
+	let module;
+	try {
+		module = await transformersLoader;
+	} catch (error) {
+		transformersLoader = null;
+		throw transformersLoadError(error);
+	}
 	const cacheDir = localCacheDir();
 	if (module.env !== undefined) {
 		module.env.cacheDir = cacheDir;

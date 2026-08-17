@@ -37,9 +37,21 @@ changing the default preset or overwriting an existing user preset. Once it is
 installed, the startup notice is suppressed.
 
 Local Transformers.js embedding and rerank models are optional. The core bundle
-uses FTS5 and external-compatible retrieval without `@huggingface/transformers`;
-install and explicitly approve that optional peer only when local model support
-is needed.
+uses FTS5 and external-compatible retrieval without `@huggingface/transformers`.
+Install the optional peer with explicit native-build approval only when local
+model support is needed:
+
+```sh
+dsh plugin --profile web add \
+  --allow-build=onnxruntime-node \
+  --allow-build=protobufjs \
+  --allow-build=sharp \
+  @huggingface/transformers
+```
+
+If a local preset is selected without this package, the settings panel reports
+the missing dependency and the same installation command; retrieval falls back
+to FTS5 until it is installed.
 
 ## Enable the ContextEngine
 
