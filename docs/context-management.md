@@ -380,6 +380,12 @@ ContextEngine 为当前 agent 注册用户侧命令：
 
 立即对当前 session 运行一次 Dreamer 整合；无参数，执行结果会返回本次轮数和待处理 material 数量。已有 Dreamer 运行时会返回 busy，无 provider/model route 时会返回跳过原因。
 
+```text
+/inject-memory
+```
+
+重新选择当前 workspace 下的可注入 Memories，并将一个完整的 `<project_memory>` block **追加**到下一次模型请求。它不会改写 deriveMessages 首部已有的 Memory block，因此不会让原有请求前缀整体失效；没有可注入 Memory 时返回成功但不排队消息。
+
 ## 8. UI 展示
 
 已接入 DSH 现有的上下文注入 UI。通知使用 `agent.inject(createUserMessage(...))` 排队到下一次 pre-step，并以 `source: { kind: "plugin", plugin: "dsh-plugin-context", form: "notice" }` 写入 session；Web 的 `ContextInjectionRow` 会将它显示为默认折叠的上下文注入行。
@@ -388,14 +394,14 @@ ContextEngine 为当前 agent 注册用户侧命令：
 
 | 事件 | 内容 |
 |---|---|
-| Inject Memory | 选中的 project memory 数量，并说明它们会进入下一次模型请求；完整 memory 文本仍由 deriveMessages 的动态注入提供 |
+| Inject Memory | 选中的 project memory 数量；自动 landing 通过 deriveMessages 动态注入，`/inject-memory` 则将完整 block 追加到下一次请求 |
 | Inject Compartments | Compartment 代次、覆盖段落区间、替换的历史项数量和估算 token 数 |
 | Dreamer started | Dreamer 启动及本次维护批次中的 pending facts、待校验 memories、待整理 compartments 数量 |
 | Dreamer completed | Dreamer 完成轮数、实际调用的维护动作摘要和归档的 Compartment 数量 |
 | Dreamer failed | Dreamer 维护失败原因 |
 | Compartment summary ready | 总结完成的 Compartment id、捕获的事件范围和抽取出的 project facts 数量 |
 
-通知本身是模型可见的短 context message，因此与 plan-mode、jobs 等现有 context notice 行为一致；完整 checkpoint 摘要仍由内置 compaction 行渲染，memory 正文仍保持动态注入，不重复写入通知。
+通知本身是模型可见的 context message，因此与 plan-mode、jobs 等现有 context notice 行为一致；完整 checkpoint 摘要仍由内置 compaction 行渲染。自动 landing 的 memory 正文保持动态注入；`/inject-memory` 明确追加完整 memory block。
 
 ## 9. 实现阶段
 

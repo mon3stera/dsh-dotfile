@@ -1,7 +1,15 @@
-import { formatSearchResults, searchMemories } from "./memory.js";
+import {
+	formatSearchResults,
+	recordInjectionHit,
+	renderInjectionText,
+	searchMemories,
+	selectInjectionMemories,
+} from "./memory.js";
+import { createContextNotice } from "./notifications.js";
 
 export const CTX_SEARCH_USAGE = "Usage: /ctx-search <query> [--limit N]";
 export const DREAM_USAGE = "Usage: /dream";
+export const INJECT_MEMORY_USAGE = "Usage: /inject-memory";
 
 /** Parse the human command input while keeping the query text intact. */
 export function parseCtxSearchInput(rawInput) {
@@ -62,6 +70,35 @@ export async function executeDreamCommand(invocation, { runDreamer }) {
 	}
 }
 
+/** Parse the argument-free append-only memory injection command. */
+export function parseInjectMemoryInput(rawInput) {
+	return String(rawInput ?? "").trim().length === 0 ? {} : { error: INJECT_MEMORY_USAGE };
+}
+
+/** Append the current memory selection to the next request without changing the derived head. */
+export async function executeInjectMemoryCommand(invocation, { cdb, memoryConfig, resolveScope }) {
+	const parsed = parseInjectMemoryInput(invocation.rawInput);
+	if (parsed.error !== undefined) return { kind: "error", text: parsed.error };
+	const agent = invocation.agent;
+	if (agent === undefined || typeof agent.inject !== "function") {
+		return { kind: "error", text: "inject-memory failed: no active agent is available." };
+	}
+	try {
+		const scopePath = typeof resolveScope === "function" ? resolveScope(agent.session) : undefined;
+		const selected = selectInjectionMemories(cdb, memoryConfig, Date.now(), scopePath);
+		if (selected.length === 0) return { kind: "success", text: "No injectable project memories are available." };
+		for (const memory of selected) recordInjectionHit(cdb, memory, memoryConfig);
+		const text = renderInjectionText(selected);
+		agent.inject(createContextNotice(
+			`Inject Memory: ${selected.length} project memor${selected.length === 1 ? "y" : "ies"}`,
+			text,
+		));
+		return { kind: "success", text: `Queued ${selected.length} project memor${selected.length === 1 ? "y" : "ies"} for the next model request.` };
+	} catch (error) {
+		return { kind: "error", text: `inject-memory failed: ${error instanceof Error ? error.message : String(error)}` };
+	}
+}
+
 /** Register per-agent ContextEngine commands over the current memory database. */
 export function installContextCommands(ctx, dependencies) {
 	const active = new Set();
@@ -75,6 +112,7 @@ export function installContextCommands(ctx, dependencies) {
 	const dreamHandler = (invocation) => track(executeDreamCommand(invocation, {
 		runDreamer: (agent) => dependencies.runDreamer(agent),
 	}));
+	const injectMemoryHandler = (invocation) => track(executeInjectMemoryCommand(invocation, dependencies));
 	return ctx.effect(function* () {
 		yield async () => Promise.allSettled(active);
 		yield ctx.commands.register({
@@ -88,6 +126,12 @@ export function installContextCommands(ctx, dependencies) {
 			description: "Run Dreamer maintenance for this session",
 			input: { hint: "(no arguments)" },
 			handler: dreamHandler,
+		});
+		yield ctx.commands.register({
+			name: "inject-memory",
+			description: "Append project memories to the next model request",
+			input: { hint: "(no arguments)" },
+			handler: injectMemoryHandler,
 		});
 	}, "dsh-plugin-context: user commands");
 }

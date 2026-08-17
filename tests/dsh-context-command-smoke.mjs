@@ -1,6 +1,6 @@
 // User-side /ctx-search command parser and execution smoke test.
 import { DEFAULT_MEMORY_CONFIG } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/memory.js";
-import { executeCtxSearchCommand, executeDreamCommand, parseCtxSearchInput, parseDreamInput } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/commands.js";
+import { executeCtxSearchCommand, executeDreamCommand, executeInjectMemoryCommand, parseCtxSearchInput, parseDreamInput, parseInjectMemoryInput } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/commands.js";
 
 let failed = 0;
 const check = (label, ok) => {
@@ -44,6 +44,29 @@ const dreamResult = await executeDreamCommand({ agent: { id: "agent-1" }, rawInp
 });
 check("dream command runs current agent", dreamAgent?.id === "agent-1" && dreamResult.kind === "success");
 check("dream command reports rounds", dreamResult.text.includes("Dreamer completed 2 rounds"));
+check("inject parser accepts no args", JSON.stringify(parseInjectMemoryInput("")) === "{}");
+check("inject parser rejects args", parseInjectMemoryInput("now").error === "Usage: /inject-memory");
+const injectableRows = [
+	{ id: 9, category: "CONVENTIONS", summary: "Use append-only context injections.", content: "Keep the existing request prefix stable.", importance: 8, hits: 0, last_hit_at: Date.now(), archived: 0 },
+];
+const injectHits = [];
+const injectedMessages = [];
+const injectCdb = {
+	allInjectableMemories() { return injectableRows; },
+	recordMemoryHit(id) { injectHits.push(id); },
+	updateMemory() {},
+};
+const injectResult = await executeInjectMemoryCommand({
+	rawInput: "",
+	agent: { session: { id: "agent-1" }, inject(message) { injectedMessages.push(message); } },
+}, {
+	cdb: injectCdb,
+	memoryConfig: DEFAULT_MEMORY_CONFIG,
+	resolveScope: () => "/repo",
+});
+check("inject command succeeds", injectResult.kind === "success");
+check("inject command appends one message", injectedMessages.length === 1 && injectedMessages[0].content[0].text.includes("<project_memory>") && injectedMessages[0].source.form === "notice");
+check("inject command records memory hit", injectHits.length === 1 && injectHits[0] === 9);
 
 if (failed > 0) {
 	console.error(`${failed} assertion(s) failed`);
