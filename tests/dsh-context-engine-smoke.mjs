@@ -2,6 +2,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { parseOrganizerOutput, buildSummarizationInput } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/summarizer.js";
 import { ContextEngine } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/engine.js";
+import { installParagraphInjector } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/paragraphs.js";
 import { getContextUsage } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/usage.js";
 
 let failed = 0;
@@ -184,6 +185,91 @@ const check = (label, ok) => {
 		boundaryHandler(agent.session, { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } });
 		check("boundary handler fires on turn/end", called.length === 1);
 
+		// A successful landing starts a fresh, unconsumed memory injection. The
+		// derived head is replaced in place, so the next request sees new memories
+		// instead of appending a second project_memory block.
+		const landingEvents = [
+			{ type: "turn/start", seq: 0, time: 0, data: { turn: 1 } },
+			{ type: "user/message", seq: 1, time: 0, data: { content: [{ type: "text", text: "landing user" }] }, surfaceOp: "append" },
+			{ type: "step/start", seq: 2, time: 0, data: { turn: 1, step: 1 } },
+			{ type: "assistant/message", seq: 3, time: 0, data: { turn: 1, step: 1, message: { content: [{ type: "text", text: "landing answer" }] } }, surfaceOp: "append" },
+		];
+		const landingSession = {
+			id: "landing-refresh",
+			header: { cwd: process.cwd() },
+			events: landingEvents,
+			surface: { nodes: [1, 3], replaceGeneration: 0 },
+			append(type, data, extra = {}) {
+				const event = { type, seq: this.events.length, time: Date.now(), data, ...extra };
+				this.events.push(event);
+				if (event.surfaceOp !== undefined) {
+					if (event.surfaceOp === "append") this.surface.nodes.push(event.seq);
+					else {
+						const startIdx = this.surface.nodes.indexOf(event.surfaceOp.start);
+						const endIdx = this.surface.nodes.indexOf(event.surfaceOp.end);
+						this.surface.nodes.splice(startIdx, endIdx - startIdx + 1, event.seq);
+						this.surface.replaceGeneration += 1;
+					}
+				}
+				return event;
+			},
+		};
+		const landingAgent = { session: landingSession, inject: () => {} };
+		const originalCdb = engine.cdb;
+		const originalMeter = engine.ctx.tokenMeter;
+		const originalRefresh = engine.refreshInjection;
+		const originalAnnounce = engine._announceCompartment;
+		const refreshCalls = [];
+		engine.cdb = { markCompartmentLanded: () => {} };
+		engine.ctx.tokenMeter = {
+			estimateMessage: () => 25,
+			measure: (session) => ({ nodes: session.surface.nodes.map((seq) => ({ seq, tokens: 1 })) }),
+		};
+		engine.refreshInjection = (session, options) => refreshCalls.push({ session, options });
+		engine._announceCompartment = () => {};
+		let landingError;
+		try {
+			await engine.land(landingAgent, {
+				id: 77,
+				start_seq: 1,
+				end_seq: 3,
+				summary: "landing summary",
+				shadowed_tokens: 100,
+				provider: "provider",
+				model: "model",
+			}, new AbortController().signal);
+		} catch (error) {
+			landingError = error;
+		} finally {
+			engine.cdb = originalCdb;
+			engine.ctx.tokenMeter = originalMeter;
+			engine.refreshInjection = originalRefresh;
+			engine._announceCompartment = originalAnnounce;
+		}
+		check("landing refreshes memory injection", landingError === undefined && refreshCalls.length === 1 && refreshCalls[0].session === landingSession && refreshCalls[0].options.consumed === false);
+
+		const memorySession = {
+			id: "memory-refresh",
+			header: { cwd: process.cwd() },
+			events: [],
+			surface: { nodes: [], replaceGeneration: 0 },
+			deriveEventMessage: () => null,
+		};
+		engine.injection.set(memorySession, { text: "<project_memory>old</project_memory>", consumed: false, memoryCount: 1, memoryTokens: 1 });
+		installParagraphInjector(memorySession, engine.cdb, {
+			extraMessage: () => {
+				const injection = engine.injection.get(memorySession);
+				return injection?.consumed || injection?.text.length === 0
+					? null
+					: { role: "user", content: [{ type: "text", text: injection.text }] };
+			},
+		});
+		check("memory head starts with cached block", memorySession.deriveMessages()[0]?.content?.[0]?.text === "<project_memory>old</project_memory>");
+		engine.cdb.writeMemory({ category: "CONVENTIONS", scopePath: process.cwd(), summary: "memory created after landing", content: "new", importance: 10 });
+		engine.refreshInjection(memorySession, { consumed: false });
+		const refreshedHead = memorySession.deriveMessages()[0]?.content?.[0]?.text ?? "";
+		check("memory head is replaced with refreshed block", refreshedHead.includes("memory created after landing") && !refreshedHead.includes("<project_memory>old</project_memory>"));
+
 		// Long tool-heavy sessions can exceed the pressure threshold before they
 		// reach the default retainRounds count; automatic generation must fall back
 		// to the short-history policy instead of returning no range.
@@ -229,11 +315,11 @@ const check = (label, ok) => {
 		engine.injection.set(usageSession, { memoryCount: 6, memoryTokens: 456, consumed: false });
 		engine._refreshContextUsage(usageSession);
 		let usage = getContextUsage(usageSession.id);
-		check("usage counts only visible compartment and initial memories", usage.compartments.count === 1 && usage.compartments.tokens === 77 && usage.memories.count === 6 && usage.memories.tokens === 456 && usage.totalTokens === 533);
+		check("usage counts visible compartment and unconsumed memory", usage.compartments.count === 1 && usage.compartments.tokens === 77 && usage.memories.count === 6 && usage.memories.tokens === 456 && usage.totalTokens === 533);
 		engine.injection.get(usageSession).consumed = true;
 		engine._refreshContextUsage(usageSession);
 		usage = getContextUsage(usageSession.id);
-		check("consumed initial memories leave current window usage", usage.memories.count === 0 && usage.memories.tokens === 0 && usage.totalTokens === 77);
+		check("consumed memory leaves current window usage", usage.memories.count === 0 && usage.memories.tokens === 0 && usage.totalTokens === 77);
 		engine.cdb.close();
 	} finally {
 		if (savedHome === undefined) delete process.env.DSH_HOME;

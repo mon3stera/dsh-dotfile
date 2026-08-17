@@ -346,7 +346,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		return text;
 	}
 
-	/** Publish only checkpoint and initial-injection tokens present in the current window. */
+	/** Publish checkpoint and unconsumed memory-injection tokens in the current window. */
 	_refreshContextUsage(session) {
 		const injection = this.injection.get(session);
 		if (typeof this.ctx.tokenMeter.measure !== "function" || !Array.isArray(session?.surface?.nodes)) {
@@ -645,15 +645,34 @@ export class ContextEngine extends BasicCompactionEngine {
 		await this.land(agent, ready[0], signal);
 	}
 
-	/** One landing (automatic owner). */
-	async land(agent, compartment, signal) {
+	/** Refresh the derived head memory block after a durable landing. */
+	_refreshMemoryAfterLanding(agent) {
+		try {
+			// The head block is not part of the surface replacement. Re-selecting it
+			// here replaces the previous block before the next model request.
+			this.refreshInjection(agent.session, { consumed: false });
+		} catch (error) {
+			// Landing has already committed; a refresh failure must not report the
+			// durable compaction as failed or cause it to be retried.
+			this.ctx.logger.warn(`memory injection refresh after landing failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	/** Commit one landing, then refresh memory for the next model request. */
+	async _landCompartment(agent, compartment, options) {
 		const result = await landCompartment(
 			{ session: agent.session, cdb: this.cdb, meter: this.ctx.tokenMeter, agent },
 			compartment,
-			{ owner: "current-turn", signal },
+			options,
 		);
+		this._refreshMemoryAfterLanding(agent);
 		this._announceCompartment(agent, compartment, result);
 		return result;
+	}
+
+	/** One landing (automatic owner). */
+	async land(agent, compartment, signal) {
+		return this._landCompartment(agent, compartment, { owner: "current-turn", signal });
 	}
 
 	/** Remove archived checkpoint nodes from the surface (compaction/prune protocol). */
@@ -797,20 +816,14 @@ export class ContextEngine extends BasicCompactionEngine {
 					}
 					compartment = ready[0];
 				}
-				const result = await landCompartment(
-					{ session: agent.session, cdb: this.cdb, meter: this.ctx.tokenMeter, agent },
-					compartment,
-					{
-						owner: null,
-						sourceCommandId,
-						signal: operationSignal,
-						flush: async () => {
-							await this.ctx.sessions.flush(agent.session);
-						},
+				return this._landCompartment(agent, compartment, {
+					owner: null,
+					sourceCommandId,
+					signal: operationSignal,
+					flush: async () => {
+						await this.ctx.sessions.flush(agent.session);
 					},
-				);
-				this._announceCompartment(agent, compartment, result);
-				return result;
+				});
 			});
 		} catch (error) {
 			if (error instanceof ManualCompactionError) throw error;

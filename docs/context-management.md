@@ -80,7 +80,7 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 输入框下方的 Context Compact 行只统计当前 model-visible window 中真实存在的内容：
 
 - `Compartments`：当前 surface 中实际存在的 Compartment checkpoint 节点及其 token-meter token。
-- `Memories`：session 开始时注入的初始 memory block；只有尚未消费、仍会进入当前 model request 时计入，`ctx_memory` 后续检索不计入。
+- `Memories`：session 开始或 Compartment 落地后注入的 memory block；只有尚未消费、仍会进入当前 model request 时计入，`ctx_memory` 后续检索不计入。
 - generating、ready、archived、已从 surface 移除的 Compartment，以及不在当前 request 中的 memory，都显示为不占用。
 
 ### 3.3 落地事务（事件契约，与内置一致）
@@ -211,7 +211,7 @@ S(t) = I₀ · (1 + α·ln(1+k)) · exp(−(ln2/τ_eff)·Δt)
 
 ### 4.3 注入
 
-- 时机：**新对话开始**（session 创建首轮）+ **Compartment 落地后**。期间注入集合缓存、静态（前缀稳定）。
+- 时机：**新对话开始**（session 创建首轮）+ **Compartment 落地后**。每次刷新都会重选当前可注入 memories，并直接替换 deriveMessages 的首条 memory block；下一次请求消费后保持静态。
 - 内容：按 S(t) 从高到低选，直到 token 预算（默认 4000 tokens，用 tokenMeter.estimateMessage 计量）或选完。只给 summary，不给 content。
 - 格式（注入在 system 之后、历史之前，视图层拼接，不进 session 日志——内容本身已持久化于数据库，可审计性由数据库保证）：
 

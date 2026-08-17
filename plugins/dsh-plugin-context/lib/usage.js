@@ -1,6 +1,6 @@
 // Per-session context usage facts shared by the agent-plane engine and the
 // process-wide Web usage route. Values describe only material present in the
-// current model-visible surface plus an unconsumed initial memory injection.
+// current model-visible surface plus an unconsumed memory injection.
 const usageBySession = new Map();
 
 const EMPTY_USAGE = Object.freeze({
