@@ -1,9 +1,9 @@
-// dsh-plugin-context Dreamer smoke test: internal tools, loop against a mock
+// dsh-magic-context Dreamer smoke test: internal tools, loop against a mock
 // LLM, and the archival code path.
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { runDreamer, runArchival, createDreamerTools, buildDreamerBrief, summarizeDreamerActions } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/dreamer.js";
-import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/db.js";
+import { runDreamer, runArchival, createDreamerTools, buildDreamerBrief, summarizeDreamerActions } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/dreamer.js";
+import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/db.js";
 
 let failed = 0;
 const check = (label, ok) => {

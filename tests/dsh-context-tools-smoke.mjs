@@ -1,5 +1,5 @@
-// dsh-plugin-context ctx_reduce/ctx_expand tool smoke test.
-import { parseParagraphList, createExpandTool, createReduceTool, renderOriginalMessage } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/tools.js";
+// dsh-magic-context ctx_reduce/ctx_expand tool smoke test.
+import { parseParagraphList, createExpandTool, createReduceTool, renderOriginalMessage } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/tools.js";
 
 let failed = 0;
 const check = (label, ok) => {

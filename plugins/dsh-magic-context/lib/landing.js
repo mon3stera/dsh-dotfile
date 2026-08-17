@@ -1,4 +1,4 @@
-// Landing transaction for dsh-plugin-context: replace a pre-stored
+// Landing transaction for dsh-magic-context: replace a pre-stored
 // compartment's FIXED surface span with one checkpoint user message.
 //
 // Follows the seam's durable contract (compaction/start → compaction/summary →

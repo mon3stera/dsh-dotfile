@@ -10,7 +10,7 @@ The repository currently has no root `package.json` or unified test runner. Most
 
 1. Read this file and `docs/context-management.md`.
 2. Inspect `git status --short --branch` before changing anything.
-3. For context work, read `plugins/dsh-plugin-context/lib/engine.js`, `db.js`, `dreamer.js`, `memory.js`, and the relevant smoke test.
+3. For context work, read `plugins/dsh-magic-context/lib/engine.js`, `db.js`, `dreamer.js`, `memory.js`, and the relevant smoke test.
 4. Check the active profile composition in `profile/agent-presets/context-compact/agent.cordis.yml` and `profile/cordis.patch.example.yml`.
 5. Treat files under `plugins/` as canonical. Do not edit the installed copy directly.
 6. After plugin changes, mirror the changed plugin to the runtime directory with the documented `rsync` procedure, then run tests against the mirrored copy.
@@ -23,7 +23,7 @@ docs/
   session-outline.md          Outline plugin behavior notes
 
 plugins/
-  dsh-plugin-context/         Compaction, memories, retrieval, provenance, Dreamer
+  dsh-magic-context/         Compaction, memories, retrieval, provenance, Dreamer
   dsh-plugin-background/      Wallpaper/background settings and upload routes
   dsh-plugin-font/            Font settings and font discovery
   dsh-plugin-hide-session-titles/  Session-title visibility toggle
@@ -54,7 +54,7 @@ plugins/<plugin>/
 
 The `package.json` `dsh.client.inject` list declares the client runtime packages and must remain compatible with the target Web profile. `lib/index.js` owns host-side services/routes or exports the service class. A browser-only plugin may have a no-op Node entry.
 
-### `dsh-plugin-context`
+### `dsh-magic-context`
 
 This is the main system plugin. `lib/index.js` exports `ContextEngine`, which replaces `compaction-basic` in `context-compact`.
 
@@ -73,7 +73,7 @@ lib/
   range.js                  Compaction range selection
   summarizer.js             Organizer LLM call and fact extraction
   landing.js                Stable checkpoint landing and surface replacement
-  commands.js               /dream and /ctx-search commands
+  commands.js               /dream, /ctx-search, and /inject-memory commands
   notifications.js          Durable ContextInjectionRow notices
   scope.js                  Git-worktree/session scope resolution
   usage.js                  Context usage projection for the UI
@@ -83,7 +83,7 @@ lib/
 
 Important context behavior:
 
-- Database: `$DSH_HOME/context/context.db`.
+- Database: `$DSH_HOME/magic-context/context.db`.
 - Tables include `memories`, `memories_fts`, optional `memories_vec`, `paragraphs`, `skip_marks`, `compartments`, and `session_facts`.
 - `sqlite-vec` is optional at runtime; FTS5 remains the fallback.
 - Dreamer is an auxiliary `ctx.llm.stream()` loop, not a new agent/session. It reads bounded source context with `session_context`, performs dedicated memory/fact/compartment actions, and emits started/completed/failed UI notices.
@@ -121,7 +121,7 @@ Important context behavior:
 
 `profile/agent-presets/context-compact/agent.cordis.yml` is the agent-plane composition. Important sections include:
 
-- `compaction` group: mounts `dsh-plugin-context` instead of `compaction-basic`, plus the compact command and result pruner.
+- `compaction` group: mounts `dsh-magic-context` instead of `compaction-basic`, plus the compact command and result pruner.
 - Other groups mount shell, filesystem, skills, goals, planning, delegation, and UI tools.
 - Isolated group realms are intentional. Do not move services between realms without checking host/preset ownership and collision behavior.
 
@@ -134,13 +134,13 @@ Use the workspace plugin as the source and preserve runtime dependencies:
 ```bash
 # Preview first.
 rsync -ani --delete --exclude 'node_modules/' \
-  plugins/dsh-plugin-context/ \
-  /home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/
+  plugins/dsh-magic-context/ \
+  /home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/
 
 # Apply after reviewing the preview.
 rsync -a --delete --exclude 'node_modules/' \
-  plugins/dsh-plugin-context/ \
-  /home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/
+  plugins/dsh-magic-context/ \
+  /home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/
 ```
 
 Use the same pattern with another plugin directory when needed. The target `node_modules/` is excluded and must remain intact. Confirm with a final dry-run or `diff`.

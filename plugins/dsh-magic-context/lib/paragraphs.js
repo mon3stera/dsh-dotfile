@@ -1,4 +1,4 @@
-// Paragraph numbering for dsh-plugin-context.
+// Paragraph numbering for dsh-magic-context.
 //
 // Every model-visible message (user output, assistant output, tool result)
 // gets a global monotonic paragraph number, persisted in the `paragraphs`

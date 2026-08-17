@@ -1,9 +1,9 @@
-// dsh-plugin-context retrieval smoke test (RRF, embedding/rerank clients,
+// dsh-magic-context retrieval smoke test (RRF, embedding/rerank clients,
 // hybrid ctx_search).
 import { mkdtempSync, rmSync } from "node:fs";
-import { rrfMerge, EmbeddingClient, RerankClient, startMockRetrievalServer } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/retrieval.js";
-import { searchMemories, createMemoryTool, createSearchTool, DEFAULT_MEMORY_CONFIG } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/memory.js";
-import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/db.js";
+import { rrfMerge, EmbeddingClient, RerankClient, startMockRetrievalServer } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/retrieval.js";
+import { searchMemories, createMemoryTool, createSearchTool, DEFAULT_MEMORY_CONFIG } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/memory.js";
+import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/db.js";
 
 let failed = 0;
 const check = (label, ok) => {

@@ -1,6 +1,6 @@
-// dsh-plugin-context landing + range selection smoke test.
-import { selectCompartmentRange, selectManualCompartmentRange } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/range.js";
-import { estimateFramedSummaryTokens, landCompartment, frameCompartmentSummary } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/landing.js";
+// dsh-magic-context landing + range selection smoke test.
+import { selectCompartmentRange, selectManualCompartmentRange } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/range.js";
+import { estimateFramedSummaryTokens, landCompartment, frameCompartmentSummary } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/landing.js";
 
 let failed = 0;
 const check = (label, ok) => {

@@ -266,7 +266,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			for (const timer of this.idleTimers.values()) clearTimeout(timer);
 			this.idleTimers.clear();
 			this.cdb.close();
-		}, "dsh-plugin-context db");
+		}, "dsh-magic-context db");
 		installContextCommands(ctx, {
 			cdb: this.cdb,
 			memoryConfig: this.ownConfig.memoryConfig,

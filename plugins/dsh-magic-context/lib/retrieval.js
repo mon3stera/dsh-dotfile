@@ -100,7 +100,7 @@ const localPipelines = new Map();
 const localStatuses = new Map();
 
 function localCacheDir() {
-	const directory = join(resolveDshHome(), "context", ".cache");
+	const directory = join(resolveDshHome(), "magic-context", ".cache");
 	mkdirSync(directory, { recursive: true });
 	return directory;
 }

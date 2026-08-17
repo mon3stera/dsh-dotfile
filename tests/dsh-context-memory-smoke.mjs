@@ -1,4 +1,4 @@
-// dsh-plugin-context project_memory smoke test (S(t), injection, tools).
+// dsh-magic-context project_memory smoke test (S(t), injection, tools).
 import { mkdtempSync, rmSync } from "node:fs";
 import {
 	scoreMemory,
@@ -13,8 +13,8 @@ import {
 	createMemoryTool,
 	createSearchTool,
 	searchMemories,
-} from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/memory.js";
-import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/db.js";
+} from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/memory.js";
+import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/db.js";
 
 let failed = 0;
 const check = (label, ok) => {

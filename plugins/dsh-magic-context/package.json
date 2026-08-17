@@ -1,7 +1,7 @@
 {
-  "name": "dsh-plugin-context",
+  "name": "dsh-magic-context",
   "version": "0.1.0",
-  "description": "Async compartment compaction + paragraph numbering + project memory (S(t) scoring, FTS5+vec retrieval) + Dreamer background maintainer for DSH",
+  "description": "Magic Context port for DSH: async compartment compaction, paragraph numbering, project memory, retrieval, and Dreamer maintenance",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

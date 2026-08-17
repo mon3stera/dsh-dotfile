@@ -3,7 +3,7 @@
 // conversation renderer shows it as a collapsed ContextInjectionRow.
 import { boundContextSummary, createUserMessage } from "@deepseek-ai/dsh-llm";
 
-const PLUGIN = "dsh-plugin-context";
+const PLUGIN = "dsh-magic-context";
 
 /** Build one durable, model-facing context notice for the next agent step. */
 export function createContextNotice(summary, text) {

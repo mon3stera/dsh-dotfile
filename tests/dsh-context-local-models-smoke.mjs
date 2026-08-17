@@ -7,7 +7,7 @@ import {
 	_setTransformersLoaderForTest,
 	ensureLocalPreset,
 	localPresetStatus,
-} from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/retrieval.js";
+} from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/retrieval.js";
 
 let failed = 0;
 const check = (label, ok) => {

@@ -1,6 +1,6 @@
 // Git/workspace scope resolution smoke test.
 import { mkdtempSync, rmSync } from "node:fs";
-import { resolveMemoryScope } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/scope.js";
+import { resolveMemoryScope } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/scope.js";
 
 let failed = 0;
 const check = (label, ok) => {
@@ -9,7 +9,7 @@ const check = (label, ok) => {
 };
 
 const repo = "/home/mon3tr/dev/dsh-dotfile";
-check("nested Git cwd resolves to worktree root", resolveMemoryScope(`${repo}/plugins/dsh-plugin-context`) === repo);
+check("nested Git cwd resolves to worktree root", resolveMemoryScope(`${repo}/plugins/dsh-magic-context`) === repo);
 const nonGit = mkdtempSync("/home/mon3tr/ctx-scope-");
 try {
 	check("non-Git workspace stays isolated by canonical cwd", resolveMemoryScope(nonGit) === nonGit);

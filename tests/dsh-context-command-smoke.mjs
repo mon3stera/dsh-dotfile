@@ -1,6 +1,6 @@
 // User-side /ctx-search command parser and execution smoke test.
-import { DEFAULT_MEMORY_CONFIG } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/memory.js";
-import { executeCtxSearchCommand, executeDreamCommand, executeInjectMemoryCommand, parseCtxSearchInput, parseDreamInput, parseInjectMemoryInput } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/commands.js";
+import { DEFAULT_MEMORY_CONFIG } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/memory.js";
+import { executeCtxSearchCommand, executeDreamCommand, executeInjectMemoryCommand, parseCtxSearchInput, parseDreamInput, parseInjectMemoryInput } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/commands.js";
 
 let failed = 0;
 const check = (label, ok) => {

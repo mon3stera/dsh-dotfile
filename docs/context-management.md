@@ -12,7 +12,7 @@
 
 ```
                     ┌────────────────────────────────────────────────┐
-                    │            dsh-plugin-context                  │
+                    │            dsh-magic-context                  │
                     │  (agent preset: context-compact)               │
                     │                                                │
   agent loop ──────►│  [引擎] CompartmentEngine 子类                  │
@@ -342,7 +342,7 @@ halfLives:
 ftsTopK: 20
 vecTopK: 20
 rrfK: 60
-embeddingPreset: ''             # bge-m3 = 本地 BGE-M3，自动下载到 $DSH_HOME/context/.cache
+embeddingPreset: ''             # bge-m3 = 本地 BGE-M3，自动下载到 $DSH_HOME/magic-context/.cache
 rerankPreset: ''                # bge-reranker-v2-m3 = 本地 rerank，独立下载到同一缓存
 rerankTopN: 5
 rerankInputTopK: 20
@@ -362,7 +362,7 @@ dreamerProvider: ''             # 空 = 跟随会话路由
 dreamerModel: ''
 ```
 
-`embeddingPreset: bge-m3` 和 `rerankPreset: bge-reranker-v2-m3` 分别使用 `Xenova/bge-m3` 与 `onnx-community/bge-reranker-v2-m3-ONNX` 的 q8 ONNX 权重；每个预设独立由 Web host 后台下载，模型缓存位于 `$DSH_HOME/context/.cache`。
+`embeddingPreset: bge-m3` 和 `rerankPreset: bge-reranker-v2-m3` 分别使用 `Xenova/bge-m3` 与 `onnx-community/bge-reranker-v2-m3-ONNX` 的 q8 ONNX 权重；每个预设独立由 Web host 后台下载，模型缓存位于 `$DSH_HOME/magic-context/.cache`。
 
 ## 7. 用户命令
 
@@ -388,7 +388,7 @@ ContextEngine 为当前 agent 注册用户侧命令：
 
 ## 8. UI 展示
 
-已接入 DSH 现有的上下文注入 UI。通知使用 `agent.inject(createUserMessage(...))` 排队到下一次 pre-step，并以 `source: { kind: "plugin", plugin: "dsh-plugin-context", form: "notice" }` 写入 session；Web 的 `ContextInjectionRow` 会将它显示为默认折叠的上下文注入行。
+已接入 DSH 现有的上下文注入 UI。通知使用 `agent.inject(createUserMessage(...))` 排队到下一次 pre-step，并以 `source: { kind: "plugin", plugin: "dsh-magic-context", form: "notice" }` 写入 session；Web 的 `ContextInjectionRow` 会将它显示为默认折叠的上下文注入行。Host bridge 使用 `/magic-context/config`、`/magic-context/usage` 和 `/magic-context/models/*` 路径。
 
 **展示内容**
 

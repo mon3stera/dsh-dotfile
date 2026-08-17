@@ -12,9 +12,20 @@ const home = mkdtempSync("/home/mon3tr/ctx-settings-");
 const savedHome = process.env.DSH_HOME;
 process.env.DSH_HOME = home;
 try {
-	const settings = await import("/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/settings.js");
-	const { ContextSettingsSchema, CONTEXT_SETTINGS_DEFAULTS, handleContextConfig, handleContextModels, handleContextUsage, mergeContextConfig } = settings;
-	const { setContextUsage, clearContextUsage } = await import("/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/usage.js");
+	const settings = await import("/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/settings.js");
+	const { ContextSettingsSchema, CONTEXT_SETTINGS_DEFAULTS, configPath, handleContextConfig, handleContextModels, handleContextUsage, mergeContextConfig, apply } = settings;
+	const registeredRoutes = [];
+	apply({
+		inject(_dependencies, callback) {
+			callback({
+				webServer: { register(route) { registeredRoutes.push(route); } },
+				effect(factory) { return factory(); },
+			});
+		},
+	});
+	check("settings uses Magic Context directory", configPath().endsWith("/magic-context/settings.json"));
+	check("HTTP routes use Magic Context namespace", registeredRoutes.map((route) => route.path).join(",") === "/magic-context/config,/magic-context/usage,/magic-context/models/status,/magic-context/models/ensure");
+	const { setContextUsage, clearContextUsage } = await import("/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/usage.js");
 	const result = ContextSettingsSchema["~standard"].validate({});
 	check("schema supplies defaults", result.issues === undefined && result.value.generateThreshold === CONTEXT_SETTINGS_DEFAULTS.generateThreshold && result.value.embeddingPreset === "" && result.value.rerankPreset === "" && result.value.vecMinScore === 0.35);
 	const zeroHalfLives = ContextSettingsSchema["~standard"].validate({ halfLives: { ARCHITECTURE: 0, CONSTRAINTS: 0, ENVIRONMENT: 0, CONVENTIONS: 30, PREFERENCES: 14 } });
@@ -40,16 +51,16 @@ try {
 	check("GET returns defaults", initialResponse.state.status === 200 && initial.ok === true && initial.config.retainRounds === 20);
 	setContextUsage("usage-session", { compartments: { count: 2, tokens: 1234 }, memories: { count: 6, tokens: 456, consumed: false } });
 	const usageResponse = response();
-	await handleContextUsage({ method: "GET", url: "/context/usage?sessionId=usage-session" }, usageResponse);
+	await handleContextUsage({ method: "GET", url: "/magic-context/usage?sessionId=usage-session" }, usageResponse);
 	const usage = JSON.parse(usageResponse.state.body);
 	check("usage route returns current components", usageResponse.state.status === 200 && usage.ok === true && usage.compartments.count === 2 && usage.compartments.tokens === 1234 && usage.memories.count === 6 && usage.memories.tokens === 456 && usage.totalTokens === 1690);
 	clearContextUsage("usage-session");
 	const modelStatusResponse = response();
-	await handleContextModels({ method: "GET", url: "/context/models/status?kind=embedding&preset=bge-m3" }, modelStatusResponse);
+	await handleContextModels({ method: "GET", url: "/magic-context/models/status?kind=embedding&preset=bge-m3" }, modelStatusResponse);
 	const modelStatus = JSON.parse(modelStatusResponse.state.body);
 	check("embedding model status route", modelStatusResponse.state.status === 200 && modelStatus.ok === true && modelStatus.kind === "embedding" && modelStatus.id === "bge-m3");
 	const rerankStatusResponse = response();
-	await handleContextModels({ method: "GET", url: "/context/models/status?kind=rerank&preset=bge-reranker-v2-m3" }, rerankStatusResponse);
+	await handleContextModels({ method: "GET", url: "/magic-context/models/status?kind=rerank&preset=bge-reranker-v2-m3" }, rerankStatusResponse);
 	const rerankStatus = JSON.parse(rerankStatusResponse.state.body);
 	check("rerank model status route", rerankStatusResponse.state.status === 200 && rerankStatus.ok === true && rerankStatus.kind === "rerank" && rerankStatus.id === "bge-reranker-v2-m3");
 	const zeroResponse = response();

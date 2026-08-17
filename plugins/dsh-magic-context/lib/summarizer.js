@@ -1,4 +1,4 @@
-// Background summarizer ("organizer") for dsh-plugin-context.
+// Background summarizer ("organizer") for dsh-magic-context.
 //
 // Runs OUTSIDE the agent loop: at the 65% generation point it captures a
 // stable input snapshot (the compartment's fixed span, minus skipped
@@ -111,7 +111,7 @@ export async function summarizeCompartment(ctx, cdb, { session, compartment, ran
 			...input.messages,
 			createUserMessage({
 				content: [{ type: "text", text: ORGANIZER_INSTRUCTION }],
-				source: { kind: "plugin", plugin: "dsh-plugin-context" },
+				source: { kind: "plugin", plugin: "dsh-magic-context" },
 			}),
 		],
 		...(input.system === undefined ? {} : { system: input.system }),

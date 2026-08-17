@@ -1,17 +1,17 @@
-// Browser half of dsh-plugin-context: a file-backed settings panel.
+// Browser half of dsh-magic-context: a file-backed settings panel.
 // It follows the existing dsh-plugin-font settings-row contract so it works
 // without registering the agent-plane ContextEngine as a global namespace.
 window.__ModuleLoader__.load({
-	id: "dsh-plugin-context",
+	id: "dsh-magic-context",
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		const { jsx } = require("react/jsx-runtime");
 		const { defineStore } = require("@deepseek-ai/dsh-client-runtime/client");
-		const name = "dsh-plugin-context";
+		const name = "dsh-magic-context";
 		const inject = ["slots", "locale"];
-		const LOCALE_NS = "dsh-plugin-context-settings";
+		const LOCALE_NS = "dsh-magic-context-settings";
 
 		const DEFAULTS = {
 			thresholdRatio: 0.8,
@@ -125,8 +125,8 @@ window.__ModuleLoader__.load({
 			"halfLives.ENVIRONMENT": ["ENVIRONMENT half-life (days)", "留空表示永不衰减"],
 			"halfLives.CONVENTIONS": ["CONVENTIONS half-life (days)", "留空表示永不衰减"],
 			"halfLives.PREFERENCES": ["PREFERENCES half-life (days)", "留空表示永不衰减"],
-			embeddingPreset: ["embedding preset", "单独选择 embedding 模型；保存后自动下载到 ~/.dsh/context/.cache"],
-			rerankPreset: ["rerank preset", "单独选择 rerank 模型；保存后自动下载到 ~/.dsh/context/.cache"],
+			embeddingPreset: ["embedding preset", "单独选择 embedding 模型；保存后自动下载到 ~/.dsh/magic-context/.cache"],
+			rerankPreset: ["rerank preset", "单独选择 rerank 模型；保存后自动下载到 ~/.dsh/magic-context/.cache"],
 			embeddingModel: ["embedding model", "留空表示关闭向量检索"],
 			embeddingBaseUrl: ["embedding endpoint", "OpenAI-compatible embeddings endpoint"],
 			embeddingApiKeyEnv: ["embedding API key env", "读取 API key 的环境变量名"],
@@ -350,10 +350,10 @@ window.__ModuleLoader__.load({
 				bound?.modelLoading(kind);
 				try {
 					const query = `kind=${encodeURIComponent(kind)}&preset=${encodeURIComponent(preset)}`;
-					const kickoff = await fetch(`/context/models/ensure?${query}`, { method: "POST" });
+					const kickoff = await fetch(`/magic-context/models/ensure?${query}`, { method: "POST" });
 					if (!kickoff.ok) throw new Error("model download could not start");
 					for (let attempt = 0; attempt < 900; attempt += 1) {
-						const response = await fetch(`/context/models/status?${query}`);
+						const response = await fetch(`/magic-context/models/status?${query}`);
 						const status = await response.json();
 						if (typeof status.progress === "number") bound?.modelProgress(kind, status.progress);
 						if (status.status === "ready") { bound?.modelReady(kind); return; }
@@ -365,7 +365,7 @@ window.__ModuleLoader__.load({
 					bound?.modelFailed(kind);
 				}
 			};
-			fetch("/context/config").then((response) => response.ok ? response.json() : null).then((payload) => {
+			fetch("/magic-context/config").then((response) => response.ok ? response.json() : null).then((payload) => {
 				if (payload?.config) {
 					load(payload.config);
 					if (payload.config.embeddingPreset) void ensureModel("embedding", payload.config.embeddingPreset);
@@ -377,7 +377,7 @@ window.__ModuleLoader__.load({
 				try { payload = normalizeDraft(draft); } catch { bound?.failed("invalid"); return; }
 				bound?.beginSave();
 				try {
-					const response = await fetch("/context/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+					const response = await fetch("/magic-context/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
 					const result = await response.json();
 					if (!response.ok || result.ok !== true) { bound?.failed("failed"); return; }
 					load(result.config);
@@ -406,8 +406,8 @@ window.__ModuleLoader__.load({
 			style.dataset.plugin = name;
 			style.textContent = CSS;
 			document.head.appendChild(style);
-			ctx.effect(() => () => style.remove(), "dsh-plugin-context-settings: styles");
-			ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), "dsh-plugin-context-settings: locale");
+			ctx.effect(() => () => style.remove(), "dsh-magic-context-settings: styles");
+			ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh, en }), "dsh-magic-context-settings: locale");
 			ctx.slots.inject("settings.section", () => ctx.slots.register({
 				name: "settings.section",
 				id: "context-compact",

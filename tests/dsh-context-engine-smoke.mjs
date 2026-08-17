@@ -1,9 +1,9 @@
-// dsh-plugin-context organizer (summarizer) + engine wiring smoke test.
+// dsh-magic-context organizer (summarizer) + engine wiring smoke test.
 import { mkdtempSync, rmSync } from "node:fs";
-import { parseOrganizerOutput, buildSummarizationInput } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/summarizer.js";
-import { ContextEngine } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/engine.js";
-import { installParagraphInjector } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/paragraphs.js";
-import { getContextUsage } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/usage.js";
+import { parseOrganizerOutput, buildSummarizationInput } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/summarizer.js";
+import { ContextEngine } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/engine.js";
+import { installParagraphInjector } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/paragraphs.js";
+import { getContextUsage } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/usage.js";
 
 let failed = 0;
 const check = (label, ok) => {
@@ -107,7 +107,7 @@ const check = (label, ok) => {
 		idleHandler?.(dreamerSession, { type: "turn/end", seq: 2, data: { turn: 1 } });
 		await wait(100);
 		check("dreamer runs once per interaction round", dreamerCalls === 1);
-		idleHandler?.(dreamerSession, { type: "user/message", seq: 3, data: { source: { kind: "plugin", plugin: "dsh-plugin-context", form: "notice" } } });
+		idleHandler?.(dreamerSession, { type: "user/message", seq: 3, data: { source: { kind: "plugin", plugin: "dsh-magic-context", form: "notice" } } });
 		await wait(100);
 		check("dreamer does not repeat without a new turn", dreamerCalls === 1);
 		idleHandler?.(dreamerSession, { type: "turn/start", seq: 4, data: { turn: 2 } });

@@ -13,7 +13,7 @@ import {
 	LOCAL_RERANK_PRESETS,
 } from "./retrieval.js";
 
-export const name = "dsh-plugin-context-settings";
+export const name = "dsh-magic-context-settings";
 
 export const CONTEXT_SETTINGS_DEFAULTS = {
 	thresholdRatio: 0.8,
@@ -102,7 +102,7 @@ export const ContextSettingsSchema = z.object({
 });
 
 export function configPath() {
-	return join(resolveDshHome(), "context", "settings.json");
+	return join(resolveDshHome(), "magic-context", "settings.json");
 }
 
 function validate(value) {
@@ -157,7 +157,7 @@ async function readBody(req, maxBytes) {
 	return Buffer.concat(chunks);
 }
 
-/** GET/POST /context/config for the Web settings panel. */
+/** GET/POST /magic-context/config for the Web settings panel. */
 export async function handleContextConfig(req, res) {
 	if (req.method === "GET" || req.method === "HEAD") {
 		const overrides = readContextSettings();
@@ -186,7 +186,7 @@ export async function handleContextConfig(req, res) {
 		json(res, 400, { ok: false, error: "invalid context settings" });
 		return;
 	}
-	const directory = join(resolveDshHome(), "context");
+	const directory = join(resolveDshHome(), "magic-context");
 	mkdirSync(directory, { recursive: true });
 	const target = configPath();
 	const temporary = `${target}.tmp`;
@@ -195,14 +195,14 @@ export async function handleContextConfig(req, res) {
 	json(res, 200, { ok: true, config: value });
 }
 
-/** GET /context/usage?sessionId=... for the composer context detail row. */
+/** GET /magic-context/usage?sessionId=... for the composer context detail row. */
 export async function handleContextUsage(req, res) {
 	if (req.method !== "GET" && req.method !== "HEAD") {
 		res.writeHead(405);
 		res.end();
 		return;
 	}
-	const url = new URL(req.url ?? "/context/usage", "http://127.0.0.1");
+	const url = new URL(req.url ?? "/magic-context/usage", "http://127.0.0.1");
 	const sessionId = url.searchParams.get("sessionId");
 	if (typeof sessionId !== "string" || sessionId.length === 0) {
 		json(res, 400, { ok: false, error: "sessionId is required" });
@@ -212,9 +212,9 @@ export async function handleContextUsage(req, res) {
 	json(res, 200, { ok: true, sessionId, ...usage });
 }
 
-/** GET /context/models/status and POST /context/models/ensure for local presets. */
+/** GET /magic-context/models/status and POST /magic-context/models/ensure for local presets. */
 export async function handleContextModels(req, res) {
-	const url = new URL(req.url ?? "/context/models/status", "http://127.0.0.1");
+	const url = new URL(req.url ?? "/magic-context/models/status", "http://127.0.0.1");
 	const kind = url.searchParams.get("kind") ?? "embedding";
 	const preset = url.searchParams.get("preset") ?? (kind === "rerank" ? "bge-reranker-v2-m3" : "bge-m3");
 	const presets = kind === "embedding" ? LOCAL_EMBEDDING_PRESETS : kind === "rerank" ? LOCAL_RERANK_PRESETS : undefined;
@@ -237,9 +237,9 @@ export async function handleContextModels(req, res) {
 
 export function apply(ctx) {
 	ctx.inject(["webServer"], (httpCtx) => {
-		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/context/config", handler: handleContextConfig }), "dsh-plugin-context-settings: config route");
-		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/context/usage", handler: handleContextUsage }), "dsh-plugin-context-settings: usage route");
-		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/context/models/status", handler: handleContextModels }), "dsh-plugin-context-settings: model status route");
-		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/context/models/ensure", handler: handleContextModels }), "dsh-plugin-context-settings: model ensure route");
+		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/magic-context/config", handler: handleContextConfig }), "dsh-magic-context-settings: config route");
+		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/magic-context/usage", handler: handleContextUsage }), "dsh-magic-context-settings: usage route");
+		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/magic-context/models/status", handler: handleContextModels }), "dsh-magic-context-settings: model status route");
+		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/magic-context/models/ensure", handler: handleContextModels }), "dsh-magic-context-settings: model ensure route");
 	});
 }

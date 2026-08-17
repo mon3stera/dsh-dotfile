@@ -1,5 +1,5 @@
-// Data layer for dsh-plugin-context: node:sqlite + FTS5 + sqlite-vec.
-// One database file at $DSH_HOME/context/context.db (WAL). Owns every table
+// Data layer for dsh-magic-context: node:sqlite + FTS5 + sqlite-vec.
+// One database file at $DSH_HOME/magic-context/context.db (WAL). Owns every table
 // from docs/context-management.md §4 and exposes the storage API the engine,
 // paragraph injector, memory injector, tools, and Dreamer share.
 import { DatabaseSync } from "node:sqlite";
@@ -512,13 +512,13 @@ export class ContextDb {
 }
 
 /**
- * Open (or create) the context database under a DSH home directory.
+ * Open (or create) the Magic Context database under a DSH home directory.
  * @param homeDir - DSH home (defaults to $DSH_HOME or ~/.dsh).
  * @param opts - { embeddingDim } for the vec0 table (fixed at creation).
  */
 export function openDatabase(homeDir, opts = {}) {
 	const embeddingDim = opts.embeddingDim ?? DEFAULT_EMBEDDING_DIM;
-	const dir = join(homeDir, "context");
+	const dir = join(homeDir, "magic-context");
 	mkdirSync(dir, { recursive: true });
 	const db = new DatabaseSync(join(dir, "context.db"), { allowExtension: true });
 	db.exec("PRAGMA journal_mode = WAL");

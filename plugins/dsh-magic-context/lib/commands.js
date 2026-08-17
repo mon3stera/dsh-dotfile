@@ -133,5 +133,5 @@ export function installContextCommands(ctx, dependencies) {
 			input: { hint: "(no arguments)" },
 			handler: injectMemoryHandler,
 		});
-	}, "dsh-plugin-context: user commands");
+	}, "dsh-magic-context: user commands");
 }

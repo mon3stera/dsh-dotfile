@@ -1,13 +1,13 @@
-// dsh-plugin-context paragraph numbering smoke test.
+// dsh-magic-context paragraph numbering smoke test.
 // Imports the installed copy (dsh-session resolves from the profile):
-// /home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context
+// /home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context
 import {
 	prefixFirstText,
 	injectParagraphNo,
 	injectToolResultParagraph,
 	installParagraphInjector,
 	createParagraphAssigner,
-} from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/paragraphs.js";
+} from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/paragraphs.js";
 
 let failed = 0;
 const check = (label, ok) => {

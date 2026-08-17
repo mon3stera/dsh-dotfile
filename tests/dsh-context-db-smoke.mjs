@@ -1,7 +1,7 @@
-// dsh-plugin-context data layer smoke test.
+// dsh-magic-context data layer smoke test.
 // Imports the installed copy (sqlite-vec resolves from the profile's shared
-// node_modules): /home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context
-import { openDatabase, CATEGORIES } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/db.js";
+// node_modules): /home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context
+import { openDatabase, CATEGORIES } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/db.js";
 import { mkdtempSync, rmSync } from "node:fs";
 
 const home = mkdtempSync("/home/mon3tr/ctx-db-smoke-");
