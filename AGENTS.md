@@ -11,7 +11,7 @@ The repository currently has no root `package.json` or unified test runner. Most
 1. Read this file and `docs/context-management.md`.
 2. Inspect `git status --short --branch` before changing anything.
 3. For context work, read `plugins/dsh-plugin-context/lib/engine.js`, `db.js`, `dreamer.js`, `memory.js`, and the relevant smoke test.
-4. Check the active profile composition in `profile/agent-presets/my-compact/agent.cordis.yml` and `profile/cordis.patch.example.yml`.
+4. Check the active profile composition in `profile/agent-presets/context-compact/agent.cordis.yml` and `profile/cordis.patch.example.yml`.
 5. Treat files under `plugins/` as canonical. Do not edit the installed copy directly.
 6. After plugin changes, mirror the changed plugin to the runtime directory with the documented `rsync` procedure, then run tests against the mirrored copy.
 
@@ -31,7 +31,7 @@ plugins/
 
 profile/
   cordis.patch.example.yml    Example Web profile loader patch
-  agent-presets/my-compact/   Context Compact agent composition and bootstrap preset
+  agent-presets/context-compact/   Context Compact agent composition
 
 tests/
   dsh-context-*.mjs           Context plugin component and integration smoke tests
@@ -56,7 +56,7 @@ The `package.json` `dsh.client.inject` list declares the client runtime packages
 
 ### `dsh-plugin-context`
 
-This is the main system plugin. `lib/index.js` exports `ContextEngine`, which replaces `compaction-basic` in `my-compact`.
+This is the main system plugin. `lib/index.js` exports `ContextEngine`, which replaces `compaction-basic` in `context-compact`.
 
 ```text
 lib/
@@ -117,11 +117,10 @@ Important context behavior:
 
 ## Profile Composition
 
-`profile/cordis.patch.example.yml` is an example overlay for the Web profile. It loads the Node/client plugins and sets `my-compact` as the default preset for newly created Web sessions.
+`profile/cordis.patch.example.yml` is an example overlay for the Web profile. It loads the Node/client plugins and sets `context-compact` as the default preset for newly created Web sessions.
 
-`profile/agent-presets/my-compact/agent.cordis.yml` is the agent-plane composition. Important sections include:
+`profile/agent-presets/context-compact/agent.cordis.yml` is the agent-plane composition. Important sections include:
 
-- `tool-bootstrap.mjs`: first-request tool and context-injection gate; keep it first.
 - `compaction` group: mounts `dsh-plugin-context` instead of `compaction-basic`, plus the compact command and result pruner.
 - Other groups mount shell, filesystem, skills, goals, planning, delegation, and UI tools.
 - Isolated group realms are intentional. Do not move services between realms without checking host/preset ownership and collision behavior.

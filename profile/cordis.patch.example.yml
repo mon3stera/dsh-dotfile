@@ -17,4 +17,4 @@
 # Make Context Compact the default for newly created Web sessions.
 - id: agent-presets
   config:
-    default: my-compact
+    default: context-compact

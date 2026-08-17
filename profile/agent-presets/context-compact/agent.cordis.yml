@@ -1,5 +1,5 @@
-# The `context-compact` experimental preset: Standard capabilities with the
-# Minimal mode system-prompt condition used by the V4 trajectory evaluation.
+# The `context-compact` agent preset: standard DSH capabilities with async
+# compartment compaction, project memory, and Dreamer maintenance.
 #
 # This file is an AGENT-PLANE composition. The roster mounts it ONCE under a
 # standing scope; every session naming it joins by scope parentage, so the
@@ -18,57 +18,16 @@
 # pool instances — `provide()` throws on the second registration under the
 # same realm symbol; labels join REALMS, and are not what this file needs.)
 
-# ── bootstrap (must stay FIRST) ─────────────────────────────────────────────
-
-# This row deliberately sits before every other row: dsh-agent-instructions and
-# dsh-tool-skill inject workspace instructions and the skill catalog into the
-# first request via the agent/pre-step waterfall, and waterfall after-next
-# transforms apply in reverse registration order. Registering first (plus the
-# plugin empty inject list and the listener's `prepend` flag) makes this filter
-# strip the final transform, so request #1 stays Minimal-exact (see issue #6).
-#
-# V4 Pro conditions strongly on the API tool catalog AND the first request
-# output budget. Bootstrap request #1 with one native shell plus `read` and a
-# small maxTokens cap; after the session records its first durable promotion
-# signal (a tool call OR the first assistant message, default
-# `promoteOn: either`), later steps expose every Standard tool below and the
-# normal output budget returns. See tool-bootstrap.mjs for the other triggers.
-#
-# The same phase gate suppresses AUTO-INJECTED context on request #1:
-# `suppressedContextSources` lists the `agent/pre-step` message sources the
-# bootstrap filter strips while the session is unpromoted. The defaults are the
-# two automatic injections Standard adds over Minimal — the available-skills
-# reminder (`skill-catalog`) and the workspace instruction digest
-# (`agent-instructions`). User-initiated skill gestures are not filtered, and
-# both injections return unchanged from request #2 on. Set the list to [] to
-# disable the context filter while keeping the tool bootstrap and output cap.
-- id: tool-bootstrap
-  name: ./tool-bootstrap.mjs
-  config:
-    shellTools: [bash, pwsh]
-    commonTools: [read]
-    promoteOn: either
-    bootstrapMaxTokens: 1024
-    suppressedContextSources: [agent-instructions, skill-catalog]
-
 # ── identity ────────────────────────────────────────────────────────────────
 
-# Keep this text byte-identical to the Minimal preset. `complete` prevents the
-# Harness identity and per-tool guidance from changing the system prompt, while
-# runtime-context suppression leaves task and repository rules to user messages
-# and explicit file reads. Tool schemas and their runtime enforcement remain.
+# The preset's own persona, shadowing the deployment default for this agent.
+# `{{model}}` and `{{cwd}}` resolve from the agent's own route and workspace.
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    text: You are a helpful software engineer assistant.
-    complete: true
-    includeRuntimeContext: false
+    text: >-
+      You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.
 
-# Mounted for the PROMOTED phase: its `agent/pre-step` workspace-context
-# injection (AGENTS.md / CLAUDE.md digests) is stripped from request #1 by the
-# tool-bootstrap row above, because true Minimal mounts no instruction loader at
-# all. Same reasoning as the persona: the first request must approximate
-# Minimal, not just on the tool catalog but on injected context.
 - id: agent-instructions
   name: '@deepseek-ai/dsh-agent-instructions'
   config:
@@ -175,7 +134,8 @@
 # keys every fold by Session, and owns the context-meter projection units the
 # browser reads for every session — behind a realm those units would come and go
 # with whichever presets happen to be mounted. What a preset chooses is whether
-# its agent compacts at all, which is `compaction-basic` below.
+# its agent compacts at all. This preset replaces the basic backend with the
+# Context Engine while retaining the standard command and result-pruner rows.
 - id: compaction
   name: cordis:group
   group: true

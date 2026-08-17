@@ -1,3 +1,0 @@
-name: Context Compact (experimental)
-description: Async compartment compaction with project-memory injection and Dreamer maintenance; bootstrap with shell/read before exposing the full Standard catalog.
-order: 5
