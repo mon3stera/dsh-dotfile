@@ -66,12 +66,13 @@ const check = (label, ok) => {
 		// split own keys out of the basic config (auto forced false).
 		const stubs = [];
 		const registeredTools = [];
+		const promptSections = [];
 		const fakeCtx = {
 			effect: () => () => {},
 			logger: { warn: () => {} },
 			tokenMeter: { estimateMessage: () => 178 },
 			on: (name, handler) => { stubs.push([name, handler]); },
-			systemPrompt: { section: () => {} },
+			systemPrompt: { section: (section) => promptSections.push(section) },
 			tools: { register: (tool) => registeredTools.push(tool) },
 			reflect: { provide: () => () => {} },
 		};
@@ -81,6 +82,8 @@ const check = (label, ok) => {
 		check("basic threshold kept", engine.config.thresholdRatio === 0.8);
 		check("embedding dimension wired", engine.cdb.embeddingDim === 4);
 		check("context tools registered", registeredTools.some((tool) => tool.name === "ctx_reduce") && registeredTools.some((tool) => tool.name === "ctx_expand"));
+		const guidance = promptSections.find((section) => section.name === "context-tool-guidance");
+		check("context tool guidance injected", guidance?.text.includes("ctx_reduce") && guidance.text.includes("ctx_memory") && guidance.text.includes("ctx_search") && guidance.text.includes("ctx_expand"));
 		check("triggers registered", stubs.some(([n]) => n === "agent/pre-step") && stubs.some(([n]) => n === "session/event") && stubs.some(([n]) => n === "agent/request-error"));
 		const injectionSession = {};
 		engine.injection.set(injectionSession, { text: "<project_memory>one time</project_memory>", consumed: false });
@@ -88,6 +91,28 @@ const check = (label, ok) => {
 		injectionConsumer?.(injectionSession, { type: "step/end" });
 		check("memory injection consumed after first step", engine.injection.get(injectionSession).consumed === true);
 		check("periodic trigger removed", !stubs.some(([n]) => n === "timer") && !stubs.some(([n]) => n === "setInterval"));
+
+		// Dreamer runs once for an idle interaction round; plugin notices and
+		// other background events do not re-arm it until the next turn starts.
+		const idleHandler = stubs.find(([n, handler]) => n === "session/event" && String(handler).includes("_runDreamerForAgent"))?.[1];
+		const dreamerSession = { id: "dreamer-idle" };
+		engine.agentBySession.set(dreamerSession, { session: dreamerSession });
+		engine.ownConfig.dreamerConfig.idleMinutes = 0.001;
+		let dreamerCalls = 0;
+		engine._runDreamerForAgent = async () => { dreamerCalls += 1; };
+		const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+		idleHandler?.(dreamerSession, { type: "turn/start", seq: 1, data: { turn: 1 } });
+		idleHandler?.(dreamerSession, { type: "turn/end", seq: 2, data: { turn: 1 } });
+		await wait(100);
+		check("dreamer runs once per interaction round", dreamerCalls === 1);
+		idleHandler?.(dreamerSession, { type: "user/message", seq: 3, data: { source: { kind: "plugin", plugin: "dsh-plugin-context", form: "notice" } } });
+		await wait(100);
+		check("dreamer does not repeat without a new turn", dreamerCalls === 1);
+		idleHandler?.(dreamerSession, { type: "turn/start", seq: 4, data: { turn: 2 } });
+		idleHandler?.(dreamerSession, { type: "turn/end", seq: 5, data: { turn: 2 } });
+		await wait(100);
+		check("dreamer runs again after a new turn", dreamerCalls === 2);
+
 		const shortAgent = { session: { id: "short-history" } };
 		const shortResult = await engine._createAndSummarize(shortAgent, { start: 1, end: 2 }, 100);
 		check("short source skips impossible summary", shortResult === null && engine.cdb.readyCompartments("short-history").length === 0);

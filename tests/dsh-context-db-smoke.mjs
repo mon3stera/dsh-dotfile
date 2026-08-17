@@ -31,8 +31,10 @@ try {
 	check("clear skips", cdb.skippedSeqs("s1").size === 0);
 
 	// memories + FTS5
-	const m1 = cdb.writeMemory({ category: "ARCHITECTURE", summary: "JWT auth design", content: "JWT with 30 day expiry and refresh rotation", importance: 8 });
+	const m1 = cdb.writeMemory({ category: "ARCHITECTURE", summary: "JWT auth design", content: "JWT with 30 day expiry and refresh rotation", importance: 8, sourceSessionId: "s1", sourceCompartmentId: 4, sourceStartSeq: 10, sourceEndSeq: 12 });
 	const m2 = cdb.writeMemory({ category: "PREFERENCES", summary: "Use spaces", content: "The project uses two-space indentation everywhere", importance: 3 });
+	const storedM1 = cdb.memoryById(m1);
+	check("memory provenance stored", storedM1.source_session_id === "s1" && storedM1.source_compartment_id === 4 && storedM1.source_start_seq === 10 && storedM1.source_end_seq === 12);
 	check("fts auth finds m1", JSON.stringify(cdb.ftsSearch("auth", 5).map((r) => r.id)) === JSON.stringify([m1]));
 	check("fts spaces finds m2", JSON.stringify(cdb.ftsSearch("spaces", 5).map((r) => r.id)) === JSON.stringify([m2]));
 	cdb.updateMemory(m2, { archived: 1 });

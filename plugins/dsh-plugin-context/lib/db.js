@@ -28,7 +28,11 @@ CREATE TABLE IF NOT EXISTS memories (
   created_at  INTEGER NOT NULL,
   last_hit_at INTEGER NOT NULL,
   verified_at INTEGER,
-  archived    INTEGER NOT NULL DEFAULT 0
+  archived    INTEGER NOT NULL DEFAULT 0,
+  source_session_id TEXT,
+  source_compartment_id INTEGER,
+  source_start_seq INTEGER,
+  source_end_seq INTEGER
 );
 CREATE INDEX IF NOT EXISTS memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS memories_archived ON memories(archived);
@@ -123,6 +127,18 @@ function normalizeMemoryScope(category, scopePath) {
 	if (scopePath === undefined || scopePath === null) return null;
 	if (typeof scopePath !== "string" || scopePath.length === 0) throw new Error("memory scope_path must be a non-empty string or null");
 	return scopePath;
+}
+
+function normalizeSourceSessionId(value) {
+	if (value === undefined || value === null) return null;
+	if (typeof value !== "string" || value.length === 0) throw new Error("memory source_session_id must be a non-empty string or null");
+	return value;
+}
+
+function normalizeSourceInteger(value, label) {
+	if (value === undefined || value === null) return null;
+	if (!Number.isSafeInteger(value) || value < 0) throw new Error(`memory ${label} must be a non-negative safe integer or null`);
+	return value;
 }
 
 /** Scope predicate: undefined keeps low-level DB callers backward-compatible. */
@@ -304,16 +320,20 @@ export class ContextDb {
 
 	// ── memories ────────────────────────────────────────────────────────────
 
-	writeMemory({ category, scopePath, summary, content, importance }) {
+	writeMemory({ category, scopePath, summary, content, importance, sourceSessionId, sourceCompartmentId, sourceStartSeq, sourceEndSeq }) {
 		if (!CATEGORIES.includes(category)) throw new Error(`invalid memory category: ${String(category)}`);
 		if (typeof summary !== "string" || summary.length === 0) throw new Error("memory summary must be a non-empty string");
 		if (typeof content !== "string") throw new Error("memory content must be a string");
 		assertImportance(importance);
 		const normalizedScope = normalizeMemoryScope(category, scopePath);
+		const normalizedSourceSessionId = normalizeSourceSessionId(sourceSessionId);
+		const normalizedSourceCompartmentId = normalizeSourceInteger(sourceCompartmentId, "source_compartment_id");
+		const normalizedSourceStartSeq = normalizeSourceInteger(sourceStartSeq, "source_start_seq");
+		const normalizedSourceEndSeq = normalizeSourceInteger(sourceEndSeq, "source_end_seq");
 		const now = Date.now();
 		const result = this.db.prepare(
-			"INSERT INTO memories(category, scope_path, summary, content, importance, hits, created_at, last_hit_at, verified_at, archived) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, 0)"
-		).run(category, normalizedScope, summary, content, importance, now, now);
+			"INSERT INTO memories(category, scope_path, summary, content, importance, hits, created_at, last_hit_at, verified_at, archived, source_session_id, source_compartment_id, source_start_seq, source_end_seq) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, 0, ?, ?, ?, ?)"
+		).run(category, normalizedScope, summary, content, importance, now, now, normalizedSourceSessionId, normalizedSourceCompartmentId, normalizedSourceStartSeq, normalizedSourceEndSeq);
 		return Number(result.lastInsertRowid);
 	}
 
@@ -398,11 +418,22 @@ export class ContextDb {
 	promoteFactToMemory({ factId, scopePath, category, summary, content, importance }) {
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
-			const fact = this.db.prepare("SELECT status, scope_path FROM session_facts WHERE id = ?").get(factId);
+			const fact = this.db.prepare("SELECT status, scope_path, session_id, compartment_id FROM session_facts WHERE id = ?").get(factId);
 			if (fact === undefined) throw new Error(`fact ${factId} does not exist`);
 			if (scopePath !== undefined && fact.scope_path !== scopePath) throw new Error(`fact ${factId} does not belong to this workspace`);
 			if (fact.status !== "pending") throw new Error(`fact ${factId} is not pending`);
-			const memoryId = this.writeMemory({ category, scopePath: fact.scope_path, summary, content, importance });
+			const compartment = fact.compartment_id === null ? undefined : this.compartmentById(fact.compartment_id);
+			const memoryId = this.writeMemory({
+				category,
+				scopePath: fact.scope_path,
+				summary,
+				content,
+				importance,
+				sourceSessionId: fact.session_id,
+				sourceCompartmentId: fact.compartment_id,
+				sourceStartSeq: compartment?.start_seq,
+				sourceEndSeq: compartment?.end_seq,
+			});
 			this.promoteFact(factId, memoryId);
 			this.db.exec("COMMIT");
 			return memoryId;
@@ -515,7 +546,15 @@ export function openDatabase(homeDir, opts = {}) {
 /** Additive column migrations for databases created before a field existed. */
 function migrate(db) {
 	const memoryCols = new Set(db.prepare("PRAGMA table_info(memories)").all().map((row) => row.name));
-	if (!memoryCols.has("scope_path")) db.exec("ALTER TABLE memories ADD COLUMN scope_path TEXT");
+	for (const [name, ddl] of [
+		["scope_path", "ALTER TABLE memories ADD COLUMN scope_path TEXT"],
+		["source_session_id", "ALTER TABLE memories ADD COLUMN source_session_id TEXT"],
+		["source_compartment_id", "ALTER TABLE memories ADD COLUMN source_compartment_id INTEGER"],
+		["source_start_seq", "ALTER TABLE memories ADD COLUMN source_start_seq INTEGER"],
+		["source_end_seq", "ALTER TABLE memories ADD COLUMN source_end_seq INTEGER"],
+	]) {
+		if (!memoryCols.has(name)) db.exec(ddl);
+	}
 	db.exec("CREATE INDEX IF NOT EXISTS memories_scope ON memories(category, scope_path, archived)");
 	const factCols = new Set(db.prepare("PRAGMA table_info(session_facts)").all().map((row) => row.name));
 	if (!factCols.has("scope_path")) db.exec("ALTER TABLE session_facts ADD COLUMN scope_path TEXT");

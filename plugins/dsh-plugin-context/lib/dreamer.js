@@ -10,19 +10,22 @@ import { readFile, readdir, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { BlockAssembler, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { estimateTokens } from "./memory.js";
+import { readSessionContext } from "./session-context.js";
+import { sessionMemoryScope } from "./scope.js";
 
 export const DREAMER_INSTRUCTION = [
 	"You are Dreamer, the background memory maintainer for this AI coding assistant.",
 	"Three material lists are provided: PENDING SESSION FACTS (raw facts extracted from compacted conversations), MEMORIES TO VERIFY (project memories that may be outdated), and UNDISTILLED COMPARTMENTS (checkpoint summaries whose facts have not been promoted yet).",
 	"",
 	"Your jobs, in order:",
-	"1. VERIFY memories against the real codebase using the read-only filesystem tools (fs_read/fs_list/fs_grep; workspace root is given). Correct factual drift with memory_update (fix summary/content/importance/category), or memory_archive memories that no longer match reality.",
-	"2. PROMOTE pending session facts into project memories with promote_fact (choose category, summary wording, content, importance 0-10). Before promoting, check for duplicates with sql_query against the memories table and merge instead (promote into the existing row is not supported — promote the fact and then memory_update the older row to archived if it is redundant).",
+	"1. VERIFY memories against the real codebase using the read-only filesystem tools (fs_read/fs_list/fs_grep; workspace root is given). When a source session or compartment is provided, call session_context before judging the memory so explicit user instructions and original evidence are preserved. Correct factual drift with memory_update (fix summary/content/importance/category), or memory_archive memories that no longer match reality.",
+	"2. PROMOTE pending session facts into project memories with promote_fact (choose category, summary wording, content, importance 0-10). Read the source compartment with session_context before promoting when available. Before promoting, check for duplicates with sql_query against the memories table and merge instead (promote into the existing row is not supported — promote the fact and then memory_update the older row to archived if it is redundant).",
 	"3. DISTILL undistilled compartments: their facts may already be pending; verify with sql_query, and mark each processed compartment with compartment_mark (compartmentId, processed=true) once its facts are handled.",
 	"4. RECOMMEND ARCHIVAL: mark compartments that should be archived with compartment_mark (compartmentId, archive=true) — prefer compartments already distilled to memory, then low-importance, then old ones. Real archival runs in code afterwards; you only mark.",
 	"",
 	"Rules:",
 	"- Never modify files, never run shell commands, never write SQL other than read-only SELECTs.",
+	"- Treat original session records as evidence: preserve explicit user instructions, and if source context is unavailable, state uncertainty instead of inventing provenance.",
 	"- Keep working until every item in the three lists is handled (verified/promoted/distilled/marked).",
 	"- Finish with a plain-text summary of what you changed (no tags).",
 ].join("\n");
@@ -98,8 +101,13 @@ async function grepTree(root, pattern, start, maxMatches = MAX_GREP_MATCHES) {
 }
 
 /** Build the Dreamer's internal tool set. */
-export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = {} } = {}) {
+export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = {}, sessions, currentSession } = {}) {
 	const root = resolve(workspaceRoot ?? process.cwd());
+	const resolveSession = (sessionId) => {
+		if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+		if (currentSession?.id === sessionId) return currentSession;
+		return typeof sessions?.get === "function" ? sessions.get(sessionId) : undefined;
+	};
 	const byName = new Map();
 	const add = (tool) => {
 		byName.set(tool.name, tool);
@@ -122,6 +130,43 @@ export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = 
 				}
 				const rows = cdb.db.prepare(sql).all();
 				return rows.slice(0, MAX_SQL_ROWS);
+			},
+		}),
+		add({
+			name: "session_context",
+			description: "Read a bounded slice of original records from a source session or compartment in the current workspace. Use this before verifying source-backed memories or promoting facts.",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				properties: {
+					sessionId: { type: "string" },
+					compartmentId: { type: "number" },
+					startSeq: { type: "number" },
+					endSeq: { type: "number" },
+					maxEvents: { type: "number" },
+					maxChars: { type: "number" },
+				},
+			},
+			async execute(args) {
+				let sessionId = args.sessionId;
+				let startSeq = args.startSeq;
+				let endSeq = args.endSeq;
+				if (args.compartmentId !== undefined) {
+					if (!Number.isSafeInteger(args.compartmentId) || args.compartmentId < 1) throw new Error("compartmentId must be a positive safe integer");
+					const compartment = cdb.compartmentById(args.compartmentId);
+					if (compartment === undefined || (scopePath !== undefined && compartment.scope_path !== scopePath)) {
+						throw new Error(`compartment ${args.compartmentId} does not exist in this workspace`);
+					}
+					if (sessionId !== undefined && sessionId !== compartment.session_id) throw new Error("sessionId does not match compartment source");
+					sessionId = compartment.session_id;
+					startSeq = compartment.start_seq;
+					endSeq = compartment.end_seq;
+				}
+				sessionId ??= currentSession?.id;
+				const session = resolveSession(sessionId);
+				if (session === undefined) return { available: false, sessionId, error: "source session is not live; use the stored fact or compartment summary" };
+				if (scopePath !== undefined && sessionMemoryScope(session) !== scopePath) throw new Error("source session does not belong to this workspace");
+				return { available: true, ...readSessionContext(session, { startSeq, endSeq, maxEvents: args.maxEvents, maxChars: args.maxChars }) };
 			},
 		}),
 		add({
@@ -311,9 +356,22 @@ export function buildDreamerBrief(cdb, verifyIntervalDays, scopePath) {
 		`PENDING SESSION FACTS (${facts.length}):`,
 		JSON.stringify(facts.map((f) => ({ id: f.id, sessionId: f.session_id, compartmentId: f.compartment_id, fact: f.fact, importance: f.importance })), null, 1),
 		`MEMORIES TO VERIFY (${memories.length}):`,
-		JSON.stringify(memories.map((m) => ({ id: m.id, category: m.category, summary: m.summary, content: m.content, importance: m.importance, hits: m.hits, created: new Date(m.created_at).toISOString(), lastHit: new Date(m.last_hit_at).toISOString() })), null, 1),
+		JSON.stringify(memories.map((m) => ({
+			id: m.id,
+			category: m.category,
+			summary: m.summary,
+			content: m.content,
+			importance: m.importance,
+			hits: m.hits,
+			created: new Date(m.created_at).toISOString(),
+			lastHit: new Date(m.last_hit_at).toISOString(),
+			sourceSessionId: m.source_session_id,
+			sourceCompartmentId: m.source_compartment_id,
+			sourceStartSeq: m.source_start_seq,
+			sourceEndSeq: m.source_end_seq,
+		})), null, 1),
 		`UNDISTILLED COMPARTMENTS (${compartments.length}):`,
-		JSON.stringify(compartments.map((c) => ({ id: c.id, sessionId: c.session_id, generation: c.generation, summary: c.summary.slice(0, 2000), importance: c.importance })), null, 1),
+		JSON.stringify(compartments.map((c) => ({ id: c.id, sessionId: c.session_id, generation: c.generation, startSeq: c.start_seq, endSeq: c.end_seq, summary: c.summary.slice(0, 2000), importance: c.importance })), null, 1),
 	].join("\n\n");
 	return { facts, memories, compartments, brief };
 }
@@ -331,6 +389,7 @@ export async function runDreamer(ctx, cdb, opts) {
 		agent,
 		provider,
 		model,
+		sessions,
 		workspaceRoot,
 		scopePath,
 		maxRounds = 20,
@@ -342,7 +401,7 @@ export async function runDreamer(ctx, cdb, opts) {
 	if (material.facts.length === 0 && material.memories.length === 0 && material.compartments.length === 0) {
 		return { skipped: true, rounds: 0, ...material };
 	}
-	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval });
+	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval, sessions, currentSession: agent?.session });
 	const toolSchemas = tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,

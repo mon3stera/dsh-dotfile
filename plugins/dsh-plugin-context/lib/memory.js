@@ -10,6 +10,7 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { CATEGORIES } from "./db.js";
 import { rrfMerge } from "./retrieval.js";
+import { currentSessionSource } from "./session-context.js";
 
 export const DEFAULT_MEMORY_CONFIG = {
 	alpha: 0.4,
@@ -144,7 +145,14 @@ export function createMemoryTool(cdb, retrieval = {}, { resolveScope } = {}) {
 				return { ok: false, message: "ctx_memory write requires category, summary, content, importance" };
 			}
 			if (args.category !== "PREFERENCES" && typeof scopePath !== "string") return { ok: false, message: "project memory write requires a session workspace scope" };
-			const id = cdb.writeMemory({ category: args.category, scopePath, summary: args.summary, content: args.content, importance: args.importance });
+			const id = cdb.writeMemory({
+				category: args.category,
+				scopePath,
+				summary: args.summary,
+				content: args.content,
+				importance: args.importance,
+				...currentSessionSource(exec?.agent?.session),
+			});
 			if (retrieval.embedding !== undefined && cdb.vecEnabled) {
 				try {
 					const vector = await retrieval.embedding.embed(args.summary);

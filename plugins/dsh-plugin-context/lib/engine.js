@@ -15,6 +15,7 @@ import { estimateFramedSummaryTokens, landCompartment } from "./landing.js";
 import { summarizeCompartment } from "./summarizer.js";
 import { createParagraphAssigner, installParagraphInjector, PARAGRAPH_SECTION } from "./paragraphs.js";
 import { createExpandTool, createReduceTool } from "./tools.js";
+import { CONTEXT_TOOL_GUIDANCE } from "./context-tool-guidance.js";
 import {
 	DEFAULT_MEMORY_CONFIG,
 	MEMORY_SECTION,
@@ -196,6 +197,7 @@ export class ContextEngine extends BasicCompactionEngine {
 	injection = new WeakMap(); // session -> { text, consumed }
 	idleTimers = new Map(); // session -> timer
 	dreamerBusy = false;
+	dreamerRounds = new WeakMap(); // session -> { interactionRound, triggeredRound }
 
 	constructor(ctx, config = {}) {
 		const configured = mergeContextConfig(config);
@@ -319,6 +321,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		ctx.tools.register(createMemoryTool(this.cdb, this.ownConfig.retrievalConfig, { resolveScope }));
 		ctx.tools.register(createSearchTool(this.cdb, this.ownConfig.memoryConfig, this.ownConfig.retrievalConfig, { resolveScope }));
 		ctx.systemPrompt.section(MEMORY_SECTION);
+		ctx.systemPrompt.section(CONTEXT_TOOL_GUIDANCE);
 	}
 
 	/** Re-select and cache the <project_memory> injection block for one session. */
@@ -395,6 +398,15 @@ export class ContextEngine extends BasicCompactionEngine {
 		this.idleTimers.delete(session);
 	}
 
+	_dreamerRoundState(session) {
+		let state = this.dreamerRounds.get(session);
+		if (state === undefined) {
+			state = { interactionRound: 0, triggeredRound: -1 };
+			this.dreamerRounds.set(session, state);
+		}
+		return state;
+	}
+
 	_registerTriggers(ctx) {
 		// 65%: kick off the background organizer at step/turn boundaries.
 		ctx.on("session/event", (session, event) => {
@@ -405,13 +417,23 @@ export class ContextEngine extends BasicCompactionEngine {
 				ctx.logger.warn(`compartment generation failed: ${error instanceof Error ? error.message : String(error)}`);
 			});
 		});
-		// Dreamer idle trigger: any session activity resets a per-session timer.
-		ctx.on("session/event", (session) => {
+		// Dreamer idle trigger: reset the timer for activity, but only allow one
+		// run per interaction round. Dreamer notices and other background events
+		// must not create a fresh idle run without a new turn/start.
+		ctx.on("session/event", (session, event) => {
+			const state = this._dreamerRoundState(session);
+			if (event?.type === "turn/start") state.interactionRound += 1;
+			else if (state.interactionRound === 0) state.interactionRound = 1;
 			this._clearIdleTimer(session);
+			if (state.triggeredRound >= state.interactionRound) return;
+			const interactionRound = state.interactionRound;
 			const timer = setTimeout(() => {
 				this.idleTimers.delete(session);
+				const current = this.dreamerRounds.get(session);
+				if (current === undefined || current.interactionRound !== interactionRound || current.triggeredRound >= interactionRound) return;
 				const agent = this.agentBySession.get(session);
 				if (agent === undefined) return;
+				current.triggeredRound = interactionRound;
 				this._runDreamerForAgent(agent).catch((error) => {
 					ctx.logger.warn(`dreamer run failed: ${error instanceof Error ? error.message : String(error)}`);
 				});
@@ -420,6 +442,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		});
 		ctx.on("session/disposed", (session) => {
 			this._clearIdleTimer(session);
+			this.dreamerRounds.delete(session);
 			clearContextUsage(session?.id);
 		});
 		// 80%: land a ready compartment before the next step.
@@ -688,6 +711,7 @@ export class ContextEngine extends BasicCompactionEngine {
 				agent,
 				provider: target.provider,
 				model: target.model,
+				sessions: this.ctx.sessions,
 				workspaceRoot,
 				scopePath,
 				maxRounds: dreamer.maxRounds,

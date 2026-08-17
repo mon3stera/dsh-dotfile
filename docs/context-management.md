@@ -121,6 +121,10 @@ CREATE TABLE IF NOT EXISTS memories (
   last_hit_at INTEGER NOT NULL,     -- 写入或最后命中时间（Δt 基准）
   verified_at INTEGER,              -- Dreamer 校验时间；NULL = 未校验（新写/已修正）
   archived    INTEGER NOT NULL DEFAULT 0,
+  source_session_id TEXT,           -- 原始来源 session（可选）
+  source_compartment_id INTEGER,    -- 原始来源 compartment（可选）
+  source_start_seq INTEGER,         -- 原始来源事件起点（可选）
+  source_end_seq INTEGER,           -- 原始来源事件终点（可选）
   embedding   BLOB                  -- float32 向量（可选，配置 embedding 模型后启用）
 );
 
@@ -276,17 +280,22 @@ FROM compartments WHERE has_promoted_facts = 0 ORDER BY created_at;
 |---|---|
 | `sql_query` | 只读 SQL（校验必须以 SELECT 开头），进一步检索数据库 |
 | `fs_list` / `fs_read` / `fs_grep` | 只读扫描代码库（根 = 配置的 workspaceRoot，**无写工具**） |
+| `session_context` | 按来源 session/compartment 有界读取原始事件（scope 校验、事件数和字符数上限） |
 | `memory_write` | 直接写记忆（合并时用） |
 | `memory_update` | 修正已有记忆（id + 字段） |
 | `memory_archive` | 注销过时记忆 |
 | `promote_fact` | fact id → 提升为记忆（Dreamer 定 category/importance/summary），facts 置 promoted |
 | `compartment_mark` | compartments id → 设 archive_flagged / importance |
 
+主 Agent 的 `context-tool-guidance` system-prompt section 明确指导：不需要或过时的段落用 `ctx_reduce`，重要持久信息用 `ctx_memory`，需要记忆全文时用 `ctx_search`，需要段落原文时用 `ctx_expand`。
+
 **循环实现**：插件内自建轻量 loop（不走 DSH agent/deriveMessages，不占段落号）：system（角色 + schema + 工具说明）+ 素材初始消息 → `ctx.llm.stream` → 解析 tool_calls → 执行 → 结果回填 → 直到无 tool_calls 或轮次上限（默认 20）/总超时（默认 10 分钟）。进程级 single-flight（同时只跑一个 Dreamer）。Dreamer 是辅助 LLM 调用，路由默认跟随会话（或配置 provider/model）。
+
+**来源上下文**：Organizer 首次读取原始会话后，facts/compartments 保留来源 session 与事件范围；直接通过 `ctx_memory` 写入的 memory 也保存当前 session/turn 来源。Dreamer 可用 `session_context` 在当前 workspace scope 内有界读取这些原始事件，用于判断用户明确指令和事实证据；来源 session 不可用时回退到已持久化的 fact/summary，不猜测缺失 provenance。
 
 **触发**
 
-1. **会话空闲**：`session/event` 监听重置计时器，会话 15 分钟（可配）无新事件且存在 pending 素材/待校验记忆 → 触发该会话的 Dreamer run。
+1. **会话空闲**：`session/event` 监听重置计时器，会话 15 分钟（可配）无新事件且存在 pending 素材/待校验记忆 → 触发该会话的 Dreamer run。同一交互轮次只触发一次；Dreamer 通知等后台事件不会重新安排运行，直到下一次 `turn/start`。
 
 当前暂不启用全局定时触发；Dreamer 只在有活动会话进入 idle 后运行。
 

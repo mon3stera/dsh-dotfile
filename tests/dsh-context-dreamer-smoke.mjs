@@ -18,9 +18,22 @@ try {
 	writeFileSync(join(workspace, "src", "auth.ts"), "export const TOKEN_TTL = 3600; // seconds\n");
 	const cdb = openDatabase(home, {});
 	const cwd = workspace;
+	const sourceSession = {
+		id: "s",
+		header: { cwd: workspace },
+		events: [
+			{ seq: 1, type: "turn/start", data: { turn: 1 } },
+			{ seq: 2, type: "user/message", data: { content: [{ type: "text", text: "The user explicitly requires this convention." }] } },
+			{ seq: 3, type: "assistant/message", data: { turn: 1, step: 1, message: { role: "assistant", content: [{ type: "text", text: "Understood." }] } } },
+			{ seq: 4, type: "tool/result", data: { message: { role: "tool", content: [{ type: "text", text: "memory written" }] } } },
+			{ seq: 5, type: "turn/end", data: { turn: 1 } },
+		],
+		deriveEventMessage: (event) => event.type === "user/message" ? { role: "user", content: event.data.content } : event.type === "assistant/message" || event.type === "tool/result" ? event.data.message : null,
+	};
+	const sessions = { get: (id) => id === sourceSession.id ? sourceSession : undefined };
 
 	// ── internal tools ───────────────────────────────────────────────────────
-	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot: workspace, scopePath: workspace });
+	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot: workspace, scopePath: workspace, sessions, currentSession: sourceSession });
 	const run = (name, args) => byName.get(name).execute(args);
 
 	check("fs_list", JSON.stringify((await run("fs_list", { path: "." })).map((e) => e.name).sort()) === '["src"]');
@@ -29,6 +42,8 @@ try {
 	check("fs escape rejected", (() => run("fs_read", { path: "../../etc/passwd" }).then(() => false, () => true))());
 	check("sql read-only enforced", (() => run("sql_query", { sql: "DELETE FROM memories" }).then(() => false, () => true))());
 	check("sql select works", JSON.stringify(await run("sql_query", { sql: "SELECT COUNT(*) AS n FROM memories" })) === '[{"n":0}]');
+	const sourceContext = await run("session_context", { sessionId: "s", startSeq: 1, endSeq: 5 });
+	check("session_context reads original user input", sourceContext.available === true && JSON.stringify(sourceContext).includes("user explicitly requires this convention"));
 
 	// memory tools
 	const wrote = await run("memory_write", { category: "ARCHITECTURE", summary: "jwt ttl", content: "TOKEN_TTL=3600", importance: 8 });
@@ -41,9 +56,12 @@ try {
 	const factId = cdb.insertFact({ sessionId: "s", scopePath: workspace, fact: "auth uses TOKEN_TTL 3600s", importance: 6 });
 	const promoted = await run("promote_fact", { factId, category: "ARCHITECTURE", summary: "auth ttl", content: "TOKEN_TTL=3600 in src/auth.ts", importance: 8 });
 	check("promote_fact", promoted.id !== undefined && cdb.pendingFacts().length === 0 && cdb.memoryById(promoted.id) !== undefined);
+	check("promoted fact provenance", cdb.memoryById(promoted.id).source_session_id === "s");
 	const c1 = cdb.insertCompartment({ sessionId: "s", scopePath: workspace, generation: 1, startSeq: 1, endSeq: 5, startPara: 1, endPara: 5, summary: "x".repeat(20000) });
 	cdb.setCompartmentStatus(c1, "ready");
 	cdb.markCompartmentLanded(c1, 42);
+	const compartmentContext = await run("session_context", { compartmentId: c1 });
+	check("session_context resolves compartment source", compartmentContext.available === true && compartmentContext.returnedRange.startSeq === 1 && compartmentContext.returnedRange.endSeq === 5);
 	check("compartment_mark processed", (await run("compartment_mark", { compartmentId: c1, processed: true })).ok === true && cdb.compartmentById(c1).has_promoted_facts === 1);
 	check("compartment_mark archive", (await run("compartment_mark", { compartmentId: c1, archive: true, importance: 1 })).ok === true && cdb.compartmentById(c1).archive_flagged === 1);
 
