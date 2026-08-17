@@ -391,6 +391,8 @@ ContextEngine 为当前 agent 注册用户侧命令：
 | Inject Memory | 选中的 project memory 数量，并说明它们会进入下一次模型请求；完整 memory 文本仍由 deriveMessages 的动态注入提供 |
 | Inject Compartments | Compartment 代次、覆盖段落区间、替换的历史项数量和估算 token 数 |
 | Dreamer started | Dreamer 启动及本次维护批次中的 pending facts、待校验 memories、待整理 compartments 数量 |
+| Dreamer completed | Dreamer 完成轮数、实际调用的维护动作摘要和归档的 Compartment 数量 |
+| Dreamer failed | Dreamer 维护失败原因 |
 | Compartment summary ready | 总结完成的 Compartment id、捕获的事件范围和抽取出的 project facts 数量 |
 
 通知本身是模型可见的短 context message，因此与 plan-mode、jobs 等现有 context notice 行为一致；完整 checkpoint 摘要仍由内置 compaction 行渲染，memory 正文仍保持动态注入，不重复写入通知。

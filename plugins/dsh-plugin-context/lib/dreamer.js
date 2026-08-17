@@ -34,6 +34,35 @@ const MAX_READ_CHARS = 65536;
 const MAX_GREP_MATCHES = 200;
 const MAX_SQL_ROWS = 100;
 const MAX_TOOL_TEXT = 8000;
+const DREAMER_ACTION_LABELS = Object.freeze({
+	sql_query: "queried context data",
+	session_context: "read source session context",
+	fs_list: "listed workspace directories",
+	fs_read: "read workspace files",
+	fs_grep: "searched workspace files",
+	memory_write: "wrote memories",
+	memory_update: "updated memories",
+	memory_archive: "archived memories",
+	promote_fact: "promoted facts",
+	compartment_mark: "updated compartments",
+});
+
+/** Summarize tool calls without exposing their arguments or full results. */
+export function summarizeDreamerActions(actions = []) {
+	const counts = new Map();
+	let failures = 0;
+	for (const action of actions) {
+		if (action?.ok === false) {
+			failures += 1;
+			continue;
+		}
+		const label = DREAMER_ACTION_LABELS[action?.name] ?? `ran ${String(action?.name ?? "unknown")} tool`;
+		counts.set(label, (counts.get(label) ?? 0) + 1);
+	}
+	const parts = [...counts].map(([label, count]) => `${label} (${count})`);
+	if (failures > 0) parts.push(`${failures} tool action${failures === 1 ? "" : "s"} failed`);
+	return parts.length === 0 ? "no maintenance tool actions recorded" : parts.join("; ");
+}
 
 /** Ensure a path stays inside the workspace root. */
 function insideRoot(root, path) {
@@ -382,7 +411,7 @@ export function buildDreamerBrief(cdb, verifyIntervalDays, scopePath) {
  * @param cdb - context database.
  * @param opts - { agent?, provider, model, workspaceRoot, maxRounds, timeoutMs,
  *   verifyIntervalDays, retrieval }.
- * @returns { skipped, rounds, facts, memories, compartments }.
+ * @returns { skipped, rounds, facts, memories, compartments, actions }.
  */
 export async function runDreamer(ctx, cdb, opts) {
 	const {
@@ -398,8 +427,9 @@ export async function runDreamer(ctx, cdb, opts) {
 		retrieval = {},
 	} = opts;
 	const material = buildDreamerBrief(cdb, verifyIntervalDays, scopePath);
+	const actions = [];
 	if (material.facts.length === 0 && material.memories.length === 0 && material.compartments.length === 0) {
-		return { skipped: true, rounds: 0, ...material };
+		return { skipped: true, rounds: 0, actions, ...material };
 	}
 	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval, sessions, currentSession: agent?.session });
 	const toolSchemas = tools.map((tool) => ({
@@ -414,7 +444,8 @@ export async function runDreamer(ctx, cdb, opts) {
 	const timer = setTimeout(() => abort.abort(), timeoutMs);
 	let rounds = 0;
 	try {
-		for (; rounds < maxRounds; rounds += 1) {
+		for (; rounds < maxRounds;) {
+			rounds += 1;
 			const assembler = new BlockAssembler();
 			const options = {
 				provider,
@@ -439,6 +470,7 @@ export async function runDreamer(ctx, cdb, opts) {
 			for (const call of calls) {
 				const tool = byName.get(call.name);
 				if (tool === undefined) {
+					actions.push({ name: call.name, ok: false });
 					messages.push(createToolResultMessage({
 						callId: call.id,
 						content: [{ type: "text", text: `unknown tool: ${call.name}` }],
@@ -454,6 +486,7 @@ export async function runDreamer(ctx, cdb, opts) {
 					value = { error: error instanceof Error ? error.message : String(error) };
 					isError = true;
 				}
+				actions.push({ name: call.name, ok: !isError });
 				const text = typeof value === "string" ? value : JSON.stringify(value, null, 1);
 				messages.push(createToolResultMessage({
 					callId: call.id,
@@ -462,7 +495,7 @@ export async function runDreamer(ctx, cdb, opts) {
 				}));
 			}
 		}
-		return { skipped: false, rounds, ...material };
+		return { skipped: false, rounds, actions, ...material };
 	} finally {
 		clearTimeout(timer);
 	}

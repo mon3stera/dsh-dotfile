@@ -2,7 +2,7 @@
 // LLM, and the archival code path.
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { runDreamer, runArchival, createDreamerTools, buildDreamerBrief } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/dreamer.js";
+import { runDreamer, runArchival, createDreamerTools, buildDreamerBrief, summarizeDreamerActions } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/dreamer.js";
 import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-context/lib/db.js";
 
 let failed = 0;
@@ -106,6 +106,8 @@ try {
 		verifyIntervalDays: 30,
 	});
 	check("dreamer loop ran", dreamerResult.skipped === false && dreamerResult.rounds >= 1);
+	check("dreamer records actions", dreamerResult.actions.some((action) => action.name === "promote_fact" && action.ok === true));
+	check("dreamer action summary", summarizeDreamerActions(dreamerResult.actions).includes("promoted facts"));
 	check("dreamer promoted fact", cdb.pendingFacts().length === 0 && cdb.db.prepare("SELECT COUNT(*) AS n FROM session_facts WHERE status='promoted'").get().n === 2);
 	// mark the remaining compartment distilled and all memories verified so
 	// the next pass has no material

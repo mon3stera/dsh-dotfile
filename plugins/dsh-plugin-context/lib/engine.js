@@ -34,7 +34,7 @@ import {
 	LOCAL_RERANK_PRESETS,
 	RerankClient,
 } from "./retrieval.js";
-import { buildDreamerBrief, runArchival, runDreamer } from "./dreamer.js";
+import { buildDreamerBrief, runArchival, runDreamer, summarizeDreamerActions } from "./dreamer.js";
 import { injectContextNotice } from "./notifications.js";
 import { mergeContextConfig } from "./settings.js";
 import { clearContextUsage, setContextUsage } from "./usage.js";
@@ -719,8 +719,25 @@ export class ContextEngine extends BasicCompactionEngine {
 				verifyIntervalDays: dreamer.verifyIntervalDays,
 				retrieval: this.ownConfig.retrievalConfig,
 			});
-			runArchival(this.cdb, { budgetTokens: dreamer.compartmentBudgetTokens });
-			return result;
+			const archival = runArchival(this.cdb, { budgetTokens: dreamer.compartmentBudgetTokens });
+			this._notify(
+				agent,
+				"Dreamer completed",
+				[
+					"Dreamer completed its background memory-maintenance pass.",
+					`Completed ${result.rounds} round${result.rounds === 1 ? "" : "s"}.`,
+					`Summary: ${summarizeDreamerActions(result.actions)}.`,
+					`Archived compartments: ${archival.archived.length}.`,
+				].join("\n"),
+			);
+			return { ...result, archival };
+		} catch (error) {
+			this._notify(
+				agent,
+				"Dreamer failed",
+				`Dreamer failed during its background memory-maintenance pass: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			throw error;
 		} finally {
 			this.dreamerBusy = false;
 		}

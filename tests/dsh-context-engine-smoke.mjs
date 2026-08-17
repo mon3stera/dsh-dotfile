@@ -99,6 +99,7 @@ const check = (label, ok) => {
 		engine.agentBySession.set(dreamerSession, { session: dreamerSession });
 		engine.ownConfig.dreamerConfig.idleMinutes = 0.001;
 		let dreamerCalls = 0;
+		const realDreamer = engine._runDreamerForAgent;
 		engine._runDreamerForAgent = async () => { dreamerCalls += 1; };
 		const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 		idleHandler?.(dreamerSession, { type: "turn/start", seq: 1, data: { turn: 1 } });
@@ -112,6 +113,21 @@ const check = (label, ok) => {
 		idleHandler?.(dreamerSession, { type: "turn/end", seq: 5, data: { turn: 2 } });
 		await wait(100);
 		check("dreamer runs again after a new turn", dreamerCalls === 2);
+
+		// A completed pass publishes a concise UI notice with the action summary.
+		engine._runDreamerForAgent = realDreamer;
+		const completionNotices = [];
+		const completionSession = {
+			id: "dreamer-completion",
+			header: { cwd: process.cwd() },
+			requestHeader: () => ({ config: { provider: "p", model: "m" } }),
+			events: [],
+		};
+		engine.cdb.writeMemory({ category: "CONVENTIONS", scopePath: process.cwd(), summary: "completion notice test", content: "test", importance: 5 });
+		fakeCtx.llm = { async *stream() { yield { type: "text-delta", text: "done" }; } };
+		await engine._runDreamerForAgent({ session: completionSession, inject: (message) => completionNotices.push(message) });
+		const completionText = completionNotices.map((notice) => notice.content?.map((block) => block.text ?? "").join("\n")).join("\n");
+		check("dreamer completion notice", completionText.includes("Dreamer completed") && completionText.includes("Summary:") && completionText.includes("Archived compartments: 0."));
 
 		const shortAgent = { session: { id: "short-history" } };
 		const shortResult = await engine._createAndSummarize(shortAgent, { start: 1, end: 2 }, 100);
