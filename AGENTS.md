@@ -50,6 +50,8 @@ All plugins use ESM and normally have this shape:
 plugins/<plugin>/
   package.json                Package name, exports, and DSH bundle/client manifests
   cordis.patch.yml            Profile bundle layer when the package is installable
+  preset/                     Packaged user preset assets when the plugin provides one
+  scripts/                    Explicit package setup commands
   lib/index.js                Node/plugin entry point
   lib/client.js               Browser/client half when the plugin has UI
 ```
@@ -58,7 +60,7 @@ The `package.json` `dsh.client.inject` list declares the client runtime packages
 
 ### `dsh-magic-context`
 
-This is the main system plugin and an installable DSH bundle. `cordis.patch.yml` mounts the host-side settings bridge; `lib/index.js` exports `ContextEngine`, which replaces `compaction-basic` in `context-compact`. The engine must remain inside an isolated agent-preset compaction group.
+This is the main system plugin and an installable DSH bundle. `cordis.patch.yml` mounts the host-side settings bridge and startup guidance; `scripts/install-preset.mjs` installs the packaged `context-compact` preset without changing the default. `lib/index.js` exports `ContextEngine`, which replaces `compaction-basic` in `context-compact`. The engine must remain inside an isolated agent-preset compaction group.
 
 ```text
 lib/

@@ -12,8 +12,13 @@
   },
   "type": "module",
   "main": "lib/index.js",
+  "bin": {
+    "dsh-magic-context-install-preset": "scripts/install-preset.mjs"
+  },
   "files": [
     "lib",
+    "preset",
+    "scripts",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -23,6 +28,7 @@
     "./settings": "./lib/settings.js",
     "./client": "./lib/client.js",
     "./notice": "./lib/notice.js",
+    "./install-preset": "./scripts/install-preset.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },

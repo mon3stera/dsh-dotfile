@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
+
+export const PRESET_ID = "context-compact";
+const PRESET_FILES = ["agent.cordis.yml", "preset.yml"];
+const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+
+function targetDirectory(homeDir) {
+	return join(homeDir, ".agent-presets", PRESET_ID);
+}
+
+/** Return whether the user preset is absent, ours, or an existing conflict. */
+export function presetState(homeDir = resolveDshHome()) {
+	const directory = targetDirectory(homeDir);
+	if (!existsSync(directory)) return { state: "missing", directory };
+	try {
+		const composition = readFileSync(join(directory, "agent.cordis.yml"), "utf8");
+		return {
+			state: /(^|\n)\s*name:\s*["']?dsh-magic-context["']?\s*$/m.test(composition) ? "installed" : "conflict",
+			directory,
+		};
+	} catch {
+		return { state: "conflict", directory };
+	}
+}
+
+/** Install the packaged preset without replacing any user-owned directory. */
+export function installPreset({ homeDir = resolveDshHome(), packageRoot = PACKAGE_ROOT } = {}) {
+	const target = presetState(homeDir);
+	if (target.state === "installed") return { ...target, changed: false };
+	if (target.state === "conflict") throw new Error(`preset directory already exists and does not use dsh-magic-context: ${target.directory}`);
+
+	const source = join(resolve(packageRoot), "preset", PRESET_ID);
+	mkdirSync(target.directory, { recursive: true });
+	try {
+		for (const filename of PRESET_FILES) {
+			const sourceFile = join(source, filename);
+			if (!existsSync(sourceFile)) throw new Error(`packaged preset file is missing: ${sourceFile}`);
+			copyFileSync(sourceFile, join(target.directory, filename));
+		}
+	} catch (error) {
+		rmSync(target.directory, { recursive: true, force: true });
+		throw error;
+	}
+	return { ...target, state: "installed", changed: true };
+}
+
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	try {
+		const result = installPreset();
+		console.log(result.changed
+			? `[dsh-magic-context] Installed ${PRESET_ID} preset at ${result.directory}. It is available but not selected as the default.`
+			: `[dsh-magic-context] ${PRESET_ID} preset is already installed at ${result.directory}.`);
+	} catch (error) {
+		console.error(`[dsh-magic-context] Preset installation failed: ${error instanceof Error ? error.message : String(error)}`);
+		process.exitCode = 1;
+	}
+}

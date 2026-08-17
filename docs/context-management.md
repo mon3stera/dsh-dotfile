@@ -318,7 +318,7 @@ FROM compartments WHERE has_promoted_facts = 0 ORDER BY created_at;
 | 系统提示词 | `ctx.systemPrompt` 注册两个 section（段落号说明、memory 说明） |
 | Dreamer loop | 自建轻量工具循环（`ctx.llm.stream` 多轮），辅助调用不占段落号；空闲触发 = `session/event` 计时器；single-flight |
 | 数据库 | `node:sqlite` + `{allowExtension:true}` + `sqlite-vec`（`sqlite-vec` + `sqlite-vec-linux-x64` npm 包）；FTS5 原生 |
-| 挂载 | 安装 `dsh-magic-context` bundle 提供 host settings/client；在 `~/.dsh/.agent-presets/context-compact/agent.cordis.yml` 替换 `compaction-basic` 行（保留 command-compact、tool-result-pruner），profile patch 设 default；host 侧插件需重启 |
+| 挂载 | 安装 `dsh-magic-context` bundle 提供 host settings/client；若启动提示 preset 缺失，运行 `dsh plugin --profile web exec dsh-magic-context-install-preset` 将随包的 `context-compact` 安装到 `~/.dsh/.agent-presets/`；它不会修改 default，preset 内保留 `command-compact`、`tool-result-pruner`，host 侧插件需重启 |
 
 **已知权衡**：
 - 段落号 + memory 块是视图层注入，违反"model-visible 必须走日志通道"原则（memory 有数据库兜底；段落号是纯展示）。落地 checkpoint 走正式事件契约不受影响。

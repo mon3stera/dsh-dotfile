@@ -25,14 +25,23 @@ dsh plugin --profile web add ./dsh-magic-context-0.1.0.tgz
 ```
 
 The bundle adds the host-side settings bridge and the browser settings panel.
-It does not change the user's default agent preset. On the next DSH startup it
-prints a setup notice explaining this boundary and the required preset rows.
+It does not change the user's default agent preset. If the packaged preset is
+missing, the next DSH startup prints this command:
+
+```sh
+dsh plugin --profile web exec dsh-magic-context-install-preset
+```
+
+The command copies `context-compact` to `$DSH_HOME/.agent-presets/` without
+changing the default preset or overwriting an existing user preset. Once it is
+installed, the startup notice is suppressed.
 
 ## Enable the ContextEngine
 
-`ContextEngine` is intentionally an agent-plane service. Mount it inside an
-isolated `compaction` group in the preset used by your sessions. The repository
-contains a complete example at
+`ContextEngine` is intentionally an agent-plane service. The install command
+copies a complete example into `$DSH_HOME/.agent-presets/context-compact/`.
+Select that preset for new sessions, or set it as the default explicitly. The
+repository source for the same composition is
 `profile/agent-presets/context-compact/agent.cordis.yml`.
 
 The compaction group must retain the command and tool-result-pruner rows:
@@ -53,9 +62,9 @@ The compaction group must retain the command and tool-result-pruner rows:
       name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
 ```
 
-Copy the complete example into a user-owned preset before editing it. Do not
-put the ContextEngine in the host root: compaction providers and their session
-state belong to an isolated agent-preset realm.
+The installer provides this complete example as a user-owned preset. If you
+edit it, keep the ContextEngine out of the host root: compaction providers and
+their session state belong to an isolated agent-preset realm.
 
 ## Storage and HTTP
 
