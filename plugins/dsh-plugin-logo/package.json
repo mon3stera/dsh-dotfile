@@ -1,0 +1,20 @@
+{
+  "name": "dsh-plugin-logo",
+  "version": "0.1.0",
+  "description": "Replace the DSH web brand mark and name with a custom Mon3tr logo",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT"
+}

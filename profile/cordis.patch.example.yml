@@ -6,6 +6,8 @@
 - insert:
     - id: dsh-plugin-background
       name: dsh-plugin-background
+    - id: dsh-plugin-logo
+      name: dsh-plugin-logo
     - id: dsh-plugin-font
       name: dsh-plugin-font
     - id: dsh-plugin-hide-session-titles

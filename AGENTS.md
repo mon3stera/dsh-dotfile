@@ -76,7 +76,8 @@ lib/
   paragraphs.js             Paragraph numbering and model-message injection
   tools.js                 ctx_reduce and ctx_expand implementations
   range.js                  Compaction range selection
-  summarizer.js             Organizer LLM call and fact extraction
+  summarizer.js             Organizer LLM call, bounded repair, and fact extraction
+  organizer-xml.js          Organizer XML/schema validation and repair prompt
   landing.js                Stable checkpoint landing and surface replacement
   commands.js               /dream, /ctx-search, and /inject-memory commands
   notifications.js          Durable ContextInjectionRow notices

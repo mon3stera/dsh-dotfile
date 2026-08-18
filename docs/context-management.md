@@ -64,6 +64,38 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 - **落地后**：若 surface 仍高于 65%（极端保留尾过大），立即进入下一代生成循环，自洽无需特殊处理。
 - **Dreamer 归档**：旧 checkpoint 节点由 Dreamer 标记、代码逻辑真实归档（§4.7），归档会从 surface 移除 checkpoint 节点并更新预算——这是落地之外唯一允许的 surface 变更。
 
+### 3.1.1 整理者输入与 flat XML 摘要
+
+当前版本暂不实现 Magic Context 的 P1-P4 衰减层，而是先采用一份结构化 flat XML 摘要。每次整理的当前 raw conversation 是唯一事实来源；整理者另外收到两个有界参考块：
+
+1. `<project_memory>`：当前 Git worktree scope 可见的 project memories（包含全局 `PREFERENCES`），用于去重、命名和识别长期约束。
+2. `<session_references>`：同一 session 最近最多 6 个未归档 Compartment，用于判断当前工作是否延续旧目标。参考摘要不是本次覆盖范围，也不能覆盖当前 raw evidence。
+
+整理者输出一个 XML `<output>`，包含一个 flat `<compartment>` 和 `<facts>`：
+
+```xml
+<output>
+  <compartments>
+    <compartment title="..." episode_type="feature">
+      <objective>...</objective>
+      <continuity>...</continuity>
+      <work_completed><item>...</item></work_completed>
+      <decisions><decision>...</decision></decisions>
+      <current_state><item>...</item></current_state>
+      <verification><check status="passed">...</check></verification>
+      <open_items><none/></open_items>
+      <user_constraints><constraint>...</constraint></user_constraints>
+      <anchors><file>...</file><commit>...</commit></anchors>
+    </compartment>
+  </compartments>
+  <facts><fact importance="8">...</fact></facts>
+</output>
+```
+
+固定区段让摘要同时保留工作目标、连续性、结果、决策、当前状态、验证结果、未完成项、用户纠正和可搜索锚点。`<facts>` 仍然先进入 `session_facts`，由 Dreamer 决定是否提升为正式 memory。当前落地协议仍将整个 `<compartment>` XML 作为一份 flat summary 存储；未来可以在不改变输入参考模型的情况下增加 `p1`-`p4`。
+
+落地前会先进行 XML token/标签栈校验和 schema 校验，包括根节点、区段顺序、必填节点、属性枚举、fact importance 和 XML 转义。校验失败时，Organizer 会收到带有具体路径和错误原因的 `<validation_errors>`，并最多重新生成一次。修复仍失败时 Compartment 标记为 `failed`，不会写入无效 summary 或 session fact。
+
 ### 3.2 段落号系统（§N§）
 
 - **分配**：每个 model-visible 消息（user 输出 / assistant 输出 / tool 结果）首次进入主请求组装时，从 `paragraphs` 表分配全局递增号（按 session 绑定，持久化，永不复用）。
