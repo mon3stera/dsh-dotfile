@@ -33,6 +33,15 @@ loader patch (`~/.dsh/profiles/web/cordis.patch.yml` or your profile's):
 
 Restart the DSH process for the patch to load.
 
+## Web settings
+
+The plugin adds a "Header rewrite" section to the Settings sidebar with a
+YAML editor. The editor shows the currently active rules (the persisted file,
+or the seed from the patch) and saving them writes
+`$DSH_HOME/header-rewrite/config.yaml` and applies the rules immediately -
+no restart needed. The editor accepts the same YAML as the patch `config`
+above.
+
 ## Configuration
 
 `rules` is a list of rule objects:

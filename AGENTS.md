@@ -123,8 +123,9 @@ Important context behavior:
 
 ### `dsh-header-rewrite`
 
-- `lib/index.js`: wraps the global `fetch` once and applies configurable header rules (set/delete) matched by host, path, body model, and method. Use it to adapt to gateways with strict client policies (e.g. a User-Agent allowlist that rejects the harness attribution header).
-- `package.json`: Node-only plugin, no client half.
+- `lib/index.js`: wraps the global `fetch` once and applies configurable header rules (set/delete) matched by host, path, body model, and method. Rules come from the persisted `$DSH_HOME/header-rewrite/config.yaml` (validated, applied immediately) or the patch config as seed; the `/header-rewrite/config` route reads and writes that file. Use it to adapt to gateways with strict client policies (e.g. a User-Agent allowlist that rejects the harness attribution header).
+- `lib/client.js`: a "Header rewrite" section in the Settings sidebar with a YAML editor that loads/saves the config through the host route.
+- `package.json`: Web client injection and package exports.
 
 ## Profile Composition
 
