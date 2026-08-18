@@ -28,6 +28,7 @@ plugins/
   dsh-plugin-font/            Font settings and font discovery
   dsh-plugin-hide-session-titles/  Session-title visibility toggle
   dsh-plugin-outline/         Browser-only session outline panel
+  dsh-header-rewrite/         Header rewrite for LLM provider requests
 
 profile/
   cordis.patch.example.yml    Example Web profile loader patch
@@ -119,6 +120,11 @@ Important context behavior:
 - `lib/index.js`: no-op Node entry; the browser half does the work.
 - `lib/client.js`: right-side outline panel for jumping between user messages in long sessions.
 - `package.json`: Web conversation/primitives client injection and package exports.
+
+### `dsh-header-rewrite`
+
+- `lib/index.js`: wraps the global `fetch` once and applies configurable header rules (set/delete) matched by host, path, body model, and method. Use it to adapt to gateways with strict client policies (e.g. a User-Agent allowlist that rejects the harness attribution header).
+- `package.json`: Node-only plugin, no client half.
 
 ## Profile Composition
 

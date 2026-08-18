@@ -1,0 +1,12 @@
+{
+  "name": "dsh-header-rewrite",
+  "version": "0.1.0",
+  "description": "Rewrite HTTP request headers for LLM provider calls with configurable match rules (host/path/model/method).",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT"
+}

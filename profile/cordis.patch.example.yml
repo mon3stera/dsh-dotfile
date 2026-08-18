@@ -13,6 +13,16 @@
     # dsh-magic-context/settings is supplied by the dsh.bundle layer.
     - id: dsh-plugin-outline
       name: dsh-plugin-outline/client
+    # Example: rewrite User-Agent for a gateway that only accepts claude-cli.
+    - id: dsh-header-rewrite
+      name: dsh-header-rewrite
+      config:
+        rules:
+          - match:
+              host: agentrouter.org
+              path: /v1/messages
+            headers:
+              User-Agent: claude-cli/1.0.0 (external, cli)
 
 # Make Context Compact the default for newly created Web sessions.
 - id: agent-presets
