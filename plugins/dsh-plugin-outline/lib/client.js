@@ -104,7 +104,10 @@ window.__ModuleLoader__.load({
       const nodeStore = useSession((snapshot) => snapshot.chat.nodes);
       const hasMore = useSession((snapshot) => snapshot.hasMore);
       const loadingOlder = useSession((snapshot) => snapshot.loadingOlder);
-      const [open, setOpen] = react.useState(true);
+      // Collapsed by default: this component is session-scoped, so it remounts
+      // on every session switch, and defaulting to open meant the panel kept
+      // reappearing uninvited over the conversation.
+      const [open, setOpen] = react.useState(false);
       const [activeKey, setActiveKey] = react.useState(null);
       const items = react.useMemo(() => collectItems(order, nodeStore), [order, nodeStore]);
 

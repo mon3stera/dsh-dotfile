@@ -25,8 +25,17 @@ globalThis.document = {
 };
 vm.runInThisContext(raw, { filename: "dsh-plugin-outline/lib/client.js" });
 
+// The component calls useState twice per render: `open` first, then `activeKey`.
+// Overriding a call's initial value by position lets one render exercise the
+// collapsed default and another the expanded panel, with no real renderer.
+let stateOverrides = [];
+let stateCalls = 0;
 const react = {
-	useState(value) { return [value, () => {}]; },
+	useState(value) {
+		const index = stateCalls;
+		stateCalls += 1;
+		return [stateOverrides[index] === undefined ? value : stateOverrides[index], () => {}];
+	},
 	useMemo(factory) { return factory(); },
 	useRef(value) { return { current: value }; },
 	useEffect() {},
@@ -71,12 +80,18 @@ const nodes = new Map([
 ]);
 const snapshot = { chat: { order: ["user-1", "assistant-1"], nodes: { get: (key) => nodes.get(key) } }, hasMore: true, loadingOlder: false };
 let olderLoads = 0;
-const tree = ctx.entry.component({
-	sessionId: "session-test",
-	useSession: (selector) => selector(snapshot),
-	loadOlder: async () => { olderLoads += 1; },
-	t: (key) => ctx.locales.zh[key] ?? key,
-});
+const render = (overrides) => {
+	stateOverrides = overrides;
+	stateCalls = 0;
+	return ctx.entry.component({
+		sessionId: "session-test",
+		useSession: (selector) => selector(snapshot),
+		loadOlder: async () => { olderLoads += 1; },
+		t: (key) => ctx.locales.zh[key] ?? key,
+	});
+};
+// Force `open` true so the panel contents below can be asserted.
+const tree = render([true]);
 const serialized = JSON.stringify(tree);
 if (!serialized.includes("First user question") || !serialized.includes("会话目录")) throw new Error("outline did not render user message");
 const find = (node, predicate) => {
@@ -95,4 +110,13 @@ const messageButton = find(tree, (node) => node.type === "button" && node.props?
 if (!messageButton) throw new Error("outline message button missing");
 messageButton.props.onClick();
 if (scrollCalls !== 1) throw new Error(`outline click did not scroll: ${scrollCalls}`);
+
+// The panel must stay collapsed until the user asks for it: the component is
+// session-scoped, so a default-open panel reopened on every session switch.
+const closed = render([]);
+const trigger = find(closed, (node) => node.type === "button" && node.props?.className === "dsh-outline-trigger");
+if (!trigger) throw new Error("outline trigger missing while collapsed");
+if (trigger.props["aria-expanded"] !== false) throw new Error("outline trigger should report collapsed by default");
+if (find(closed, (node) => node.props?.className === "dsh-outline-panel")) throw new Error("outline panel must not open automatically");
+if (JSON.stringify(closed).includes("会话目录") === false) throw new Error("collapsed trigger should still label the outline");
 console.log("dsh-context outline smoke: OK");
