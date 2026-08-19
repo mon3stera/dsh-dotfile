@@ -12,7 +12,7 @@ import { CONTEXT_WINDOW_EXCEEDED_CODE, createUserMessage } from "@deepseek-ai/ds
 import { openDatabase } from "./db.js";
 import { selectCompartmentRange, selectManualCompartmentRange } from "./range.js";
 import { estimateFramedSummaryTokens, landCompartment } from "./landing.js";
-import { summarizeCompartment } from "./summarizer.js";
+import { DEFAULT_ORGANIZER_MAX_TOKENS, summarizeCompartment } from "./summarizer.js";
 import { createParagraphAssigner, installParagraphInjector, PARAGRAPH_SECTION } from "./paragraphs.js";
 import { createExpandTool, createReduceTool } from "./tools.js";
 import { CONTEXT_TOOL_GUIDANCE } from "./context-tool-guidance.js";
@@ -34,10 +34,11 @@ import {
 	LOCAL_RERANK_PRESETS,
 	RerankClient,
 } from "./retrieval.js";
-import { buildDreamerBrief, runArchival, runDreamer, summarizeDreamerActions } from "./dreamer.js";
+import { buildDreamerBrief, DEFAULT_DREAMER_MAX_TOKENS, runArchival, runDreamer, summarizeDreamerActions } from "./dreamer.js";
 import { injectContextNotice } from "./notifications.js";
 import { mergeContextConfig } from "./settings.js";
 import { clearContextUsage, setContextUsage } from "./usage.js";
+import { describeAuxFailure } from "./aux-llm.js";
 import { sessionMemoryScope } from "./scope.js";
 import { installContextCommands } from "./commands.js";
 
@@ -49,6 +50,15 @@ const DEFAULT_DREAMER_MAX_ROUNDS = 20;
 const DEFAULT_DREAMER_TIMEOUT_MS = 600000;
 const DEFAULT_VERIFY_INTERVAL_DAYS = 30;
 const DEFAULT_COMPARTMENT_BUDGET_TOKENS = 40000;
+/**
+ * Backoff after a failed generation, doubling per consecutive failure.
+ *
+ * Generation re-sends the entire compartment range, so an unthrottled retry on
+ * every step boundary is what turned one throttled provider response into
+ * dozens of failed generations in observed sessions.
+ */
+const GENERATE_COOLDOWN_MS = 120000;
+const MAX_GENERATE_COOLDOWN_MS = 900000;
 
 /** Keys ContextEngine owns; everything else goes to the basic engine config. */
 const OWN_KEYS = new Set([
@@ -82,6 +92,10 @@ const OWN_KEYS = new Set([
 	"compartmentBudgetTokens",
 	"dreamerProvider",
 	"dreamerModel",
+	"summarizationReasoningEffort",
+	"dreamerReasoningEffort",
+	"summarizationMaxTokens",
+	"dreamerMaxTokens",
 ]);
 
 /** Resolve the exact provider/model durably routed for the latest request. */
@@ -90,6 +104,28 @@ function routedTarget(session) {
 	if (typeof config?.provider !== "string" || config.provider.length === 0
 		|| typeof config.model !== "string" || config.model.length === 0) return undefined;
 	return { provider: config.provider, model: config.model };
+}
+
+/**
+ * Attach an explicitly configured reasoning effort to a resolved target.
+ *
+ * Effort is chosen independently of provider/model so a session-routed
+ * organizer can still run cheaper than the conversation it summarizes. Effort
+ * ids are adapter- and model-owned, so an id that the chosen model rejects
+ * fails closed (INVALID_REQUEST is never retried) and surfaces on the
+ * compartment row and its notice.
+ */
+/** Whether a caught failure is an abort rather than a real work failure. */
+function isAbortFailure(error, signal) {
+	if (signal?.aborted === true) return true;
+	if (error?.aborted === true) return true;
+	return error?.name === "AbortError" || error?.code === "ABORT_ERR";
+}
+
+function withReasoningEffort(target, effort) {
+	if (target === undefined) return undefined;
+	if (typeof effort !== "string" || effort.length === 0) return target;
+	return { ...target, reasoningEffort: effort };
 }
 
 function delay(ms, signal) {	return new Promise((resolve) => {
@@ -187,12 +223,17 @@ export class ContextEngine extends BasicCompactionEngine {
 		compartmentBudgetTokens: z.number().step(1).min(1),
 		dreamerProvider: z.string(),
 		dreamerModel: z.string(),
+		summarizationReasoningEffort: z.string(),
+		dreamerReasoningEffort: z.string(),
+		summarizationMaxTokens: z.number().step(1).min(1),
+		dreamerMaxTokens: z.number().step(1).min(1),
 	});
 
 	cdb;
 	ownConfig;
 	agentBySession = new WeakMap();
 	inFlight = new Map(); // sessionId -> Promise
+	generateFailures = new Map(); // sessionId -> { failures, until }
 	overflowRetries = new WeakMap();
 	injection = new WeakMap(); // session -> { text, memoryCount, memoryTokens }
 	idleTimers = new Map(); // session -> timer
@@ -251,6 +292,8 @@ export class ContextEngine extends BasicCompactionEngine {
 						})
 						: undefined,
 			},
+			summarizationReasoningEffort: own.summarizationReasoningEffort ?? "",
+			summarizationMaxTokens: own.summarizationMaxTokens ?? DEFAULT_ORGANIZER_MAX_TOKENS,
 			dreamerConfig: {
 				idleMinutes: own.dreamerIdleMinutes ?? DEFAULT_DREAMER_IDLE_MINUTES,
 				maxRounds: own.dreamerMaxRounds ?? DEFAULT_DREAMER_MAX_ROUNDS,
@@ -259,6 +302,8 @@ export class ContextEngine extends BasicCompactionEngine {
 				compartmentBudgetTokens: own.compartmentBudgetTokens ?? DEFAULT_COMPARTMENT_BUDGET_TOKENS,
 				provider: own.dreamerProvider ?? "",
 				model: own.dreamerModel ?? "",
+				reasoningEffort: own.dreamerReasoningEffort ?? "",
+				maxTokens: own.dreamerMaxTokens ?? DEFAULT_DREAMER_MAX_TOKENS,
 			},
 		};
 		this.cdb = openDatabase(resolveDshHome(), { embeddingDim: embeddingPreset?.embeddingDim ?? own.embeddingDim });
@@ -452,6 +497,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		ctx.on("session/disposed", (session) => {
 			this._clearIdleTimer(session);
 			this.dreamerRounds.delete(session);
+			this.generateFailures.delete(session?.id);
 			clearContextUsage(session?.id);
 		});
 		// 80%: land a ready compartment before the next step.
@@ -511,10 +557,19 @@ export class ContextEngine extends BasicCompactionEngine {
 			if (!Number.isFinite(shadowedTokens) || shadowedTokens <= 0) return true;
 			const framedTokens = estimateFramedSummaryTokens(this.ctx.tokenMeter, compartment.summary);
 			if (framedTokens < shadowedTokens) return true;
-			this.cdb.setCompartmentStatus(compartment.id, "failed");
-			this.ctx.logger.warn(`compartment ${compartment.id} is not shrinkable: ${framedTokens} framed tokens >= ${shadowedTokens} source tokens`);
+			const reason = `not shrinkable: ${framedTokens} framed tokens >= ${shadowedTokens} source tokens`;
+			this.cdb.setCompartmentStatus(compartment.id, "failed", reason);
+			this.ctx.logger.warn(`compartment ${compartment.id} is ${reason}`);
 			return false;
 		});
+	}
+
+	/** Resolve the organizer's provider/model/effort for one session. */
+	_summarizationTarget(session) {
+		const configured = this.config.summarizationProvider.length > 0 && this.config.summarizationModel.length > 0
+			? { provider: this.config.summarizationProvider, model: this.config.summarizationModel }
+			: routedTarget(session);
+		return withReasoningEffort(configured, this.ownConfig.summarizationReasoningEffort);
 	}
 
 	/** Create one fixed-range compartment and finish its summary lifecycle. */
@@ -544,16 +599,16 @@ export class ContextEngine extends BasicCompactionEngine {
 			`Started background summary generation for compartment generation ${generation}.`,
 		);
 		try {
-			const target = this.config.summarizationProvider.length > 0 && this.config.summarizationModel.length > 0
-				? { provider: this.config.summarizationProvider, model: this.config.summarizationModel }
-				: routedTarget(session);
+			const target = this._summarizationTarget(session);
 			const parsed = await summarizeCompartment(this.ctx, this.cdb, {
 				session,
 				compartment: this.cdb.compartmentById(compartmentId),
 				range,
 				scopePath: sessionMemoryScope(session),
 				target,
+				maxTokens: this.ownConfig.summarizationMaxTokens,
 			});
+			this.generateFailures.delete(id);
 			this._notify(
 				agent,
 				`Compartment summary ready: #${compartmentId}`,
@@ -564,10 +619,40 @@ export class ContextEngine extends BasicCompactionEngine {
 				].join("\n"),
 			);
 		} catch (error) {
-			this.cdb.setCompartmentStatus(compartmentId, "failed");
+			const reason = describeAuxFailure(error instanceof Error ? error.message : String(error));
+			this.cdb.setCompartmentStatus(compartmentId, "failed", reason);
+			this._recordGenerationFailure(agent, compartmentId, generation, shadowedTokens, reason);
 			throw error;
 		}
 		return compartmentId;
+	}
+
+	/**
+	 * Remember one failed generation and report it.
+	 *
+	 * Without a cooldown the next step boundary immediately re-sends the whole
+	 * range (56k-133k tokens in observed sessions), which turns one throttled
+	 * provider into a self-sustaining flood; without a notice the only trace is
+	 * a process-log warning nobody sees while the UI still shows "generation
+	 * started".
+	 */
+	_recordGenerationFailure(agent, compartmentId, generation, shadowedTokens, reason) {
+		const id = agent.session.id;
+		const failures = (this.generateFailures.get(id)?.failures ?? 0) + 1;
+		const cooldownMs = Math.min(
+			MAX_GENERATE_COOLDOWN_MS,
+			GENERATE_COOLDOWN_MS * 2 ** (failures - 1),
+		);
+		this.generateFailures.set(id, { failures, until: Date.now() + cooldownMs });
+		this._notify(
+			agent,
+			`Compartment generation failed: generation ${generation}`,
+			[
+				`Compartment ${compartmentId} (generation ${generation}) failed after retries: ${reason}`,
+				`Source range: ${shadowedTokens} tokens. Consecutive failures: ${failures}.`,
+				`Next attempt is deferred for ${Math.round(cooldownMs / 1000)}s; the reason is stored on the compartment row.`,
+			].join("\n"),
+		);
 	}
 
 	/** 65% trigger: reserve the session before any asynchronous work. */
@@ -589,6 +674,8 @@ export class ContextEngine extends BasicCompactionEngine {
 		const id = session.id;
 		this._registerUnownedCheckpoints(agent); // migrate legacy checkpoints once
 		if (this._readyCompartments(id).length > 0) return;
+		const cooldown = this.generateFailures.get(id);
+		if (cooldown !== undefined && Date.now() < cooldown.until) return;
 		const contextWindow = await this._contextWindow(agent);
 		if (contextWindow === undefined) return;
 		const measurement = this.ctx.tokenMeter.measure(session);
@@ -715,9 +802,12 @@ export class ContextEngine extends BasicCompactionEngine {
 	/** Run one Dreamer pass for a session's agent (single-flight). */
 	async _runDreamerForAgent(agent) {
 		const dreamer = this.ownConfig.dreamerConfig;
-		const target = dreamer.provider.length > 0 && dreamer.model.length > 0
-			? { provider: dreamer.provider, model: dreamer.model }
-			: routedTarget(agent.session);
+		const target = withReasoningEffort(
+			dreamer.provider.length > 0 && dreamer.model.length > 0
+				? { provider: dreamer.provider, model: dreamer.model }
+				: routedTarget(agent.session),
+			dreamer.reasoningEffort,
+		);
 		if (target === undefined) return { skipped: true, reason: "no route" };
 		if (this.dreamerBusy) return { skipped: true, reason: "busy" };
 		const scopePath = sessionMemoryScope(agent.session);
@@ -740,6 +830,8 @@ export class ContextEngine extends BasicCompactionEngine {
 				agent,
 				provider: target.provider,
 				model: target.model,
+				...(target.reasoningEffort === undefined ? {} : { reasoningEffort: target.reasoningEffort }),
+				maxTokens: dreamer.maxTokens,
 				sessions: this.ctx.sessions,
 				workspaceRoot,
 				scopePath,
@@ -764,7 +856,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			this._notify(
 				agent,
 				"Dreamer failed",
-				`Dreamer failed during its background memory-maintenance pass: ${error instanceof Error ? error.message : String(error)}`,
+				`Dreamer failed during its background memory-maintenance pass: ${describeAuxFailure(error instanceof Error ? error.message : String(error))}`,
 			);
 			throw error;
 		} finally {
@@ -801,8 +893,14 @@ export class ContextEngine extends BasicCompactionEngine {
 	/** Manual `/compact`: land a ready compartment, or generate synchronously. */
 	async compactNow(agent, signal, sourceCommandId) {
 		signal.throwIfAborted();
+		// `runMaintenance` throws synchronously when the agent is not idle, while
+		// anything the task itself raises is a work failure. Without this flag
+		// every organizer failure was reported as "the agent is not idle", which
+		// hid a deterministic summarization failure behind a false busy state.
+		let started = false;
 		try {
 			return await agent.runMaintenance(async (agentSignal) => {
+				started = true;
 				const operationSignal = AbortSignal.any([agentSignal, signal]);
 				operationSignal.throwIfAborted();
 				let ready = this._readyCompartments(agent.session.id);
@@ -837,7 +935,18 @@ export class ContextEngine extends BasicCompactionEngine {
 			});
 		} catch (error) {
 			if (error instanceof ManualCompactionError) throw error;
-			throw new ManualCompactionError("busy", "manual compaction requires an idle agent with no waking queued work", { cause: error });
+			if (!started) {
+				throw new ManualCompactionError("busy", "manual compaction requires an idle agent with no waking queued work", { cause: error });
+			}
+			if (isAbortFailure(error, signal)) {
+				throw new ManualCompactionError("cancelled", "manual compaction was cancelled", { cause: error });
+			}
+			// The reason is already on the compartment row and in a UI notice; the
+			// command surface only distinguishes classes, so `summary` is the honest
+			// one for "the compartment could not be produced".
+			const reason = describeAuxFailure(error instanceof Error ? error.message : String(error));
+			this.ctx.logger.warn(`manual compaction could not produce a summary: ${reason}`);
+			throw new ManualCompactionError("summary", `manual compaction could not produce a summary: ${reason}`, { cause: error });
 		}
 	}
 }

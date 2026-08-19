@@ -21,6 +21,8 @@ window.__ModuleLoader__.load({
 			waitReadyTimeoutMs: 60000,
 			summarizationProvider: "",
 			summarizationModel: "",
+			summarizationReasoningEffort: "",
+			summarizationMaxTokens: 32768,
 			alpha: 0.4,
 			beta: 0.2,
 			injectBudgetTokens: 4000,
@@ -48,6 +50,8 @@ window.__ModuleLoader__.load({
 			compartmentBudgetTokens: 40000,
 			dreamerProvider: "",
 			dreamerModel: "",
+			dreamerReasoningEffort: "",
+			dreamerMaxTokens: 16384,
 		};
 
 		const GROUPS = [
@@ -58,8 +62,8 @@ window.__ModuleLoader__.load({
 					["generateThreshold", "number", 0.1, 1, 0.05],
 					["retainRounds", "number", 1, 100, 1],
 					["waitReadyTimeoutMs", "number", 0, 600000, 1000],
-					["summarizationProvider", "text"],
-					["summarizationModel", "text"],
+					["summarization", "modelTarget"],
+					["summarizationMaxTokens", "number", 1024, 262144, 1024],
 				],
 			},
 			{
@@ -104,8 +108,8 @@ window.__ModuleLoader__.load({
 					["dreamerTimeoutMs", "number", 1000, 3600000, 1000],
 					["verifyIntervalDays", "number", 1, 3650, 1],
 					["compartmentBudgetTokens", "number", 1, 1000000, 100],
-					["dreamerProvider", "text"],
-					["dreamerModel", "text"],
+					["dreamer", "modelTarget"],
+					["dreamerMaxTokens", "number", 1024, 262144, 1024],
 				],
 			},
 		];
@@ -115,8 +119,8 @@ window.__ModuleLoader__.load({
 			generateThreshold: ["generation threshold", "后台开始生成 compartment 的 context 比例"],
 			retainRounds: ["retained paragraphs", "自动压缩时原样保留的最近 N 个有段落号消息"],
 			waitReadyTimeoutMs: ["ready wait timeout (ms)", "落地前等待异步 summary ready 的最长时间"],
-			summarizationProvider: ["summary provider", "留空表示沿用当前 session route"],
-			summarizationModel: ["summary model", "留空表示沿用当前 session route"],
+			summarization: ["整理者模型", "生成 Compartment 摘要的模型；留空表示沿用当前 session route"],
+			summarizationMaxTokens: ["整理者输出上限", "单次整理调用的输出预算；推理模型的思考也占用它，会自动收敛到模型上限"],
 			alpha: ["memory hit boost (alpha)", "memory 命中次数对分数的提升系数"],
 			beta: ["memory decay speed (beta)", "命中次数对衰减半衰期的影响系数"],
 			injectBudgetTokens: ["memory injection budget", "每次请求注入 memory summary 的 token 预算"],
@@ -146,8 +150,8 @@ window.__ModuleLoader__.load({
 			dreamerTimeoutMs: ["Dreamer timeout (ms)", "单次 Dreamer 维护超时时间"],
 			verifyIntervalDays: ["memory verify interval (days)", "memory 再次进入校验队列的间隔"],
 			compartmentBudgetTokens: ["compartment budget", "Dreamer 归档前允许保留的 summary token 总量"],
-			dreamerProvider: ["Dreamer provider", "留空表示沿用当前 session route"],
-			dreamerModel: ["Dreamer model", "留空表示沿用当前 session route"],
+			dreamer: ["Dreamer 模型", "后台记忆整理使用的模型；留空表示沿用当前 session route"],
+			dreamerMaxTokens: ["Dreamer 输出上限", "Dreamer 单轮输出预算；同样受模型上限收敛"],
 		};
 
 		const en = {
@@ -178,6 +182,16 @@ window.__ModuleLoader__.load({
 			meterMemoriesHint: "Injected project_memory prefix. It rides every request but is not part of the conversation figure.",
 			meterCompartments: "\u21B3 Compartments",
 			meterCompartmentsHint: "Compartment checkpoints on the surface. Already counted inside conversation messages, shown here as a sub-total.",
+			targetSessionRoute: "Same as the session model",
+			targetManual: "Custom provider/model\u2026",
+			targetSaved: "saved",
+			targetProvider: "Provider route",
+			targetModel: "Model id",
+			targetEffort: "Reasoning effort",
+			effortDefault: "Adapter default",
+			catalogLoading: "Loading the model catalog\u2026",
+			catalogUnavailable: "The model catalog is unavailable; enter the provider route and model id manually.",
+			catalogFailures: "Providers that could not be listed:",
 		};
 		const zh = {
 			title: "上下文管理",
@@ -207,6 +221,16 @@ window.__ModuleLoader__.load({
 			meterMemoriesHint: "注入的 project_memory 前缀。它随每次请求发送，但不计入「对话消息」。",
 			meterCompartments: "\u21B3 Compartment",
 			meterCompartmentsHint: "surface 上的 Compartment checkpoint。已包含在「对话消息」内，此处仅作为其中的小计。",
+			targetSessionRoute: "沿用 session 模型",
+			targetManual: "自定义 provider/model\u2026",
+			targetSaved: "已保存",
+			targetProvider: "Provider route",
+			targetModel: "Model id",
+			targetEffort: "推理强度",
+			effortDefault: "adapter 默认",
+			catalogLoading: "正在加载模型目录…",
+			catalogUnavailable: "模型目录不可用，请手动填写 provider route 和 model id。",
+			catalogFailures: "以下 provider 无法列出模型：",
 		};
 
 		// --- Native context-meter rows -------------------------------------------
@@ -391,6 +415,8 @@ window.__ModuleLoader__.load({
 			".dctx-group summary{color:var(--dsw-alias-label-primary);cursor:pointer;font-size:13px;font-weight:600;line-height:22px}",
 			".dctx-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px;padding-top:10px}",
 			".dctx-field{display:flex;flex-direction:column;gap:4px;min-width:0}",
+			".dctx-field-wide{grid-column:1/-1}",
+			".dctx-subfield{display:flex;flex-direction:column;gap:4px;min-width:0;padding-top:2px}",
 			".dctx-label{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}",
 			".dctx-input{box-sizing:border-box;width:100%;height:32px;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-input-major);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:0 8px;font-size:12px;font-family:inherit}",
 			".dctx-input:focus{outline:none;border-color:var(--dsw-alias-state-business-primary)}",
@@ -414,7 +440,7 @@ window.__ModuleLoader__.load({
 
 		function createContextStore() {
 			return defineStore({
-				init: () => ({ status: "loading", saved: clone(DEFAULTS), draft: clone(DEFAULTS), dirty: false, saving: false, message: "", modelStatus: { embedding: "idle", rerank: "idle" }, modelProgress: { embedding: 0, rerank: 0 }, modelError: { embedding: "", rerank: "" } }),
+				init: () => ({ status: "loading", saved: clone(DEFAULTS), draft: clone(DEFAULTS), dirty: false, saving: false, message: "", modelStatus: { embedding: "idle", rerank: "idle" }, modelProgress: { embedding: 0, rerank: 0 }, modelError: { embedding: "", rerank: "" }, catalog: { status: "loading", groups: [], failures: [] } }),
 				actions: {
 					load: (state, config) => { state.saved = merged(config); state.draft = merged(config); state.dirty = false; state.saving = false; state.status = "ready"; state.message = ""; state.modelStatus = { embedding: "idle", rerank: "idle" }; state.modelProgress = { embedding: 0, rerank: 0 }; state.modelError = { embedding: "", rerank: "" }; },
 					edit: (state, path, value) => { setAt(state.draft, path, value); state.dirty = true; state.message = ""; },
@@ -426,6 +452,7 @@ window.__ModuleLoader__.load({
 					modelProgress: (state, kind, progress) => { state.modelProgress[kind] = Math.max(0, Math.min(100, Number(progress) || 0)); },
 					modelReady: (state, kind) => { state.modelStatus[kind] = "ready"; state.modelProgress[kind] = 100; state.modelError[kind] = ""; },
 					modelFailed: (state, kind, error) => { state.modelStatus[kind] = "error"; state.modelError[kind] = error || ""; },
+					catalog: (state, catalog) => { state.catalog = catalog; },
 				},
 			});
 		}
@@ -444,8 +471,116 @@ window.__ModuleLoader__.load({
 			return value;
 		}
 
+		/** Split a catalog option value back into its provider/model pair. */
+		function splitTarget(value) {
+			const cut = value.indexOf("/");
+			return cut === -1 ? { provider: value, model: "" } : { provider: value.slice(0, cut), model: value.slice(cut + 1) };
+		}
+
+		/** The catalog entry for one provider/model pair, when it advertises one. */
+		function findCatalogModel(catalog, provider, model) {
+			for (const group of catalog.groups) {
+				if (group.id !== provider) continue;
+				for (const entry of group.models) if (entry.id === model) return entry;
+			}
+			return undefined;
+		}
+
+		/**
+		 * Provider/model/effort picker over the host's own provider registry.
+		 *
+		 * Catalog membership is advisory on purpose: a saved pair that no route
+		 * advertises stays selected (shown as "saved") and manual entry remains
+		 * available, so a gateway that hides its model list never blocks the
+		 * organizer or Dreamer from being pointed somewhere cheaper.
+		 */
+		function ModelTargetField({ prefix, state, t, edit }) {
+			const provider = String(valueAt(state.draft, `${prefix}Provider`) ?? "");
+			const model = String(valueAt(state.draft, `${prefix}Model`) ?? "");
+			const effort = String(valueAt(state.draft, `${prefix}ReasoningEffort`) ?? "");
+			const pair = provider.length > 0 && model.length > 0 ? `${provider}/${model}` : "";
+			const known = pair.length > 0 && findCatalogModel(state.catalog, provider, model) !== undefined;
+			// Manual mode is only ever entered by choosing it. Deriving it from
+			// catalog membership would depend on whether the catalog had arrived by
+			// first render, so the panel would silently change shape with latency.
+			const [manual, setManual] = react.useState(false);
+			const copy = FIELD_LABELS[prefix] ?? [prefix, ""];
+			const selected = manual ? "__manual__" : pair;
+			const onSelect = (value) => {
+				if (value === "__manual__") { setManual(true); return; }
+				setManual(false);
+				const next = value.length === 0 ? { provider: "", model: "" } : splitTarget(value);
+				edit(`${prefix}Provider`, next.provider);
+				edit(`${prefix}Model`, next.model);
+				// Effort ids belong to one exact model; a stale id would fail the
+				// next request, so switching the target clears it.
+				edit(`${prefix}ReasoningEffort`, "");
+			};
+			const efforts = findCatalogModel(state.catalog, provider, model)?.reasoning?.efforts ?? [];
+			const targetSelect = jsx("select", {
+				className: "dctx-input",
+				value: selected,
+				onChange: (event) => onSelect(event.target.value),
+				children: [
+					jsx("option", { value: "", children: t("targetSessionRoute") }),
+					...(pair.length > 0 && !known
+						? [jsx("option", { key: "saved", value: pair, children: `${pair} (${t("targetSaved")})` })]
+						: []),
+					...state.catalog.groups.map((group) => jsx("optgroup", {
+						label: group.name,
+						children: group.models.map((entry) => jsx("option", {
+							value: `${group.id}/${entry.id}`,
+							children: entry.name === entry.id ? entry.id : `${entry.name} (${entry.id})`,
+						}, entry.id)),
+					}, group.id)),
+					jsx("option", { value: "__manual__", children: t("targetManual") }),
+				],
+			});
+			const manualInputs = manual
+				? [
+					jsx("div", { className: "dctx-subfield", children: [
+						jsx("span", { className: "dctx-label", children: t("targetProvider") }),
+						jsx("input", { className: "dctx-input", type: "text", value: provider, onChange: (event) => edit(`${prefix}Provider`, event.target.value) }),
+					] }, "provider"),
+					jsx("div", { className: "dctx-subfield", children: [
+						jsx("span", { className: "dctx-label", children: t("targetModel") }),
+						jsx("input", { className: "dctx-input", type: "text", value: model, onChange: (event) => edit(`${prefix}Model`, event.target.value) }),
+					] }, "model"),
+				]
+				: [];
+			const effortControl = efforts.length > 0
+				? jsx("select", {
+					className: "dctx-input",
+					value: effort,
+					onChange: (event) => edit(`${prefix}ReasoningEffort`, event.target.value),
+					children: [
+						jsx("option", { value: "", children: t("effortDefault") }),
+						...efforts.map((entry) => jsx("option", { value: entry.id, children: entry.name ?? entry.id }, entry.id)),
+					],
+				})
+				: jsx("input", { className: "dctx-input", type: "text", value: effort, placeholder: t("effortDefault"), onChange: (event) => edit(`${prefix}ReasoningEffort`, event.target.value) });
+			return jsx("div", { className: "dctx-field dctx-field-wide", children: [
+				jsx("span", { className: "dctx-label", children: copy[0] }),
+				targetSelect,
+				...manualInputs,
+				jsx("div", { className: "dctx-subfield", children: [
+					jsx("span", { className: "dctx-label", children: t("targetEffort") }),
+					effortControl,
+				] }),
+				jsx("span", { className: "dctx-hint", children: state.catalog.status === "loading"
+					? t("catalogLoading")
+					: state.catalog.status === "error"
+						? t("catalogUnavailable")
+						: copy[1] }),
+				...(state.catalog.failures.length > 0
+					? [jsx("span", { className: "dctx-hint", children: `${t("catalogFailures")} ${state.catalog.failures.map((failure) => failure.id).join(", ")}` })]
+					: []),
+			] });
+		}
+
 		function Field({ field, state, t, edit }) {
 			const [path, type, min, max, step] = field;
+			if (type === "modelTarget") return jsx(ModelTargetField, { prefix: path, state, t, edit });
 			const copy = FIELD_LABELS[path] ?? [path, ""];
 			const current = valueAt(state.draft, path);
 			const presetOptions = path === "embeddingPreset"
@@ -544,6 +679,13 @@ window.__ModuleLoader__.load({
 					bound?.modelFailed(kind, error instanceof Error ? error.message : String(error));
 				}
 			};
+			const loadCatalog = () => fetch("/magic-context/models/catalog")
+				.then((response) => (response.ok ? response.json() : null))
+				.then((payload) => {
+					if (payload?.ok !== true || !Array.isArray(payload.groups)) throw new Error("catalog unavailable");
+					bound?.catalog({ status: "ready", groups: payload.groups, failures: Array.isArray(payload.failures) ? payload.failures : [] });
+				})
+				.catch(() => bound?.catalog({ status: "error", groups: [], failures: [] }));
 			fetch("/magic-context/config").then((response) => response.ok ? response.json() : null).then((payload) => {
 				if (payload?.config) {
 					load(payload.config);
@@ -567,6 +709,7 @@ window.__ModuleLoader__.load({
 			};
 			const injected = (actions) => {
 				bound = actions;
+				void loadCatalog();
 				if (loaded !== null) actions.load(loaded);
 				return {
 					edit: (path, value) => {

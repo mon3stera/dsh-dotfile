@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS compartments (
   model        TEXT,
   landing_seq  INTEGER,
   removed      INTEGER NOT NULL DEFAULT 0,
+  error        TEXT,
   UNIQUE (session_id, generation)
 );
 CREATE INDEX IF NOT EXISTS compartments_session ON compartments(session_id);
@@ -115,6 +116,9 @@ const VEC_SCHEMA = `
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec
   USING vec0(embedding float[__EMBEDDING_DIM__]);
 `;
+
+/** Bound stored generation-failure reasons; they are diagnostics, not payloads. */
+const MAX_COMPARTMENT_ERROR_CHARS = 2000;
 
 function assertImportance(value, label = "importance") {
 	if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 10) {
@@ -228,12 +232,24 @@ export class ContextDb {
 	}
 
 	setCompartmentSummary(id, { summary, provider, model }) {
-		this.db.prepare("UPDATE compartments SET summary = ?, provider = ?, model = ?, status = 'ready' WHERE id = ?")
+		this.db.prepare("UPDATE compartments SET summary = ?, provider = ?, model = ?, status = 'ready', error = NULL WHERE id = ?")
 			.run(summary, provider ?? null, model ?? null, id);
 	}
 
-	setCompartmentStatus(id, status) {
-		this.db.prepare("UPDATE compartments SET status = ? WHERE id = ?").run(status, id);
+	/**
+	 * Move one compartment to another status, optionally recording why.
+	 *
+	 * A failure reason is durable on purpose: generation runs outside the agent
+	 * loop, so the process log is the only other place it would appear, and a
+	 * silent `failed` row is indistinguishable from a bug.
+	 */
+	setCompartmentStatus(id, status, error) {
+		if (error === undefined) {
+			this.db.prepare("UPDATE compartments SET status = ? WHERE id = ?").run(status, id);
+			return;
+		}
+		this.db.prepare("UPDATE compartments SET status = ?, error = ? WHERE id = ?")
+			.run(status, error === null ? null : String(error).slice(0, MAX_COMPARTMENT_ERROR_CHARS), id);
 	}
 
 	compartmentById(id) {
@@ -568,6 +584,7 @@ function migrate(db) {
 		["model", "ALTER TABLE compartments ADD COLUMN model TEXT"],
 		["landing_seq", "ALTER TABLE compartments ADD COLUMN landing_seq INTEGER"],
 		["removed", "ALTER TABLE compartments ADD COLUMN removed INTEGER NOT NULL DEFAULT 0"],
+		["error", "ALTER TABLE compartments ADD COLUMN error TEXT"],
 	]) {
 		if (!compartmentCols.has(name)) db.exec(ddl);
 	}

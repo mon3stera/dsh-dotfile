@@ -34,6 +34,47 @@ const SECTION_CHILDREN = Object.freeze({
 const MAX_VALIDATION_ERRORS = 20;
 const MAX_INVALID_OUTPUT_CHARS = 12000;
 
+/** Every element name the organizer schema can legally produce. */
+const KNOWN_ELEMENTS = new Set([
+	"output",
+	"compartments",
+	"compartment",
+	...COMPARTMENT_SECTIONS,
+	"item",
+	"decision",
+	"check",
+	"constraint",
+	"file",
+	"symbol",
+	"command",
+	"error",
+	"commit",
+	"url",
+	"facts",
+	"fact",
+	"none",
+]);
+
+/**
+ * Elements the schema declares text-only (`leafText` rejects any child), so the
+ * only markup that can legally appear inside one is its own closing tag.
+ */
+const LEAF_ELEMENTS = new Set([
+	"objective",
+	"continuity",
+	"item",
+	"decision",
+	"check",
+	"constraint",
+	"file",
+	"symbol",
+	"command",
+	"error",
+	"commit",
+	"url",
+	"fact",
+]);
+
 function addError(errors, path, message) {
 	if (errors.length < MAX_VALIDATION_ERRORS) errors.push(`${path}: ${message}`);
 }
@@ -300,6 +341,107 @@ function parseFacts(factsNode, errors) {
 		if (value !== "") facts.push({ text: value, importance: Number.isFinite(importance) ? Math.min(10, Math.max(0, importance)) : 5 });
 	}
 	return facts;
+}
+
+/** Escape ampersands that do not already start a legal XML entity. */
+function escapeStrayAmpersands(value) {
+	return value.replace(/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-f]+;)/gi, "&amp;");
+}
+
+/** Turn one rejected token back into text; ampersands first, then brackets. */
+function escapeTokenAsText(token) {
+	return escapeStrayAmpersands(token).replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+/** Escape a text run: stray ampersands plus any `<` the tokenizer left behind. */
+function escapeTextRun(value) {
+	return escapeStrayAmpersands(value).replaceAll("<", "&lt;");
+}
+
+/** Classify one `<...>` token without validating its attributes. */
+function classifyToken(token) {
+	if (token.startsWith("</")) {
+		const match = token.match(/^<\/\s*([A-Za-z_][A-Za-z0-9_.:-]*)\s*>$/);
+		return match === null ? null : { kind: "close", name: match[1] };
+	}
+	const body = token.slice(1, -1).trim();
+	const match = body.match(/^([A-Za-z_][A-Za-z0-9_.:-]*)/);
+	if (match === null) return null;
+	return { kind: "open", name: match[1], selfClosing: body.endsWith("/") };
+}
+
+/**
+ * Reduce a response to its `<output>` document.
+ *
+ * Models routinely wrap the document in prose or a markdown fence, which the
+ * strict validator rejects as text outside the document root. Slicing from the
+ * first `<output` to the last `</output>` removes that wrapper without changing
+ * anything inside the document; a response with no root is returned unchanged
+ * so validation still reports the real problem.
+ */
+export function extractOutputDocument(text) {
+	if (typeof text !== "string") return "";
+	const start = text.search(/<output(?:\s|>|\/)/);
+	if (start === -1) return text;
+	const end = text.lastIndexOf("</output>");
+	if (end === -1 || end < start) return text;
+	return text.slice(start, end + "</output>".length);
+}
+
+/**
+ * Locally repair an organizer response that failed strict validation.
+ *
+ * This is NOT a general XML repairer, and it never changes the tree shape: it
+ * only decides, per `<...>` token, whether that token can be markup at all, and
+ * escapes it when it cannot. Two schema properties make that decision sound
+ * instead of a guess:
+ *
+ *  1. the element-name set is closed, so any other name (`<name>`, `<plugin>`,
+ *     `<T>`) can only ever be text the model failed to escape, and
+ *  2. every leaf element is declared text-only, so inside a leaf the single
+ *     legal token is that leaf's own closing tag.
+ *
+ * Callers must re-run the unchanged {@link validateOrganizerOutput} on the
+ * result: a candidate that still fails is discarded, so this pass can only turn
+ * a rejected response into one the same strict schema accepts.
+ *
+ * @param text - the raw model response.
+ * @returns the repaired candidate text.
+ */
+export function sanitizeOrganizerOutput(text) {
+	if (typeof text !== "string") return "";
+	const source = extractOutputDocument(text);
+	const tokenPattern = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[[\s\S]*?\]\]>|<[^>]*>/g;
+	const stack = [];
+	let out = "";
+	let cursor = 0;
+	let match;
+	while ((match = tokenPattern.exec(source)) !== null) {
+		out += escapeTextRun(source.slice(cursor, match.index));
+		cursor = tokenPattern.lastIndex;
+		const token = match[0];
+		if (token.startsWith("<!--") || token.startsWith("<?") || token.startsWith("<![CDATA[")) {
+			out += token;
+			continue;
+		}
+		const parsed = classifyToken(token);
+		const open = stack.at(-1);
+		const insideLeaf = open !== undefined && LEAF_ELEMENTS.has(open);
+		const accept = parsed !== null && (insideLeaf
+			? parsed.kind === "close" && parsed.name === open
+			: KNOWN_ELEMENTS.has(parsed.name));
+		if (!accept) {
+			out += escapeTokenAsText(token);
+			continue;
+		}
+		out += parsed.kind === "close" ? token : escapeStrayAmpersands(token);
+		if (parsed.kind === "open") {
+			if (!parsed.selfClosing) stack.push(parsed.name);
+		} else if (open === parsed.name) {
+			stack.pop();
+		}
+	}
+	return out + escapeTextRun(source.slice(cursor));
 }
 
 /** Validate the new XML organizer protocol and return its parsed payload. */

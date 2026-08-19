@@ -22,6 +22,8 @@ export const CONTEXT_SETTINGS_DEFAULTS = {
 	waitReadyTimeoutMs: 60000,
 	summarizationProvider: "",
 	summarizationModel: "",
+	summarizationReasoningEffort: "",
+	summarizationMaxTokens: 32768,
 	alpha: 0.4,
 	beta: 0.2,
 	injectBudgetTokens: 4000,
@@ -55,6 +57,8 @@ export const CONTEXT_SETTINGS_DEFAULTS = {
 	compartmentBudgetTokens: 40000,
 	dreamerProvider: "",
 	dreamerModel: "",
+	dreamerReasoningEffort: "",
+	dreamerMaxTokens: 16384,
 };
 
 const nullableDays = () => z.union([z.number().min(1), z.const(0), z.const(null)]).default(null);
@@ -66,6 +70,8 @@ export const ContextSettingsSchema = z.object({
 	waitReadyTimeoutMs: z.number().step(1).min(0).max(600000).default(CONTEXT_SETTINGS_DEFAULTS.waitReadyTimeoutMs),
 	summarizationProvider: z.string().default(""),
 	summarizationModel: z.string().default(""),
+	summarizationReasoningEffort: z.string().default(""),
+	summarizationMaxTokens: z.number().step(1).min(1024).max(262144).default(32768),
 	alpha: z.number().min(0).max(10).default(CONTEXT_SETTINGS_DEFAULTS.alpha),
 	beta: z.number().min(0).max(10).default(CONTEXT_SETTINGS_DEFAULTS.beta),
 	injectBudgetTokens: z.number().step(1).min(1).max(100000).default(CONTEXT_SETTINGS_DEFAULTS.injectBudgetTokens),
@@ -99,6 +105,8 @@ export const ContextSettingsSchema = z.object({
 	compartmentBudgetTokens: z.number().step(1).min(1).max(1000000).default(CONTEXT_SETTINGS_DEFAULTS.compartmentBudgetTokens),
 	dreamerProvider: z.string().default(""),
 	dreamerModel: z.string().default(""),
+	dreamerReasoningEffort: z.string().default(""),
+	dreamerMaxTokens: z.number().step(1).min(1024).max(262144).default(16384),
 });
 
 export function configPath() {
@@ -235,11 +243,79 @@ export async function handleContextModels(req, res) {
 	json(res, 202, { ok: true, ...localPresetStatus(kind, preset) });
 }
 
+/**
+ * Build the provider/model catalog for the settings panel.
+ *
+ * Deliberately the same three host APIs the native model surfaces use
+ * (`llm.providers` / `session.models` are built the same way), so the organizer
+ * and Dreamer pickers offer exactly the routes this DSH can actually dispatch,
+ * including each exact model's adapter-owned reasoning efforts. Catalog
+ * membership stays advisory: a provider that fails to list rides `failures` and
+ * the sound groups remain usable, and a saved provider/model pair that no route
+ * advertises stays valid for dispatch.
+ * @param llm - the host llm service.
+ * @returns { groups, failures } with empty models groups dropped.
+ */
+export async function buildModelCatalog(llm) {
+	const providers = typeof llm?.listProviders === "function" ? llm.listProviders() : [];
+	const groups = [];
+	const failures = [];
+	await Promise.all(providers.map(async (provider) => {
+		const id = typeof provider === "string" ? provider : provider?.id;
+		if (typeof id !== "string" || id.length === 0) return;
+		const name = (typeof provider === "object" ? provider?.name : undefined) ?? id;
+		try {
+			const models = await llm.listModels(id);
+			const entries = await Promise.all((models ?? []).map(async (model) => {
+				let reasoning;
+				try {
+					const resolved = await llm.resolveModelInfo(id, model.id);
+					if (resolved?.reasoning !== undefined) {
+						reasoning = {
+							efforts: (resolved.reasoning.efforts ?? []).map((effort) => ({ id: effort.id, name: effort.name })),
+							...(resolved.reasoning.defaultEffort === undefined ? {} : { defaultEffort: resolved.reasoning.defaultEffort }),
+						};
+					}
+				} catch { /* reasoning metadata is optional */ }
+				return { id: model.id, name: model.name ?? model.id, ...(reasoning === undefined ? {} : { reasoning }) };
+			}));
+			if (entries.length > 0) groups.push({ id, name, models: entries });
+		} catch (error) {
+			failures.push({ id, name, message: error instanceof Error ? error.message : String(error) });
+		}
+	}));
+	groups.sort((a, b) => a.id.localeCompare(b.id));
+	failures.sort((a, b) => a.id.localeCompare(b.id));
+	return { groups, failures };
+}
+
+/** GET /magic-context/models/catalog for the organizer/Dreamer model pickers. */
+export function createModelCatalogHandler(llm) {
+	return async function handleModelCatalog(req, res) {
+		if (req.method !== "GET" && req.method !== "HEAD") {
+			res.writeHead(405);
+			res.end();
+			return;
+		}
+		try {
+			json(res, 200, { ok: true, ...(await buildModelCatalog(llm)) });
+		} catch (error) {
+			json(res, 200, { ok: false, groups: [], failures: [], error: error instanceof Error ? error.message : String(error) });
+		}
+	};
+}
+
 export function apply(ctx) {
 	ctx.inject(["webServer"], (httpCtx) => {
 		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/magic-context/config", handler: handleContextConfig }), "dsh-magic-context-settings: config route");
 		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/magic-context/usage", handler: handleContextUsage }), "dsh-magic-context-settings: usage route");
 		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/magic-context/models/status", handler: handleContextModels }), "dsh-magic-context-settings: model status route");
 		httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/magic-context/models/ensure", handler: handleContextModels }), "dsh-magic-context-settings: model ensure route");
+		// The catalog route exists only where the host llm registry does; the
+		// panel falls back to manual provider/model entry without it.
+		httpCtx.inject(["llm"], (llmCtx) => {
+			const handler = createModelCatalogHandler(llmCtx.llm);
+			llmCtx.effect(() => llmCtx.webServer.register({ kind: "exact", path: "/magic-context/models/catalog", handler }), "dsh-magic-context-settings: model catalog route");
+		});
 	});
 }

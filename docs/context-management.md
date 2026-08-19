@@ -154,6 +154,72 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 - `context-window-exceeded` 溢出恢复：优先用就绪 Compartment；没有则**同步生成**（溢出时必须立刻释放空间，允许阻塞）。
 - `/compact` 手动：有就绪 Compartment 则落地；否则同步生成（用户预期立即生效）。历史少于 `retainRounds` 时，手动/溢出路径会降低保留尾部但至少保留最近一个段落；候选范围还必须大于固定 checkpoint framing，否则直接跳过，不发起必然失败的摘要请求。
 
+### 3.6 辅助调用韧性（重试、失败可见性、本地 XML 修复）
+
+整理者与 Dreamer 都走 `ctx.llm.stream()` 的**辅助调用**：它们不带 agent loop 的请求标记，因此宿主的请求重试插件（挂在 `agent/request-error`、以 `isAgentLoopRequest` 为守卫）看不到它们，`LlmRuntime.stream()` 自身也不重试。主 Agent 能扛过网关抖动，靠的正是那层重试；辅助调用曾经只有一次机会，网关一次 `429 Rate limit exceeded: tpm (InputTokens)`、nginx `504`、流提前中断或空响应，就让整代 Compartment 永久 `failed`。
+
+- **重试**：`lib/aux-llm.js` 的 `streamAux()` 为辅助调用提供有界重试（默认 3 次），指数退避 + 抖动，并优先采用 provider 给出的 `providerRetryAfterMs`。可重试类与主 Agent 一致：`RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE`（外加 `STREAM_CLOSED`）。`AUTH`、`INVALID_REQUEST`、`MAX_TOKENS` 以及用户中止一律不重试，失败立即上抛。整理者与 Dreamer 每轮都经由它发起请求。
+- **失败可见性**：`compartments` 增加 `error` 列（迁移式添加）。失败时 `setCompartmentStatus(id, "failed", reason)` 落库原因，成功写摘要时清空；同时发一条 `Compartment generation failed: generation N` 的 UI 通知，包含原因、源区间 token 数、连续失败次数与下次尝试的推迟时长。此前失败只有一行进程日志，UI 上仍停在 "generation started"。
+- **失败冷却**：每次生成都会重发整个区间（实测 56k–133k input tokens），因此每个 step 边界无节制重试会把一次限流放大成持续洪流。连续失败按 `2^n` 退避（起步 120s，上限 15min）记在 `generateFailures`，冷却期内 `_maybeGenerate` 直接返回；一次成功即清空，会话销毁时一并清理。
+- **本地 XML 修复**：模型偶尔在 text-only 叶子里写出未转义的裸标签（如 `<name>`、`<plugin>`、`<system-reminder>`）。`sanitizeOrganizerOutput()` 在**校验失败之后**做一次 schema 感知的重判：元素名集合是封闭的，凡不在集合内的标签只能是文本；叶子按 schema 是 text-only，因此叶子内唯一合法的标记是它自己的结束标签；此外还会剥掉 markdown 围栏/前后散文（`extractOutputDocument`）。修复结果必须通过**未改动的严格校验器**才会被采用，否则照旧走模型 repair。它从不补标签、不改树形，因此只能把被拒绝的输出变成合法输出，不会放宽契约——纯转义错误因此不再多花一次全量模型调用。
+
+#### 3.6.1 输出预算：截断按"长大"恢复，不按重试恢复
+
+`MAX_TOKENS` 与限流不同：同一个 cap 上重试必然再次截断，所以它不在可重试类里。真正的修法是把 cap 调大。
+
+- **思考也吃这份预算**。推理模型先思考再作答，而 Anthropic 的 `max_tokens` 同时覆盖 thinking 与正文。因此"按文档长度"估的 cap 在大区间上会在正文开始之前就被思考耗尽——表现为 `stop_reason: max_tokens` 且**一个字都没输出**，且每次必然复现。实测：某会话在 158–370 段（约 90k tokens 源区间）上以 8192 的 cap 连续失败 8 次，`compartments.error` 全部是 `auxiliary model output truncated at the token cap`。
+- **默认值与收敛**：整理者默认 `summarizationMaxTokens: 32768`，Dreamer 默认 `dreamerMaxTokens: 16384`，两者都会被 `resolveAuxMaxTokens()`（`ctx.llm.resolveModelInfo` 的 `defaultMaxTokens`）收敛到目标模型自己的上限，因此把整理者指到只有 4k–8k 输出的旧模型也不会发出非法请求。
+- **一次性增长**：`streamAux` 在 `MAX_TOKENS` 上把 cap 乘以 `growFactor`（默认 2、上限 `growAttempts: 1` 次）后立即重发，不退避——没有人在限流我们。增长同样受模型上限收敛；已经到顶就直接失败。
+- **配置降档更省**：整理者不继承会话的 `reasoningEffort`（会话是 `max` 时尤其不该继承）。把 3.7 的推理档位设为 `off`/`minimal` 能同时消掉思考开销与截断风险。
+
+##### 3.6.1.0 "cap 只算输出、不算思考"能否做到：分三种路线
+
+这个问题没有统一答案，取决于目标路由如何把思考预算映射到线上参数。三种情形都已核对，其中第三种为实测：
+
+| 路线 | 线上行为 | 我们的 cap 是否＝输出预算 |
+| --- | --- | --- |
+| pi-ai **预算式** thinking（无 `compat.forceAdaptiveThinking`，如 Sonnet 4.5、Opus 4.1） | `adjustMaxTokensForThinking()` 把思考预算**加在**调用方 cap 之上：`max_tokens = min(ours + budget, modelMax)`，`budget_tokens = min(budget, max_tokens - 1024)`；阶梯为 minimal 1024 / low 2048 / medium 8192 / high·xhigh·max 16384 | **是，已经是**。传 32768 + `high` → 线上 `max_tokens: 49152`、`budget_tokens: 16384` |
+| pi-ai **自适应** thinking（`compat.forceAdaptiveThinking: true`，如 Opus 4.6–5、Sonnet 4.6/5） | `thinking: {type: "adaptive"}` + `output_config: {effort}`，cap 原样进 `max_tokens`；Anthropic 在自适应模式下**不提供**独立思考预算 | **否，且无法做到**——这是 API 的限制，不是 DSH 的 |
+| `deepseek-official` adapter | `max_tokens` 原样下发，另附 `thinking.type` 与 `reasoning_effort`；CoT 与正文共享同一预算 | **否**，只能用 `off` 把整份预算让给输出 |
+
+DeepSeek 那行的实测（`deepseek-v4-flash`，`max_tokens: 200`）：
+
+- `reasoning_effort: high` → `finish_reason: length`、`completion_tokens: 200`、`reasoning_tokens: 200`、`content` **长度 0**。预算被 CoT 吃光，正文一个字都没开始——正是 3.6.1 描述的确定性截断。
+- `thinking: {type: "disabled"}` → `completion_tokens: 200`、无 `reasoning_tokens`、`content` 469 字符。整份预算归输出。
+
+因此想让 `summarizationMaxTokens` 在**任意**路由上都等于"输出预算"，唯一无歧义的开关是把 `summarizationReasoningEffort` 设为 `off`：pi-ai 侧 `off` 折成"不传 reasoning"（`thinkingEnabled: false`），DeepSeek 侧折成 `thinking: {type: "disabled"}`。整理者做的是对给定文本的结构化抽取而非推理，所以这是它本就该用的档位。`off` 是否合法由模型的 `thinkingLevelMap` 决定（Opus 5 允许，`claude-fable-5` 明确禁止），而设置面板只列出该模型自己声明的档位，因此选不出非法值。Dreamer 做的是判断性工作（核验记忆与事实），保留思考档位是合理的。
+
+#### 3.6.1.1 图片内容不得阻断纯文本整理者
+
+整理者处理的是它无法选择的固定区间：会话里只要贴过一张截图，纯文本路由就会以 `UNSUPPORTED_CONTENT` 拒收整个请求（实测 `The DeepSeek chat-completions adapter does not support image content.`），于是这个会话**永久无法压缩**——把整理者换成便宜模型反而制造了新的确定性失败。
+
+`stripImageContent()` 因此把 image block 换成占位文本 `[image omitted: the summarization model accepts text only]`，保留消息的位置与角色（摘要需要的是叙事结构，不是像素）。两条路径：
+
+- **提前剥离**：`resolveAuxImageSupport()` 读 `resolveModelInfo().inputModalities`；明确不含 `image`（如 `deepseek-official` 声明 `["text"]`）就在发请求前剥离，连一次失败都不浪费。
+- **拒收后兜底**：`inputModalities` 缺失表示"未知"，此时照常带图发送；若路由以 `UNSUPPORTED_CONTENT` 拒收，则剥离后**重试一次**。剥离后已无 image block，因此不会形成循环；与图片无关的拒收（如 `INVALID_REQUEST`）照旧立即失败。
+
+#### 3.6.2 失败文本必须先变惰性再落地
+
+provider/网关的失败不一定是 JSON：网关前的 WAF 会返回**整页 HTML**（含 `<script>`）。这种文本绝不能原样进通知——通知是**持久的会话内容**，它会随后续每次请求发送，于是：下一次整理调用把自己的错误页当输入重发，而错误页里的脚本标签本身可能正是触发拦截的东西，失败便自我延续，且每失败一次再追加一份。
+
+`describeAuxFailure()` 因此在入库与通知前把失败文本压成单行诊断：识别出 HTML 后只保留状态码与 `<title>`（如 `HTTP 405; provider returned an HTML error page`），其余文本折叠空白并截到 `MAX_AUX_REASON_CHARS`（240）。`compartments.error`、Compartment 失败通知、Dreamer 失败通知与手动压缩的失败文本都走它。
+
+#### 3.6.3 手动 `/compact` 的失败必须说实话
+
+`compactNow()` 曾把 `runMaintenance` 里的**任何**异常都改写成 `ManualCompactionError("busy")`，于是一次整理者截断在 UI 上显示为"进程有活跃压缩，或 agent 不空闲"——把确定性的摘要失败伪装成瞬时忙碌，用户只会反复重试。现在以"任务体是否已开始执行"区分：未开始 = 真忙（`busy`）；已开始则按中止（`cancelled`）或摘要失败（`summary`，附归一化原因）上报。
+
+### 3.7 整理者 / Dreamer 的独立模型选择
+
+整理者与 Dreamer 默认跟随会话路由（`routedTarget(session)`），但两者的工作性质与对话完全不同：它们是结构化抽取，不需要对话模型的推理强度，却每次都要重发整个区间。把它们指到更便宜的路由，既省钱也能让它们不再和主 Agent 抢同一个 provider 的 tpm 配额（这正是限流失败的来源）。
+
+配置直接复用宿主已有的 Provider 系统，而不是另建一套模型清单：
+
+- **目录来源**：`settings.js` 的 `buildModelCatalog()` 调用 `llm.listProviders()` / `llm.listModels(provider)` / `llm.resolveModelInfo(provider, model)`——与宿主自己的 `llm.models`、`session.models` 完全同源，因此下拉框里只会出现这台 DSH 真的能派发的路由，并带上每个精确模型的 adapter 推理档位。它由 `GET /magic-context/models/catalog` 暴露；该路由挂在对 `llm` 的内层 inject 上，宿主没有该服务时路由不存在，面板自动退回手填。
+- **目录是建议性的**：某个 provider 列不出模型时它进 `failures`（面板只列出 id），其余分组照常可用；已保存但目录未收录的 `provider/model` 仍保留为选中项（标记 `saved`）并继续派发——网关隐藏模型清单不会阻断配置。选择「自定义 provider/model…」可随时手填。
+- **推理档位**：`summarizationReasoningEffort` / `dreamerReasoningEffort` 独立于 provider/model，因此**沿用会话模型时也能单独降档**（如整理者用 `off`）。档位 id 属于某个精确模型，所以切换目标时会清空；模型不接受该 id 时按 `INVALID_REQUEST` 快速失败（不重试），原因落到 `compartments.error` 与失败通知。
+
+两组键完全独立：整理者读 `summarizationProvider` / `summarizationModel` / `summarizationReasoningEffort`，Dreamer 读 `dreamerProvider` / `dreamerModel` / `dreamerReasoningEffort`；provider 与 model 必须同时非空才算覆盖，否则回落到会话路由。
+
 ## 4. 子系统 B：project_memory
 
 ### 4.1 数据模型（SQLite DDL）
@@ -412,6 +478,12 @@ verifyIntervalDays: 30          # 记忆校验周期
 compartmentBudgetTokens: 40000  # 未归档 Compartments 总预算
 dreamerProvider: ''             # 空 = 跟随会话路由
 dreamerModel: ''
+dreamerReasoningEffort: ''      # 空 = adapter 默认档位
+summarizationProvider: ''       # 空 = 跟随会话路由（provider 与 model 必须同时填）
+summarizationModel: ''
+summarizationReasoningEffort: ''
+summarizationMaxTokens: 32768    # 整理者输出预算（含思考），收敛到模型上限
+dreamerMaxTokens: 16384          # Dreamer 单轮输出预算
 ```
 
 `embeddingPreset: bge-m3` 和 `rerankPreset: bge-reranker-v2-m3` 分别使用 `Xenova/bge-m3` 与 `onnx-community/bge-reranker-v2-m3-ONNX` 的 q8 ONNX 权重；每个预设独立由 Web host 后台下载，模型缓存位于 `$DSH_HOME/magic-context/.cache`。

@@ -80,15 +80,16 @@ lib/
   tools.js                 ctx_reduce and ctx_expand implementations
   range.js                  Compaction range selection
   summarizer.js             Organizer LLM call, bounded repair, and fact extraction
-  organizer-xml.js          Organizer XML/schema validation and repair prompt
+  organizer-xml.js          Organizer XML/schema validation, local escaping repair, repair prompt
+  aux-llm.js                Bounded retry/backoff for auxiliary (non-agent-loop) LLM calls
   landing.js                Stable checkpoint landing and surface replacement
   commands.js               /dream, /ctx-search, and /inject-memory commands
   notifications.js          Durable ContextInjectionRow notices
   scope.js                  Git-worktree/session scope resolution
   usage.js                  Context usage projection for the UI
-  settings.js               File-backed settings schema and HTTP bridge
+  settings.js               File-backed settings schema, HTTP bridge, provider/model catalog
   notice.js                 Startup setup guidance for the bundle/preset boundary
-  client.js                 Web settings UI, model download controls, ContextMeter rows
+  client.js                 Web settings UI, organizer/Dreamer model pickers, ContextMeter rows
 ```
 
 Important context behavior:
@@ -98,6 +99,13 @@ Important context behavior:
 - `sqlite-vec` and `@huggingface/transformers` are optional at runtime; FTS5 remains the fallback, and Transformers.js is only needed for local embedding/rerank models.
 - Dreamer is an auxiliary `ctx.llm.stream()` loop, not a new agent/session. It reads bounded source context with `session_context`, performs dedicated memory/fact/compartment actions, and emits started/completed/failed UI notices.
 - Dreamer idle triggering is per session and is deduplicated to one run per interaction round. Background notices must not create another run without a new `turn/start`.
+- Organizer and Dreamer calls are auxiliary: the harness retry plugin never sees them, so they go through `aux-llm.js` for bounded backoff retry of `RATE_LIMIT`/`SERVER`/`TIMEOUT`/`TRANSPORT`/`EMPTY_RESPONSE`. A failed generation stores its reason in `compartments.error`, emits a failure notice, and arms a doubling per-session cooldown, because each attempt re-sends the whole range.
+- Organizer and Dreamer targets are configured independently (`summarizationProvider`/`summarizationModel`/`summarizationReasoningEffort` and the `dreamer*` trio); provider and model must both be set to override the session route, while the effort applies either way. The settings panel populates its pickers from `GET /magic-context/models/catalog`, which reuses the host `llm` registry (`listProviders`/`listModels`/`resolveModelInfo`); that route only exists where the registry does, and the panel degrades to manual entry without it.
+- Auxiliary output budgets are configurable and self-correcting: `summarizationMaxTokens` (32768) and `dreamerMaxTokens` (16384) are clamped to the target model's `defaultMaxTokens`, and `streamAux` grows the cap once on `MAX_TOKENS` instead of retrying an identical request. A reasoning model spends this budget on thinking first, so an under-sized cap truncates deterministically before any output.
+- Image content never blocks a text-only organizer: `stripImageContent()` replaces image blocks with a text placeholder, proactively when `resolveModelInfo().inputModalities` excludes `image` (deepseek declares `["text"]`), and as a one-shot recovery when an undeclared route answers `UNSUPPORTED_CONTENT`.
+- Provider failure text is normalized by `describeAuxFailure()` before it reaches `compartments.error` or any notice. Notices are durable conversation content, so a raw HTML error page would ride every later request and feed the next attempt its own error page.
+- `compactNow` distinguishes a busy agent (the maintenance task never started) from a work failure (`summary`, with the normalized reason) and an abort (`cancelled`). Reporting every failure as `busy` previously hid deterministic summarization failures.
+- Organizer XML stays fail-closed. When validation fails, one local schema-aware pass (`sanitizeOrganizerOutput`) may re-classify unescaped text as text and strip a markdown fence, but its result must pass the unchanged validator; otherwise the single bounded model repair call runs as before.
 - New memory writes and fact promotions carry source session/compartment provenance when available. Old memories may have no recoverable source provenance.
 - The main Agent receives `context-tool-guidance` for `ctx_reduce`, `ctx_expand`, `ctx_memory`, and `ctx_search`.
 
@@ -204,6 +212,8 @@ Other useful context tests:
 - `dsh-context-notifications-smoke.mjs`: UI notice contract
 - `dsh-context-preset-smoke.mjs`: profile default and preset wiring
 - `dsh-context-meter-rows-smoke.mjs`: ContextMeter row injection (suffix selectors, clone contract, cleanup)
+- `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
+- `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
 For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, or `dsh-diff-viewer-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary.
 

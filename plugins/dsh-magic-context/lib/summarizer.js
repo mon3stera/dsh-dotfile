@@ -6,11 +6,34 @@
 // bounded XML repair call when needed, and stores only validated output.
 // Because it never runs inside a turn and never mutates the surface, it does
 // not block the agent and does not disturb prefix stability.
-import { BlockAssembler, createUserMessage } from "@deepseek-ai/dsh-llm";
+//
+// Running outside the agent loop also means the harness's request-retry plugin
+// never sees these calls, so provider failures are retried here through
+// `streamAux`; and because the whole range is re-sent on every attempt, a pure
+// escaping mistake is repaired locally before spending another model call.
+import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { isCompactCheckpointSource } from "@deepseek-ai/dsh-compaction";
-import { buildOrganizerRepairInstruction, validateOrganizerOutput } from "./organizer-xml.js";
+import { buildOrganizerRepairInstruction, sanitizeOrganizerOutput, validateOrganizerOutput } from "./organizer-xml.js";
+import { clampMaxTokens, resolveAuxImageSupport, resolveAuxMaxTokens, streamAux } from "./aux-llm.js";
 
-export { buildOrganizerRepairInstruction, parseOrganizerOutput, validateOrganizerOutput } from "./organizer-xml.js";
+/**
+ * Output budget for one organizer call.
+ *
+ * Generous on purpose: the organizer answers about a range of up to
+ * `compartmentBudgetTokens`, and a reasoning model spends this same budget on
+ * thinking before the document starts, so a cap sized for the document alone
+ * truncates deterministically on large ranges. It is clamped to the target
+ * model's adapter-declared cap, and `streamAux` grows it once on truncation.
+ */
+export const DEFAULT_ORGANIZER_MAX_TOKENS = 32768;
+
+export {
+	buildOrganizerRepairInstruction,
+	extractOutputDocument,
+	parseOrganizerOutput,
+	sanitizeOrganizerOutput,
+	validateOrganizerOutput,
+} from "./organizer-xml.js";
 
 const MAX_SESSION_REFERENCES = 6;
 const MAX_PROJECT_MEMORIES = 24;
@@ -203,35 +226,67 @@ export function buildSummarizationInput(session, range, skipSeqs) {
 	};
 }
 
-/** Map a terminal stream finish to its fail-closed error. */
-function finishError(finish) {
-	switch (finish.kind) {
-		case "error":
-		case "aborted": {
-			const error = new Error(finish.failure.message);
-			error.code = finish.failure.code;
-			return error;
-		}
-		case "max-tokens": {
-			const error = new Error("organizer output truncated at the token cap (incomplete compartment)");
-			error.code = "MAX_TOKENS";
-			return error;
-		}
-		default:
-			return undefined;
-	}
+/**
+ * Replace image content with a text placeholder for a text-only organizer.
+ *
+ * The organizer summarizes a fixed span it does not choose, so one screenshot
+ * pasted into the conversation would otherwise make every later generation fail
+ * on a text-only route ("adapter does not support image content") - a permanent
+ * failure for a session that is otherwise perfectly summarizable. The
+ * placeholder keeps the message's position and role in the narrative, which is
+ * what the summary needs, and drops only pixels the target could not read.
+ * @param messages - the derived range messages.
+ * @returns { messages, removed } with `removed` counting replaced blocks.
+ */
+export function stripImageContent(messages) {
+	let removed = 0;
+	const stripped = messages.map((message) => {
+		if (!Array.isArray(message?.content)) return message;
+		if (!message.content.some((block) => block?.type === "image")) return message;
+		const content = message.content.map((block) => {
+			if (block?.type !== "image") return block;
+			removed += 1;
+			return { type: "text", text: "[image omitted: the summarization model accepts text only]" };
+		});
+		return { ...message, content };
+	});
+	return { messages: removed === 0 ? messages : stripped, removed };
 }
 
 /**
- * Run the organizer: one auxiliary LLM call over the fixed span, plus one
- * bounded repair call when XML validation fails, then persist only validated
- * summary (compartment -> ready) and extracted facts (session_facts).
+ * Accept an organizer response, repairing escaping locally when possible.
+ *
+ * Strict validation stays the only gate. When it rejects a response, one local
+ * schema-aware pass tries to reclassify unescaped text as text (see
+ * `sanitizeOrganizerOutput`) and the result must pass the same validator, so a
+ * pure escaping mistake no longer costs a second full-range model call.
+ * @param text - the raw response text.
+ * @returns { validation, text, locallyRepaired }.
+ */
+function acceptOrganizerOutput(text) {
+	const direct = validateOrganizerOutput(text);
+	if (direct.ok) return { validation: direct, text, locallyRepaired: false };
+	const candidate = sanitizeOrganizerOutput(text);
+	if (candidate !== text) {
+		const repaired = validateOrganizerOutput(candidate);
+		if (repaired.ok) return { validation: repaired, text: candidate, locallyRepaired: true };
+	}
+	return { validation: direct, text, locallyRepaired: false };
+}
+
+/**
+ * Run the organizer: one auxiliary LLM call over the fixed span (retried with
+ * backoff for transient provider failures), plus one bounded repair call when
+ * XML validation still fails after local escaping repair, then persist only
+ * validated summary (compartment -> ready) and extracted facts (session_facts).
  * @param ctx - host context with llm service.
  * @param cdb - context database.
- * @param args - { session, compartment, range, target? }.
+ * @param args - { session, compartment, range, target?, scopePath?, signal?, retry? }.
+ *   `target` may carry an adapter-owned `reasoningEffort` for the exact model,
+ *   and `maxTokens` overrides the default organizer output budget.
  * @returns the parsed { summary, facts }.
  */
-export async function summarizeCompartment(ctx, cdb, { session, compartment, range, target: configuredTarget, scopePath }) {
+export async function summarizeCompartment(ctx, cdb, { session, compartment, range, target: configuredTarget, scopePath, signal, retry, maxTokens }) {
 	const input = buildSummarizationInput(session, range, cdb.skippedSeqs(session.id));
 	const references = buildOrganizerReferences(cdb, session.id, scopePath);
 	const organizerInstruction = buildOrganizerInstruction(references);
@@ -240,13 +295,28 @@ export async function summarizeCompartment(ctx, cdb, { session, compartment, ran
 		|| typeof target.model !== "string" || target.model.length === 0) {
 		throw new Error("no provider/model available for compartment summarization");
 	}
+	const ceiling = await resolveAuxMaxTokens(ctx, target.provider, target.model, signal);
+	const budget = clampMaxTokens(maxTokens ?? DEFAULT_ORGANIZER_MAX_TOKENS, ceiling) ?? DEFAULT_ORGANIZER_MAX_TOKENS;
+	// Strip proactively when the route declares it cannot read images; an
+	// undeclared route is tried as-is and stripped only if it refuses.
+	const acceptsImages = await resolveAuxImageSupport(ctx, target.provider, target.model, signal);
+	let messages = input.messages;
+	if (acceptsImages === false) {
+		const stripped = stripImageContent(messages);
+		if (stripped.removed > 0) {
+			ctx.logger?.info?.(`organizer input: replaced ${stripped.removed} image block(s) for text-only ${target.provider}/${target.model}`);
+			messages = stripped.messages;
+		}
+	}
 	const runOrganizer = async (instruction) => {
-		const assembler = new BlockAssembler();
 		const options = {
 			provider: target.provider,
 			model: target.model,
+			...(typeof target.reasoningEffort === "string" && target.reasoningEffort.length > 0
+				? { reasoningEffort: target.reasoningEffort }
+				: {}),
 			messages: [
-				...input.messages,
+				...messages,
 				createUserMessage({
 					content: [{ type: "text", text: instruction }],
 					source: { kind: "plugin", plugin: "dsh-magic-context" },
@@ -254,29 +324,48 @@ export async function summarizeCompartment(ctx, cdb, { session, compartment, ran
 			],
 			...(input.system === undefined ? {} : { system: input.system }),
 			...(input.tools === undefined ? {} : { tools: input.tools }),
-			maxTokens: 8192,
+			maxTokens: budget,
 			sessionId: session.id,
 			purpose: "compaction",
+			...(signal === undefined ? {} : { signal }),
 		};
-		for await (const chunk of ctx.llm.stream(options)) assembler.push(chunk);
-		const error = finishError(assembler.finish);
-		if (error !== undefined) throw error;
+		let assembler;
+		try {
+			assembler = await streamAux(ctx, options, {
+				...(retry ?? {}),
+				label: `compartment organizer (${target.provider}/${target.model})`,
+				...(ceiling === undefined ? {} : { maxTokensCeiling: ceiling }),
+				...(signal === undefined ? {} : { signal }),
+			});
+		} catch (error) {
+			// The route refused the content rather than declaring the limit up
+			// front. Retry once without images instead of failing the generation.
+			const refusedImages = error?.code === "UNSUPPORTED_CONTENT" || /image/iu.test(String(error?.message ?? ""));
+			const stripped = refusedImages ? stripImageContent(messages) : { removed: 0 };
+			if (stripped.removed === 0) throw error;
+			ctx.logger?.warn?.(`organizer route refused image content; retrying with ${stripped.removed} image block(s) replaced`);
+			messages = stripped.messages;
+			return runOrganizer(instruction);
+		}
 		const text = assembler.blocks().filter((block) => block.type === "text").map((block) => block.text).join("\n");
 		return { options, text };
 	};
 
 	let attempt = await runOrganizer(organizerInstruction);
-	let validation = validateOrganizerOutput(attempt.text);
-	if (!validation.ok) {
-		const repairInstruction = buildOrganizerRepairInstruction(organizerInstruction, attempt.text, validation.errors);
+	let accepted = acceptOrganizerOutput(attempt.text);
+	if (!accepted.validation.ok) {
+		const repairInstruction = buildOrganizerRepairInstruction(organizerInstruction, attempt.text, accepted.validation.errors);
 		attempt = await runOrganizer(repairInstruction);
-		validation = validateOrganizerOutput(attempt.text);
-		if (!validation.ok) {
-			throw new Error(`organizer XML validation failed after repair: ${validation.errors.join("; ")}`);
+		accepted = acceptOrganizerOutput(attempt.text);
+		if (!accepted.validation.ok) {
+			throw new Error(`organizer XML validation failed after repair: ${accepted.validation.errors.join("; ")}`);
 		}
 	}
+	if (accepted.locallyRepaired) {
+		ctx.logger?.info?.("organizer output accepted after local XML escaping repair");
+	}
 
-	const parsed = { summary: validation.summary, facts: validation.facts };
+	const parsed = { summary: accepted.validation.summary, facts: accepted.validation.facts };
 	cdb.setCompartmentSummary(compartment.id, { summary: parsed.summary, provider: attempt.options.provider, model: attempt.options.model });
 	for (const fact of parsed.facts) {
 		cdb.insertFact({ sessionId: session.id, scopePath, compartmentId: compartment.id, fact: fact.text, importance: fact.importance });

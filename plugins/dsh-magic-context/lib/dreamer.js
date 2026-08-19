@@ -8,7 +8,15 @@
 // goes through purpose-built tools.
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
-import { BlockAssembler, createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { createAssistantMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { clampMaxTokens, resolveAuxMaxTokens, streamAux } from "./aux-llm.js";
+
+/**
+ * Output budget for one Dreamer round. Smaller than the organizer's because a
+ * round emits tool calls or a short verdict, not a whole document - but still
+ * well above a thinking model's warm-up, and clamped to the target's own cap.
+ */
+export const DEFAULT_DREAMER_MAX_TOKENS = 16384;
 import { estimateTokens } from "./memory.js";
 import { readSessionContext } from "./session-context.js";
 import { sessionMemoryScope } from "./scope.js";
@@ -409,8 +417,10 @@ export function buildDreamerBrief(cdb, verifyIntervalDays, scopePath) {
  * Run one Dreamer maintenance pass.
  * @param ctx - host context with llm service.
  * @param cdb - context database.
- * @param opts - { agent?, provider, model, workspaceRoot, maxRounds, timeoutMs,
- *   verifyIntervalDays, retrieval }.
+ * @param opts - { agent?, provider, model, reasoningEffort?, maxTokens?, workspaceRoot, maxRounds, timeoutMs,
+ *   verifyIntervalDays, retrieval, retry }. Each round is retried for transient
+ *   provider failures, because Dreamer runs outside the agent loop and the
+ *   harness retry plugin never sees these requests.
  * @returns { skipped, rounds, facts, memories, compartments, actions }.
  */
 export async function runDreamer(ctx, cdb, opts) {
@@ -418,6 +428,8 @@ export async function runDreamer(ctx, cdb, opts) {
 		agent,
 		provider,
 		model,
+		reasoningEffort,
+		maxTokens,
 		sessions,
 		workspaceRoot,
 		scopePath,
@@ -425,12 +437,15 @@ export async function runDreamer(ctx, cdb, opts) {
 		timeoutMs = 600000,
 		verifyIntervalDays = 30,
 		retrieval = {},
+		retry,
 	} = opts;
 	const material = buildDreamerBrief(cdb, verifyIntervalDays, scopePath);
 	const actions = [];
 	if (material.facts.length === 0 && material.memories.length === 0 && material.compartments.length === 0) {
 		return { skipped: true, rounds: 0, actions, ...material };
 	}
+	const ceiling = await resolveAuxMaxTokens(ctx, provider, model);
+	const budget = clampMaxTokens(maxTokens ?? DEFAULT_DREAMER_MAX_TOKENS, ceiling) ?? DEFAULT_DREAMER_MAX_TOKENS;
 	const { tools, byName } = createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval, sessions, currentSession: agent?.session });
 	const toolSchemas = tools.map((tool) => ({
 		name: tool.name,
@@ -446,22 +461,28 @@ export async function runDreamer(ctx, cdb, opts) {
 	try {
 		for (; rounds < maxRounds;) {
 			rounds += 1;
-			const assembler = new BlockAssembler();
 			const options = {
 				provider,
 				model,
+				...(typeof reasoningEffort === "string" && reasoningEffort.length > 0 ? { reasoningEffort } : {}),
 				system: DREAMER_INSTRUCTION,
 				messages,
 				tools: toolSchemas,
-				maxTokens: 8192,
+				maxTokens: budget,
 				purpose: "compaction",
 				signal: abort.signal,
 				...(agent === undefined ? {} : { sessionId: agent.session.id }),
 			};
-			for await (const chunk of ctx.llm.stream(options)) assembler.push(chunk);
-			const finish = assembler.finish;
-			if (finish.kind === "error" || finish.kind === "aborted") {
-				throw new Error(`dreamer stream failed: ${finish.failure.message}`);
+			let assembler;
+			try {
+				assembler = await streamAux(ctx, options, {
+					...(retry ?? {}),
+					label: `dreamer round ${rounds} (${provider}/${model})`,
+					...(ceiling === undefined ? {} : { maxTokensCeiling: ceiling }),
+					signal: abort.signal,
+				});
+			} catch (error) {
+				throw new Error(`dreamer stream failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
 			const blocks = assembler.blocks();
 			const calls = blocks.filter((block) => block.type === "tool-call");
