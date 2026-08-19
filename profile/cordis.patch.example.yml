@@ -13,8 +13,11 @@
     - id: dsh-plugin-hide-session-titles
       name: dsh-plugin-hide-session-titles
     # dsh-magic-context/settings is supplied by the dsh.bundle layer.
+    # Loader entries must be bare package names: the client bundle is located by
+    # resolving "<name>/package.json", which a subpath entry cannot satisfy, and
+    # a subpath entry would also load the browser half in Node.
     - id: dsh-plugin-outline
-      name: dsh-plugin-outline/client
+      name: dsh-plugin-outline
     # Example: rewrite User-Agent for a gateway that only accepts claude-cli.
     - id: dsh-header-rewrite
       name: dsh-header-rewrite
