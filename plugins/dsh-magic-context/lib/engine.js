@@ -194,7 +194,7 @@ export class ContextEngine extends BasicCompactionEngine {
 	agentBySession = new WeakMap();
 	inFlight = new Map(); // sessionId -> Promise
 	overflowRetries = new WeakMap();
-	injection = new WeakMap(); // session -> { text, consumed }
+	injection = new WeakMap(); // session -> { text, memoryCount, memoryTokens }
 	idleTimers = new Map(); // session -> timer
 	dreamerBusy = false;
 	dreamerRounds = new WeakMap(); // session -> { interactionRound, triggeredRound }
@@ -286,8 +286,9 @@ export class ContextEngine extends BasicCompactionEngine {
 		const wrapped = new WeakSet();
 		ctx.on("session/event", (session, event) => {
 			if (event.type !== "step/end") return;
-			const injection = this.injection.get(session);
-			if (injection !== undefined) injection.consumed = true;
+			// The memory block is a stable request prefix, not a one-shot message:
+			// a completed step must not retract it. Only re-selection (session
+			// start or a durable landing) may replace its text.
 			this._refreshContextUsage(session);
 		});
 		ctx.on("session/event", (session, event) => {
@@ -299,13 +300,14 @@ export class ContextEngine extends BasicCompactionEngine {
 			if (wrapped.has(session)) return;
 			wrapped.add(session);
 			for (const event of session.events) assignParagraph(session, event);
-			const resumed = session.events.some((event) => event.type === "step/end");
-			this.refreshInjection(session, { consumed: resumed });
+			// Resumed sessions are re-selected too: the block is a persistent
+			// prefix, so a resumed conversation must not run without memories.
+			this.refreshInjection(session);
 			this._refreshContextUsage(session);
 			installParagraphInjector(session, this.cdb, {
 				extraMessage: () => {
 					const inj = this.injection.get(session);
-					if (inj === undefined || inj.consumed || inj.text.length === 0) return null;
+					if (inj === undefined || inj.text.length === 0) return null;
 					return { role: "user", content: [{ type: "text", text: inj.text }] };
 				},
 			});
@@ -324,8 +326,15 @@ export class ContextEngine extends BasicCompactionEngine {
 		ctx.systemPrompt.section(CONTEXT_TOOL_GUIDANCE);
 	}
 
-	/** Re-select and cache the <project_memory> injection block for one session. */
-	refreshInjection(session, { consumed = false } = {}) {
+	/**
+	 * Re-select and cache the <project_memory> injection block for one session.
+	 *
+	 * The cached text becomes a stable prefix on every subsequent model request
+	 * until the next re-selection, so this must only be called at session start
+	 * and after a durable landing. Calling it per turn would churn the request
+	 * prefix and defeat provider prompt caching.
+	 */
+	refreshInjection(session) {
 		const selected = selectInjectionMemories(this.cdb, this.ownConfig.memoryConfig, Date.now(), sessionMemoryScope(session));
 		const text = renderInjectionText(selected);
 		for (const memory of selected) recordInjectionHit(this.cdb, memory, this.ownConfig.memoryConfig);
@@ -334,7 +343,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			: typeof this.ctx.tokenMeter.estimateMessage === "function"
 				? this.ctx.tokenMeter.estimateMessage(createUserMessage({ content: [{ type: "text", text }] }))
 				: estimateTokens(text);
-		this.injection.set(session, { text, consumed, memoryCount: selected.length, memoryTokens });
+		this.injection.set(session, { text, memoryCount: selected.length, memoryTokens });
 		this._refreshContextUsage(session);
 		if (selected.length > 0) {
 			this._notify(
@@ -346,11 +355,11 @@ export class ContextEngine extends BasicCompactionEngine {
 		return text;
 	}
 
-	/** Publish checkpoint and unconsumed memory-injection tokens in the current window. */
+	/** Publish checkpoint and memory-injection tokens in the current window. */
 	_refreshContextUsage(session) {
 		const injection = this.injection.get(session);
 		if (typeof this.ctx.tokenMeter.measure !== "function" || !Array.isArray(session?.surface?.nodes)) {
-			setContextUsage(session?.id, { memories: { count: injection?.memoryCount ?? 0, tokens: injection?.memoryTokens ?? 0, consumed: injection?.consumed !== false } });
+			setContextUsage(session?.id, { memories: { count: injection?.memoryCount ?? 0, tokens: injection?.memoryTokens ?? 0 } });
 			return;
 		}
 		const measurement = this.ctx.tokenMeter.measure(session);
@@ -365,7 +374,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		}
 		setContextUsage(session.id, {
 			compartments: { count: compartmentCount, tokens: compartmentTokens },
-			memories: { count: injection?.memoryCount ?? 0, tokens: injection?.memoryTokens ?? 0, consumed: injection?.consumed !== false },
+			memories: { count: injection?.memoryCount ?? 0, tokens: injection?.memoryTokens ?? 0 },
 		});
 	}
 
@@ -649,8 +658,9 @@ export class ContextEngine extends BasicCompactionEngine {
 	_refreshMemoryAfterLanding(agent) {
 		try {
 			// The head block is not part of the surface replacement. Re-selecting it
-			// here replaces the previous block before the next model request.
-			this.refreshInjection(agent.session, { consumed: false });
+			// here replaces the previous block before the next model request, which
+			// is the only other point where the stable prefix is allowed to change.
+			this.refreshInjection(agent.session);
 		} catch (error) {
 			// Landing has already committed; a refresh failure must not report the
 			// durable compaction as failed or cause it to be retried.

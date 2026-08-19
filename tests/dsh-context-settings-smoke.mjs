@@ -49,7 +49,7 @@ try {
 	await handleContextConfig(request("GET"), initialResponse);
 	const initial = JSON.parse(initialResponse.state.body);
 	check("GET returns defaults", initialResponse.state.status === 200 && initial.ok === true && initial.config.retainRounds === 20);
-	setContextUsage("usage-session", { compartments: { count: 2, tokens: 1234 }, memories: { count: 6, tokens: 456, consumed: false } });
+	setContextUsage("usage-session", { compartments: { count: 2, tokens: 1234 }, memories: { count: 6, tokens: 456 } });
 	const usageResponse = response();
 	await handleContextUsage({ method: "GET", url: "/magic-context/usage?sessionId=usage-session" }, usageResponse);
 	const usage = JSON.parse(usageResponse.state.body);

@@ -232,11 +232,19 @@ const check = (label, ok) => {
 		const guidance = promptSections.find((section) => section.name === "context-tool-guidance");
 		check("context tool guidance injected", guidance?.text.includes("ctx_reduce") && guidance.text.includes("ctx_memory") && guidance.text.includes("ctx_search") && guidance.text.includes("ctx_expand"));
 		check("triggers registered", stubs.some(([n]) => n === "agent/pre-step") && stubs.some(([n]) => n === "session/event") && stubs.some(([n]) => n === "agent/request-error"));
+		// The memory block is a stable request prefix: a completed step refreshes
+		// usage but must never retract the block, or every turn after the first
+		// would silently run without project memories.
 		const injectionSession = {};
-		engine.injection.set(injectionSession, { text: "<project_memory>one time</project_memory>", consumed: false });
-		const injectionConsumer = stubs.find(([n, handler]) => n === "session/event" && String(handler).includes("injection"))?.[1];
-		injectionConsumer?.(injectionSession, { type: "step/end" });
-		check("memory injection consumed after first step", engine.injection.get(injectionSession).consumed === true);
+		const stablePrefix = "<project_memory>stable prefix</project_memory>";
+		engine.injection.set(injectionSession, { text: stablePrefix, memoryCount: 1, memoryTokens: 1 });
+		const stepEndUsage = stubs.find(([n, handler]) => n === "session/event"
+			&& String(handler).includes("step/end")
+			&& String(handler).includes("_refreshContextUsage"))?.[1];
+		check("step/end usage listener registered", typeof stepEndUsage === "function");
+		stepEndUsage?.(injectionSession, { type: "step/end" });
+		check("memory injection survives a completed step", engine.injection.get(injectionSession)?.text === stablePrefix);
+		check("memory injection keeps its token accounting after a step", engine.injection.get(injectionSession)?.memoryCount === 1);
 		check("periodic trigger removed", !stubs.some(([n]) => n === "timer") && !stubs.some(([n]) => n === "setInterval"));
 
 		// Dreamer runs once for an idle interaction round; plugin notices and
@@ -331,9 +339,9 @@ const check = (label, ok) => {
 		boundaryHandler(agent.session, { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } });
 		check("boundary handler fires on turn/end", called.length === 1);
 
-		// A successful landing starts a fresh, unconsumed memory injection. The
-		// derived head is replaced in place, so the next request sees new memories
-		// instead of appending a second project_memory block.
+		// A successful landing re-selects the memory injection. The derived head is
+		// replaced in place, so the next request sees new memories instead of
+		// appending a second project_memory block.
 		const landingEvents = [
 			{ type: "turn/start", seq: 0, time: 0, data: { turn: 1 } },
 			{ type: "user/message", seq: 1, time: 0, data: { content: [{ type: "text", text: "landing user" }] }, surfaceOp: "append" },
@@ -392,7 +400,7 @@ const check = (label, ok) => {
 			engine.refreshInjection = originalRefresh;
 			engine._announceCompartment = originalAnnounce;
 		}
-		check("landing refreshes memory injection", landingError === undefined && refreshCalls.length === 1 && refreshCalls[0].session === landingSession && refreshCalls[0].options.consumed === false);
+		check("landing refreshes memory injection", landingError === undefined && refreshCalls.length === 1 && refreshCalls[0].session === landingSession);
 
 		const memorySession = {
 			id: "memory-refresh",
@@ -401,18 +409,19 @@ const check = (label, ok) => {
 			surface: { nodes: [], replaceGeneration: 0 },
 			deriveEventMessage: () => null,
 		};
-		engine.injection.set(memorySession, { text: "<project_memory>old</project_memory>", consumed: false, memoryCount: 1, memoryTokens: 1 });
+		engine.injection.set(memorySession, { text: "<project_memory>old</project_memory>", memoryCount: 1, memoryTokens: 1 });
 		installParagraphInjector(memorySession, engine.cdb, {
 			extraMessage: () => {
 				const injection = engine.injection.get(memorySession);
-				return injection?.consumed || injection?.text.length === 0
+				return injection === undefined || injection.text.length === 0
 					? null
 					: { role: "user", content: [{ type: "text", text: injection.text }] };
 			},
 		});
 		check("memory head starts with cached block", memorySession.deriveMessages()[0]?.content?.[0]?.text === "<project_memory>old</project_memory>");
+		check("memory head is stable across repeated derivations", memorySession.deriveMessages()[0]?.content?.[0]?.text === memorySession.deriveMessages()[0]?.content?.[0]?.text);
 		engine.cdb.writeMemory({ category: "CONVENTIONS", scopePath: process.cwd(), summary: "memory created after landing", content: "new", importance: 10 });
-		engine.refreshInjection(memorySession, { consumed: false });
+		engine.refreshInjection(memorySession);
 		const refreshedHead = memorySession.deriveMessages()[0]?.content?.[0]?.text ?? "";
 		check("memory head is replaced with refreshed block", refreshedHead.includes("memory created after landing") && !refreshedHead.includes("<project_memory>old</project_memory>"));
 
@@ -458,14 +467,19 @@ const check = (label, ok) => {
 			surface: { nodes: [1, 3, 5] },
 		};
 		engine.ctx.tokenMeter.measure = () => ({ nodes: [{ seq: 1, tokens: 100 }, { seq: 3, tokens: 77 }, { seq: 5, tokens: 200 }] });
-		engine.injection.set(usageSession, { memoryCount: 6, memoryTokens: 456, consumed: false });
+		engine.injection.set(usageSession, { text: "<project_memory>x</project_memory>", memoryCount: 6, memoryTokens: 456 });
 		engine._refreshContextUsage(usageSession);
 		let usage = getContextUsage(usageSession.id);
-		check("usage counts visible compartment and unconsumed memory", usage.compartments.count === 1 && usage.compartments.tokens === 77 && usage.memories.count === 6 && usage.memories.tokens === 456 && usage.totalTokens === 533);
-		engine.injection.get(usageSession).consumed = true;
+		check("usage counts visible compartment and memory prefix", usage.compartments.count === 1 && usage.compartments.tokens === 77 && usage.memories.count === 6 && usage.memories.tokens === 456 && usage.totalTokens === 533);
+		// The prefix persists across steps, so repeated refreshes must keep
+		// reporting it rather than dropping it out of the window.
 		engine._refreshContextUsage(usageSession);
 		usage = getContextUsage(usageSession.id);
-		check("consumed memory leaves current window usage", usage.memories.count === 0 && usage.memories.tokens === 0 && usage.totalTokens === 77);
+		check("memory prefix stays in window usage across refreshes", usage.memories.count === 6 && usage.memories.tokens === 456 && usage.totalTokens === 533);
+		engine.injection.set(usageSession, { text: "", memoryCount: 0, memoryTokens: 0 });
+		engine._refreshContextUsage(usageSession);
+		usage = getContextUsage(usageSession.id);
+		check("empty memory selection reports no usage", usage.memories.count === 0 && usage.memories.tokens === 0 && usage.totalTokens === 77);
 		engine.cdb.close();
 	} finally {
 		if (savedHome === undefined) delete process.env.DSH_HOME;
