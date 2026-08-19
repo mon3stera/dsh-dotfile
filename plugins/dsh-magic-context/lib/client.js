@@ -7,6 +7,7 @@ window.__ModuleLoader__.load({
 		var module = { exports: {} };
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+		const react = require("react");
 		const { jsx } = require("react/jsx-runtime");
 		const { defineStore } = require("@deepseek-ai/dsh-client-runtime/client");
 		const name = "dsh-magic-context";
@@ -173,6 +174,10 @@ window.__ModuleLoader__.load({
 			modelLoading: "Downloading local model…",
 			modelReady: "Local model is ready.",
 			modelFailed: "Local model is unavailable. See the error details below.",
+			meterMemories: "Memories",
+			meterMemoriesHint: "Injected project_memory prefix. It rides every request but is not part of the conversation figure.",
+			meterCompartments: "\u21B3 Compartments",
+			meterCompartmentsHint: "Compartment checkpoints on the surface. Already counted inside conversation messages, shown here as a sub-total.",
 		};
 		const zh = {
 			title: "上下文管理",
@@ -198,7 +203,179 @@ window.__ModuleLoader__.load({
 			modelLoading: "正在下载本地模型…",
 			modelReady: "本地模型已准备好。",
 			modelFailed: "本地模型不可用，请查看下方错误详情。",
+			meterMemories: "项目记忆",
+			meterMemoriesHint: "注入的 project_memory 前缀。它随每次请求发送，但不计入「对话消息」。",
+			meterCompartments: "\u21B3 Compartment",
+			meterCompartmentsHint: "surface 上的 Compartment checkpoint。已包含在「对话消息」内，此处仅作为其中的小计。",
 		};
+
+		// --- Native context-meter rows -------------------------------------------
+		// The composer's ContextMeter panel reports the heuristic system/tools/
+		// messages composition, which omits the injected project_memory prefix
+		// entirely and folds Compartment checkpoints into the conversation figure.
+		// DSH renders that panel inline and exposes no slot inside it, so the two
+		// extra rows are placed by DOM injection instead of patching the installed
+		// `@deepseek-ai/dsh-client-ui-conversation` bundle.
+		//
+		// Selectors match CSS-module class SUFFIXES (`_panel`, `_rows`, `_row`,
+		// `_swatch`): the hash prefix changes on every upstream rebuild, the suffix
+		// does not. Rows are cloned from a live native row so all styling, spacing,
+		// and theme tokens are inherited rather than duplicated.
+		const METER_OWN = "data-dctx-meter-row";
+		const METER_POLL_MS = 2000;
+		// The swatch paints `background: var(--meter-tint)`, so an inline custom
+		// property is enough to give Memories its own colour without new CSS.
+		const METER_MEMORY_TINT = "#34d399";
+		// Sub-total indent. The host row is `display:flex` with the value pushed
+		// right by `justify-content:space-between`, so left padding on the row
+		// moves only the label side. A sub-total carries no swatch of its own —
+		// its tokens are already counted under the parent row's colour, so a
+		// second colour would imply a separate segment. 28px therefore covers
+		// the dropped swatch's footprint (8px plus its 6px `margin-right`) and
+		// adds a 14px step, leaving the label one step right of the parent's.
+		const METER_SUB_INDENT = "28px";
+
+		/** Mirror of the host meter's compact token formatter (1234 -> "1.2K"). */
+		function formatMeterTokens(n) {
+			const scaled = (v) => (v >= 100 ? String(Math.round(v)) : String(Math.round(v * 10) / 10));
+			if (!Number.isFinite(n) || n < 0) return "0";
+			if (n < 1e3) return String(Math.round(n));
+			if (n < 1e6) return `${scaled(n / 1e3)}K`;
+			return `${scaled(n / 1e6)}M`;
+		}
+
+		/** The open ContextMeter panel's legend list, or null when it is closed. */
+		function findMeterRows() {
+			const panels = document.querySelectorAll('[role="dialog"][class$="_panel"]');
+			for (const panel of panels) {
+				const rows = panel.querySelector('dl[class$="_rows"]');
+				if (rows !== null) return rows;
+			}
+			return null;
+		}
+
+		/** Native (host-rendered) legend rows, in bar-segment order. */
+		function nativeMeterRows(rows) {
+			return Array.from(rows.children).filter((row) => !row.hasAttribute(METER_OWN));
+		}
+
+		/**
+		 * Idempotently place/refresh one injected row. Writes only on an actual
+		 * change so the MutationObserver that calls this cannot feed itself.
+		 */
+		function syncMeterRow(rows, template, spec) {
+			let row = rows.querySelector(`[${METER_OWN}="${spec.key}"]`);
+			if (row === null) {
+				row = template.cloneNode(true);
+				row.setAttribute(METER_OWN, spec.key);
+				rows.appendChild(row);
+			}
+			if (row.title !== spec.hint) row.title = spec.hint;
+			const indent = spec.indent === true ? METER_SUB_INDENT : "";
+			if (row.style.paddingLeft !== indent) row.style.paddingLeft = indent;
+			// Drop the cloned swatch on a sub-total. Done before the label is
+			// written, because that step re-appends whatever swatch it finds.
+			if (spec.indent === true) {
+				const own = row.querySelector('span[class*="_swatch"]');
+				if (own !== null) own.remove();
+			}
+			const dt = row.querySelector("dt");
+			if (dt !== null && dt.textContent !== spec.label) {
+				const swatch = dt.querySelector('span[class*="_swatch"]');
+				dt.textContent = "";
+				if (swatch !== null) dt.appendChild(swatch);
+				dt.appendChild(document.createTextNode(spec.label));
+			}
+			if (spec.tint !== undefined) {
+				const swatch = row.querySelector('span[class*="_swatch"]');
+				if (swatch !== null && swatch.style.getPropertyValue("--meter-tint") !== spec.tint) {
+					swatch.style.setProperty("--meter-tint", spec.tint);
+				}
+			}
+			const dd = row.querySelector("dd");
+			const value = `~${formatMeterTokens(spec.tokens)}`;
+			if (dd !== null && dd.textContent !== value) dd.textContent = value;
+		}
+
+		/**
+		 * Renders nothing: it exists to borrow the session-scoped slot lifecycle
+		 * (mount, sessionId, disposal) for the DOM injection above. Polling only
+		 * runs while the panel is actually open.
+		 */
+		function ContextMeterRows({ t, sessionId, session }) {
+			const id = typeof sessionId === "string" && sessionId.length > 0
+				? sessionId
+				: (typeof session?.id === "string" ? session.id : undefined);
+			const usageRef = react.useRef(null);
+			react.useEffect(() => {
+				if (id === undefined) return undefined;
+				let active = true;
+				let timer = null;
+				let observer = null;
+				const stopPolling = () => {
+					if (timer === null) return;
+					clearInterval(timer);
+					timer = null;
+				};
+				const paint = () => {
+					const usage = usageRef.current;
+					const rows = findMeterRows();
+					if (rows === null || usage === null) return;
+					const native = nativeMeterRows(rows);
+					if (native.length === 0) return; // no template to clone yet
+					// Compartments inherit the conversation tint from the last native
+					// row (they are part of that figure); Memories get their own.
+					const template = native[native.length - 1];
+					syncMeterRow(rows, template, {
+						key: "compartments",
+						label: t("meterCompartments"),
+						hint: t("meterCompartmentsHint"),
+						tokens: usage.compartments?.tokens ?? 0,
+						indent: true,
+					});
+					syncMeterRow(rows, template, {
+						key: "memories",
+						label: t("meterMemories"),
+						hint: t("meterMemoriesHint"),
+						tokens: usage.memories?.tokens ?? 0,
+						tint: METER_MEMORY_TINT,
+					});
+				};
+				const load = async () => {
+					try {
+						const response = await fetch(`/magic-context/usage?sessionId=${encodeURIComponent(id)}`);
+						if (!response.ok) return;
+						const payload = await response.json();
+						if (!active || payload?.ok !== true) return;
+						usageRef.current = payload;
+						paint();
+					} catch { /* best effort; the next tick retries */ }
+				};
+				const tick = () => {
+					if (!active) return;
+					if (findMeterRows() === null) {
+						stopPolling();
+						return;
+					}
+					if (timer === null) timer = setInterval(() => { void load(); }, METER_POLL_MS);
+					if (usageRef.current === null) void load();
+					else paint();
+				};
+				if (typeof MutationObserver !== "undefined") {
+					observer = new MutationObserver(tick);
+					observer.observe(document.body, { childList: true, subtree: true });
+				}
+				tick();
+				return () => {
+					active = false;
+					stopPolling();
+					if (observer !== null) observer.disconnect();
+					const rows = findMeterRows();
+					if (rows !== null) rows.querySelectorAll(`[${METER_OWN}]`).forEach((row) => row.remove());
+				};
+			}, [id, t]);
+			return null;
+		}
 
 		const CSS = [
 			".dctx-panel{display:flex;flex-direction:column;gap:12px;max-width:760px;padding:2px 2px 6px}",
@@ -419,6 +596,15 @@ window.__ModuleLoader__.load({
 				store,
 				inject: injected,
 			}, ContextSettingsRow));
+			// Renders nothing; it only borrows this session-scoped seat to inject the
+			// Memories / Compartments rows into the native ContextMeter panel.
+			ctx.slots.inject("conversation.input.right", () => ctx.slots.register({
+				name: "conversation.input.right",
+				id: "context-meter-rows",
+				order: 90,
+				locale: LOCALE_NS,
+				inject: (sessionId) => ({ sessionId }),
+			}, ContextMeterRows));
 		}
 
 		exports.name = name;

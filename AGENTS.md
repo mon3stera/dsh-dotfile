@@ -85,7 +85,7 @@ lib/
   usage.js                  Context usage projection for the UI
   settings.js               File-backed settings schema and HTTP bridge
   notice.js                 Startup setup guidance for the bundle/preset boundary
-  client.js                 Web settings UI and model download controls
+  client.js                 Web settings UI, model download controls, ContextMeter rows
 ```
 
 Important context behavior:
@@ -193,6 +193,7 @@ Other useful context tests:
 - `dsh-context-scope-smoke.mjs`: Git-worktree scope isolation
 - `dsh-context-notifications-smoke.mjs`: UI notice contract
 - `dsh-context-preset-smoke.mjs`: profile default and preset wiring
+- `dsh-context-meter-rows-smoke.mjs`: ContextMeter row injection (suffix selectors, clone contract, cleanup)
 
 For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, or `dsh-outline-smoke.mjs` test.
 

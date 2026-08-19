@@ -115,6 +115,25 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 - `Memories`：session 开始或 Compartment 落地后注入的 memory block；它是常驻请求前缀，因此一经选中就持续计入，直到下一次重选替换它。`ctx_memory` 后续检索不计入。
 - generating、ready、archived、已从 surface 移除的 Compartment 都显示为不占用；没有可注入 memory 时 `Memories` 为 0。
 
+### 3.2.2 原生 ContextMeter 面板中的两行
+
+发送按钮旁的圆环面板（宿主 `ContextMeter`）只展示启发式的 `contextBreakdown`：`系统提示词` / `工具` / `对话消息`。这个组成对本插件有两处盲区：
+
+- **Memories 完全缺失**：`contextBreakdown` 的消息数字重放 `surface-fold`，按单个 **surface 事件**计价（`deriveEventMessage`）。而 `<project_memory>` 前缀是 `deriveMessages()` 包装层注入的 head，不是 surface 事件，因此从不计入。它却真实随每次请求发送，也被 provider 锚定的 `projectedTokens` 计入。
+- **Compartments 被折叠**：checkpoint 本身就是 surface 上的 `user/message`，已经包含在 `对话消息` 里。
+
+因此 `lib/client.js` 向该面板补两行：`项目记忆`（独立项）和 `↳ Compartment`（标为 `对话消息` 的小计，避免读者把行相加）。两行只进图例，**不加进色条**——色条按 `breakdownTotal` 归一，塞入不在该分母里的数字会歪曲比例。
+
+实现约束（`tests/dsh-context-meter-rows-smoke.mjs` 锁定）：
+
+- 宿主把 `ContextMeter` 内联渲染，面板内部**没有 slot**，所以两行靠 DOM 注入。**不得**修改已安装的 `@deepseek-ai/dsh-client-ui-conversation` bundle：那是部署产物，升级即丢，且曾因此把 endpoint 卡在废弃的 `/context/usage` 上而静默失效。
+- 选择器只匹配 CSS Module 类名**后缀**（`_panel`、`_rows`、`_row`、`_swatch`）。哈希前缀每次上游构建都会变，后缀不变。
+- 行从一条活的原生行 `cloneNode` 而来，样式/间距/主题变量全部继承；Memories 的色块靠内联 `--meter-tint` 取得独立颜色。
+- `↳ Compartment` 作为小计**不带色块**——它的 token 已计入 `对话消息` 的颜色，再给一个色块会暗示它是独立分段。行级 `padding-left: 28px` 兼顾两件事：补偿被去掉的色块占位（8px 宽 + 6px `margin-right`），再加 14px 层级缩进，使标签正好比父行标签右移一档。宿主行是 `display:flex` + `justify-content:space-between`，左侧 padding 只推动标签一侧，右侧数值仍右对齐。
+- 组件挂在 `conversation.input.right`（`scope: "session"`）上，只为借用 session 域的生命周期与 `sessionId`；它自身渲染 `null`。轮询仅在面板打开时进行，卸载时移除自己注入的行。
+
+> 客户端半边的注册条件：`dsh-client-modules` 用 `require.resolve(\`${entryName}/package.json\`)` 解析 loader 条目名，因此只有名字**恰为包名**的条目才会注册 client bundle。`dsh-magic-context/settings`、`/notice` 这类子路径条目会以 `ERR_PACKAGE_PATH_NOT_EXPORTED` 静默跳过。裸名条目由 agent preset（`agent.cordis.yml`）提供，所以面板两行在首个 context-compact agent 加载后才出现，而不是进程启动时。
+
 ### 3.3 落地事务（事件契约，与内置一致）
 
 `compaction/start`（锁）→ `compaction/summary`（含代次、覆盖范围、shadowedSeqs、摘要）→ `user/message`（`surfaceOp:{op:"replace",start,end}` + `compactCheckpointSource(compactionId)` + `sourceEventSeqs`）→ `compaction/end`。复用 `BasicCompactionEngine` 的事务、稳定性断言、`/compact`（`compactNow` → `runMaintenance`）。
