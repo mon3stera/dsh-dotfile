@@ -21,6 +21,7 @@ The repository currently has no root `package.json` or unified test runner. Most
 docs/
   context-management.md       Context Compact, memory, retrieval, and Dreamer design
   session-outline.md          Outline plugin behavior notes
+  diff-viewer.md              Diff viewer routes, confinement, and baseline choice
 
 plugins/
   dsh-magic-context/         Compaction, memories, retrieval, provenance, Dreamer
@@ -28,6 +29,7 @@ plugins/
   dsh-plugin-font/            Font settings and font discovery
   dsh-plugin-hide-session-titles/  Session-title visibility toggle
   dsh-plugin-outline/         Browser-only session outline panel
+  dsh-plugin-diff-viewer/     Read-only git diff and file browser panel
   dsh-header-rewrite/         Header rewrite for LLM provider requests
 
 profile/
@@ -41,6 +43,7 @@ tests/
   dsh-font-smoke.mjs          Font plugin smoke test
   dsh-session-titles-smoke.mjs  Session title plugin smoke test
   dsh-outline-smoke.mjs       Outline client smoke test
+  dsh-diff-viewer-smoke.mjs   Diff viewer host routes and client contract test
 ```
 
 ## Plugin Structure
@@ -122,6 +125,13 @@ Important context behavior:
 - `lib/client.js`: right-side outline panel for jumping between user messages in long sessions.
 - `package.json`: Web conversation/primitives client injection and package exports.
 
+### `dsh-plugin-diff-viewer`
+
+- `lib/index.js`: read-only git routes `/diff-viewer/changes`, `/diff-viewer/diff`, `/diff-viewer/tree`, and `/diff-viewer/file`. Every route resolves the caller's `cwd` to a git repository root and confines `path` to that root through `realpath`, so `..`, an absolute path, a symlink escape, and `.git` internals are all rejected. Nothing writes; `git` runs only read-only queries.
+- `lib/client.js`: session-header trigger plus a fixed panel with a changes tab (files differing from HEAD) and a files tab (directory browse). Diff rows carry context lines and both gutters; the panel is display-only, with no editing or revert.
+- `package.json`: Web runtime/locale/conversation/primitives client injection and package exports.
+- Baseline is HEAD, not session start, so committing re-bases the view. See `docs/diff-viewer.md`.
+
 ### `dsh-header-rewrite`
 
 - `lib/index.js`: wraps the global `fetch` once and applies configurable header rules (set/delete) matched by host, path, body model, and method. Rules come from the persisted `$DSH_HOME/header-rewrite/config.yaml` (validated, applied immediately) or the patch config as seed; the `/header-rewrite/config` route reads and writes that file. Use it to adapt to gateways with strict client policies (e.g. a User-Agent allowlist that rejects the harness attribution header).
@@ -195,7 +205,7 @@ Other useful context tests:
 - `dsh-context-preset-smoke.mjs`: profile default and preset wiring
 - `dsh-context-meter-rows-smoke.mjs`: ContextMeter row injection (suffix selectors, clone contract, cleanup)
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, or `dsh-outline-smoke.mjs` test.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, or `dsh-diff-viewer-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary.
 
 ## Git and Editing Rules
 

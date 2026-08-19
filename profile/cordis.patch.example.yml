@@ -18,6 +18,8 @@
     # a subpath entry would also load the browser half in Node.
     - id: dsh-plugin-outline
       name: dsh-plugin-outline
+    - id: dsh-plugin-diff-viewer
+      name: dsh-plugin-diff-viewer
     # Example: rewrite User-Agent for a gateway that only accepts claude-cli.
     - id: dsh-header-rewrite
       name: dsh-header-rewrite

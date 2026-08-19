@@ -1,0 +1,251 @@
+// Smoke test for dsh-plugin-diff-viewer: host git routes plus the client contract.
+//
+// The host half is exercised against a real throwaway git repository, so the
+// parsing is checked against actual `git diff` output rather than a fixture that
+// could drift from what git emits.
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import vm from "node:vm";
+
+let checks = 0;
+function ok(condition, message) {
+  checks += 1;
+  if (!condition) throw new Error(`FAIL: ${message}`);
+}
+function eq(actual, expected, message) {
+  ok(actual === expected, `${message} (got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)})`);
+}
+
+const host = await import("../plugins/dsh-plugin-diff-viewer/lib/index.js");
+eq(host.name, "dsh-plugin-diff-viewer", "host plugin name");
+ok(typeof host.apply === "function", "host exports apply");
+
+// ---------------------------------------------------------------- diff parsing
+const sample = [
+  "diff --git a/src/a.js b/src/a.js",
+  "index 111..222 100644",
+  "--- a/src/a.js",
+  "+++ b/src/a.js",
+  "@@ -1,4 +1,4 @@ function head()",
+  " keep one",
+  "-old line",
+  "+new line",
+  " keep two",
+  "\\ No newline at end of file",
+  "diff --git a/bin/blob b/bin/blob",
+  "Binary files a/bin/blob and b/bin/blob differ",
+  "diff --git a/fresh.txt b/fresh.txt",
+  "--- /dev/null",
+  "+++ b/fresh.txt",
+  "@@ -0,0 +1,2 @@",
+  "+alpha",
+  "+beta",
+].join("\n");
+const parsed = host.parseUnifiedDiff(sample);
+eq(parsed.length, 3, "three files parsed");
+eq(parsed[0].path, "src/a.js", "first path stripped of a// b/ prefix");
+eq(parsed[0].hunks.length, 1, "one hunk");
+eq(parsed[0].hunks[0].heading, "function head()", "hunk section heading captured");
+const rows = parsed[0].hunks[0].rows;
+eq(rows.length, 4, "no-newline marker dropped, four real rows");
+eq(rows.map((r) => r.kind).join(","), "ctx,del,add,ctx", "row kinds in order");
+eq(rows[0].oldNo, 1, "context keeps old number");
+eq(rows[0].newNo, 1, "context keeps new number");
+eq(rows[1].oldNo, 2, "deletion advances old only");
+eq(rows[1].newNo, null, "deletion has no new number");
+eq(rows[2].oldNo, null, "addition has no old number");
+eq(rows[2].newNo, 2, "addition advances new only");
+eq(rows[3].oldNo, 3, "context after edit resyncs old");
+eq(rows[3].newNo, 3, "context after edit resyncs new");
+eq(parsed[1].binary, true, "binary stanza flagged");
+eq(parsed[1].hunks.length, 0, "binary file has no rows");
+eq(parsed[2].path, "fresh.txt", "new file takes the +++ path");
+eq(parsed[2].hunks[0].rows.every((r) => r.kind === "add"), true, "new file is all additions");
+
+// ------------------------------------------------------- real git repository
+const repo = mkdtempSync(join(tmpdir(), "dsh-dv-"));
+const git = (...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" });
+try {
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "t@example.com");
+  git("config", "user.name", "T");
+  mkdirSync(join(repo, "src"));
+  writeFileSync(join(repo, "src/keep.js"), "one\ntwo\nthree\n");
+  writeFileSync(join(repo, "src/gone.js"), "bye\n");
+  writeFileSync(join(repo, ".gitignore"), "ignored.txt\nnode_modules/\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "base");
+
+  // Three kinds of change plus one ignored file that must stay invisible.
+  writeFileSync(join(repo, "src/keep.js"), "one\ntwoX\nthree\n");
+  writeFileSync(join(repo, "src/new.js"), "fresh\nlines\n");
+  writeFileSync(join(repo, "ignored.txt"), "noise\n");
+  mkdirSync(join(repo, "node_modules"));
+  writeFileSync(join(repo, "node_modules/dep.js"), "dep\n");
+  rmSync(join(repo, "src/gone.js"));
+
+  const root = await host.resolveRoot(repo);
+  ok(root !== null, "repo resolves to a root");
+  eq(await host.resolveRoot("/proc"), null, "non-git directory rejected");
+  eq(await host.resolveRoot("relative/path"), null, "relative cwd rejected");
+  eq(await host.resolveRoot(""), null, "empty cwd rejected");
+
+  // Confinement: traversal, absolute escape, and .git are all refused.
+  eq(await host.confine(root, "../etc/passwd"), null, "parent traversal refused");
+  eq(await host.confine(root, "/etc/passwd"), null, "absolute path outside root refused");
+  eq(await host.confine(root, ".git/config"), null, "git internals hidden");
+  eq((await host.confine(root, "src/keep.js"))?.rel, "src/keep.js", "in-repo path accepted");
+  eq((await host.confine(root, `${root}/src/keep.js`))?.rel, "src/keep.js", "absolute in-repo path accepted");
+  eq((await host.confine(root, ""))?.rel, "", "empty path means the root");
+  // A symlink escaping the repository must fail on its realpath, not its name.
+  symlinkSync("/etc", join(repo, "escape"));
+  eq(await host.confine(root, "escape/passwd"), null, "symlink escape refused");
+
+  const changes = await host.collectChanges(root);
+  ok(changes.head !== null && changes.head.length > 0, "head short hash present");
+  eq(changes.branch, "main", "branch reported");
+  const byPath = new Map(changes.files.map((f) => [f.path, f]));
+  ok(byPath.has("src/keep.js"), "modified file listed");
+  ok(byPath.has("src/new.js"), "untracked file listed");
+  ok(byPath.has("src/gone.js"), "deleted file listed");
+  eq(byPath.get("src/new.js").untracked, true, "new file marked untracked");
+  eq(byPath.get("src/new.js").added, 2, "untracked file gets a counted line total");
+  eq(byPath.get("src/new.js").removed, null, "untracked file reports no removals");
+  eq(byPath.get("src/keep.js").added, 1, "modified file added count");
+  eq(byPath.get("src/keep.js").removed, 1, "modified file removed count");
+  eq(byPath.get("src/gone.js").status, "D", "deletion status letter");
+  ok(!byPath.has("ignored.txt"), "gitignored file absent from changes");
+  ok(![...byPath.keys()].some((p) => p.startsWith("node_modules")), "ignored directory absent from changes");
+
+  const diff = await host.collectDiff(root, "src/keep.js", 3, false);
+  eq(diff.binary, false, "text diff not binary");
+  ok(diff.hunks.length >= 1, "modified file yields a hunk");
+  const kinds = diff.hunks[0].rows.map((r) => r.kind);
+  ok(kinds.includes("ctx"), "real git diff carries context rows");
+  ok(kinds.includes("add") && kinds.includes("del"), "real git diff carries add and del rows");
+
+  const untrackedDiff = await host.collectDiff(root, "src/new.js", 3, true);
+  ok(untrackedDiff.hunks.length === 1, "untracked file diffs against empty");
+  eq(untrackedDiff.hunks[0].rows.every((r) => r.kind === "add"), true, "untracked diff is all additions");
+
+  const tree = await host.collectTree(root, root);
+  const names = tree.entries.map((e) => e.name);
+  ok(!names.includes(".git"), "tree hides .git");
+  ok(!names.includes("ignored.txt"), "tree hides gitignored file");
+  ok(!names.includes("node_modules"), "tree hides ignored directory");
+  ok(names.includes("src"), "tree lists tracked directory");
+  eq(tree.entries[0].dir, true, "directories sort first");
+
+  const file = await host.collectFile(join(repo, "src/keep.js"), "src/keep.js");
+  eq(file.binary, false, "text file not binary");
+  eq(file.totalLines, 3, "line count excludes the trailing empty split");
+  eq(file.lines[1].text, "twoX", "line content preserved");
+  eq(file.lines[1].no, 2, "line numbers are 1-based");
+  eq(file.lang, "javascript", "language inferred from extension");
+
+  writeFileSync(join(repo, "blob.bin"), Buffer.from([0x1, 0x0, 0x2, 0x3]));
+  const blob = await host.collectFile(join(repo, "blob.bin"), "blob.bin");
+  eq(blob.binary, true, "NUL byte marks a binary file");
+  eq(await host.collectFile(repo, ""), null, "directory refused by collectFile");
+} finally {
+  rmSync(repo, { recursive: true, force: true });
+}
+
+// -------------------------------------------------------------- client half
+const raw = readFileSync(new URL("../plugins/dsh-plugin-diff-viewer/lib/client.js", import.meta.url), "utf8");
+let captured;
+globalThis.window = { __ModuleLoader__: { load: (entry) => { captured = entry; } } };
+const styleTags = [];
+globalThis.document = {
+  head: { appendChild: (tag) => styleTags.push(tag) },
+  createElement: () => ({ dataset: {}, textContent: "", remove() {} }),
+};
+globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+vm.runInThisContext(raw, { filename: "dsh-plugin-diff-viewer/lib/client.js" });
+eq(captured?.id, "dsh-plugin-diff-viewer", "client module id");
+
+const react = {
+  useState: (value) => [typeof value === "function" ? value() : value, () => {}],
+  useMemo: (factory) => factory(),
+  useRef: (value) => ({ current: value }),
+  useEffect: () => {},
+};
+const icon = (props) => ({ type: "icon", props });
+const client = captured.factory((spec) => {
+  if (spec === "react") return react;
+  if (spec === "react/jsx-runtime") {
+    return { jsx: (type, props, key) => ({ type, props, key }), jsxs: (type, props, key) => ({ type, props, key }) };
+  }
+  if (spec === "@deepseek-ai/dsh-client-ui-primitives") {
+    return {
+      IconCodeOutline16: icon,
+      IconCloseOutline16: icon,
+      IconRefreshOutline16: icon,
+      IconBranchOutline16: icon,
+      IconChevronLeftOutline14: icon,
+      IconFolderClose16: icon,
+      IconFolderOpen16: icon,
+    };
+  }
+  throw new Error(`unexpected require: ${spec}`);
+});
+eq(client.name, "dsh-plugin-diff-viewer", "client plugin name");
+eq(JSON.stringify(client.inject), JSON.stringify(["slots", "locale"]), "client inject contract");
+
+const sessionsItems = [{ sessionId: "s1", cwd: "/work/repo" }, { sessionId: "s2", cwd: "" }];
+const ctx = {
+  entry: null,
+  slotName: null,
+  locales: null,
+  effect(callback) { callback(); },
+  get: (name) => (name === "sessions" ? { getSnapshot: () => ({ items: sessionsItems }) } : undefined),
+  locale: { register: (_ns, dictionaries) => { ctx.locales = dictionaries; } },
+  slots: {
+    inject(name, callback) { ctx.slotName = name; callback(); },
+    register(options, component) { ctx.entry = { ...options, component }; return () => {}; },
+  },
+};
+client.apply(ctx);
+eq(ctx.slotName, "conversation.session.header.utilities", "registers on the session header slot");
+eq(ctx.entry.id, "diff-viewer", "slot entry id");
+eq(ctx.entry.order, 70, "slot order sits before the outline entry at 80");
+eq(styleTags.length, 1, "one style tag injected");
+eq(styleTags[0].dataset.plugin, "dsh-plugin-diff-viewer", "style tag tagged with the plugin name");
+
+// Locale parity: a missing translation would render a raw key in one language.
+const zhKeys = Object.keys(ctx.locales.zh).sort().join(",");
+const enKeys = Object.keys(ctx.locales.en).sort().join(",");
+eq(zhKeys, enKeys, "zh and en dictionaries cover the same keys");
+ok(Object.keys(ctx.locales.zh).length >= 20, "locale dictionary is populated");
+
+// cwd resolution comes from the sessions list entry, not the session snapshot.
+eq(ctx.entry.inject("s1").resolveCwd(), "/work/repo", "resolves cwd from the sessions list");
+eq(ctx.entry.inject("s2").resolveCwd(), undefined, "empty cwd treated as absent");
+eq(ctx.entry.inject("missing").resolveCwd(), undefined, "unknown session has no cwd");
+
+// The trigger renders closed: a button and no panel.
+const t = (key) => ctx.locales.en[key] ?? key;
+const tree = ctx.entry.component({
+  sessionId: "s1",
+  useSession: () => false,
+  resolveCwd: ctx.entry.inject("s1").resolveCwd,
+  t,
+});
+eq(tree.props.className, "dsh-dv-root", "trigger root class");
+eq(tree.props["data-diff-viewer-session"], "s1", "trigger carries the session id");
+eq(tree.props.children[0].props["aria-expanded"], false, "panel starts closed");
+eq(tree.props.children[1], false, "no panel rendered while closed");
+
+// Every route the client calls must exist in the host half.
+for (const route of ["changes", "diff", "tree", "file"]) {
+  ok(raw.includes(`fetchJson("${route}"`), `client calls the ${route} route`);
+  ok(
+    readFileSync(new URL("../plugins/dsh-plugin-diff-viewer/lib/index.js", import.meta.url), "utf8")
+      .includes(`"/diff-viewer/${route}"`),
+    `host registers the ${route} route`,
+  );
+}
+
+console.log(`diff-viewer ok (${checks} checks)`);
