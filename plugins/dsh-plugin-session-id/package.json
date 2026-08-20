@@ -1,0 +1,24 @@
+{
+  "name": "dsh-plugin-session-id",
+  "version": "0.1.0",
+  "description": "Show the current session id next to the agent-preset label in the session header, with click-to-copy — so a session can be named exactly when reporting a bug.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT"
+}

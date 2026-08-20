@@ -30,6 +30,7 @@ plugins/
   dsh-plugin-hide-session-titles/  Session-title visibility toggle
   dsh-plugin-outline/         Browser-only session outline panel
   dsh-plugin-diff-viewer/     Read-only git diff and file browser panel
+  dsh-plugin-session-id/      Session id label in the session header
   dsh-header-rewrite/         Header rewrite for LLM provider requests
 
 profile/
@@ -44,6 +45,7 @@ tests/
   dsh-session-titles-smoke.mjs  Session title plugin smoke test
   dsh-outline-smoke.mjs       Outline client smoke test
   dsh-diff-viewer-smoke.mjs   Diff viewer host routes and client contract test
+  dsh-session-id-smoke.mjs    Session id header label client contract test
 ```
 
 ## Plugin Structure
@@ -140,6 +142,13 @@ Important context behavior:
 - `package.json`: Web runtime/locale/conversation/primitives client injection and package exports.
 - Baseline is HEAD, not session start, so committing re-bases the view. See `docs/diff-viewer.md`.
 
+### `dsh-plugin-session-id`
+
+- `lib/index.js`: no-op Node entry; the browser half does all the work.
+- `lib/client.js`: registers one entry in the `conversation.session.header.actions` list slot at `order: -9`, so the chip renders immediately after the agent-preset label (`order: -10`) and ahead of the interactive entries (`subagent-catalog` 10, `job-list` 20). Negative orders are the contract's reserved band for static session context, which is what an id is. The chip displays the id's distinguishing head (`session-` stripped, first 8 characters), carries the full id in `title`/`aria-label`/`data-dsh-session-id`, and copies the **full** id on click (async clipboard, hidden-textarea fallback).
+- `package.json`: Web runtime/locale/conversation client injection and package exports.
+- Purpose is diagnosis: the session id ties a UI symptom to durable evidence (session logs, `compartments` rows, Dreamer notices) and is otherwise only visible in the URL.
+
 ### `dsh-header-rewrite`
 
 - `lib/index.js`: wraps the global `fetch` once and applies configurable header rules (set/delete) matched by host, path, body model, and method. Rules come from the persisted `$DSH_HOME/header-rewrite/config.yaml` (validated, applied immediately) or the patch config as seed; the `/header-rewrite/config` route reads and writes that file. Use it to adapt to gateways with strict client policies (e.g. a User-Agent allowlist that rejects the harness attribution header).
@@ -215,7 +224,7 @@ Other useful context tests:
 - `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
 - `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, or `dsh-diff-viewer-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, or `dsh-session-id-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary.
 
 ## Git and Editing Rules
 
