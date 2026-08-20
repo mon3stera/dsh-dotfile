@@ -194,13 +194,22 @@ const client = captured.factory((spec) => {
 eq(client.name, "dsh-plugin-diff-viewer", "client plugin name");
 eq(JSON.stringify(client.inject), JSON.stringify(["slots", "locale"]), "client inject contract");
 
-const sessionsItems = [{ sessionId: "s1", cwd: "/work/repo" }, { sessionId: "s2", cwd: "" }];
+// Mirrors the real SessionListState store: ids/byId/current, never an `items`
+// array. The previous double invented `{ items: [...] }`, so the test passed
+// while the panel could never resolve a workspace in the browser.
+const sessionListState = {
+  ids: ["s1", "s2"],
+  byId: { s1: { sessionId: "s1", cwd: "/work/repo" }, s2: { sessionId: "s2", cwd: "" } },
+  current: "s1",
+  phase: "ready",
+};
+const useSessions = (selector) => selector(sessionListState);
 const ctx = {
   entry: null,
   slotName: null,
   locales: null,
   effect(callback) { callback(); },
-  get: (name) => (name === "sessions" ? { getSnapshot: () => ({ items: sessionsItems }) } : undefined),
+  get: () => undefined,
   locale: { register: (_ns, dictionaries) => { ctx.locales = dictionaries; } },
   slots: {
     inject(name, callback) { ctx.slotName = name; callback(); },
@@ -220,23 +229,45 @@ const enKeys = Object.keys(ctx.locales.en).sort().join(",");
 eq(zhKeys, enKeys, "zh and en dictionaries cover the same keys");
 ok(Object.keys(ctx.locales.zh).length >= 20, "locale dictionary is populated");
 
-// cwd resolution comes from the sessions list entry, not the session snapshot.
-eq(ctx.entry.inject("s1").resolveCwd(), "/work/repo", "resolves cwd from the sessions list");
-eq(ctx.entry.inject("s2").resolveCwd(), undefined, "empty cwd treated as absent");
-eq(ctx.entry.inject("missing").resolveCwd(), undefined, "unknown session has no cwd");
+// The workspace must come from the sessions list store through the standard
+// `useSessions` prop, which is how the host's own header rows read it. A private
+// `inject` would freeze whatever the store held at mount.
+eq(ctx.entry.inject, undefined, "no private cwd injection; the standard prop carries it");
+ok(/useSessions\(\(state\) =>/.test(raw), "component subscribes through useSessions");
+ok(/byId\?\.\[sessionId\]/.test(raw), "reads the session entry by id");
+ok(!raw.includes('get("sessions")'), "never reaches for the sessions service directly");
+ok(!/getSnapshot\(\)\?\.\.?items|\.items\b/.test(raw), "never assumes an items array");
+
+// Cross-check the shape against the installed host UI, which is the contract
+// this plugin depends on: a host rename must fail here, not silently in a panel.
+const hostHeaderSource = readFileSync(
+  new URL("file:///home/mon3tr/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js"),
+  "utf8",
+);
+ok(hostHeaderSource.includes("byId[sessionId]?.cwd"), "host UI still reads cwd from byId[sessionId]");
 
 // The trigger renders closed: a button and no panel.
 const t = (key) => ctx.locales.en[key] ?? key;
 const tree = ctx.entry.component({
   sessionId: "s1",
   useSession: () => false,
-  resolveCwd: ctx.entry.inject("s1").resolveCwd,
+  useSessions,
   t,
 });
 eq(tree.props.className, "dsh-dv-root", "trigger root class");
 eq(tree.props["data-diff-viewer-session"], "s1", "trigger carries the session id");
 eq(tree.props.children[0].props["aria-expanded"], false, "panel starts closed");
 eq(tree.props.children[1], false, "no panel rendered while closed");
+
+// The selector must resolve exactly what the panel needs, including absence.
+eq(useSessions((state) => state.byId.s1.cwd), "/work/repo", "list store carries the workspace");
+const readCwd = (sessionId) => {
+  const entry = sessionListState.byId?.[sessionId];
+  return typeof entry?.cwd === "string" && entry.cwd !== "" ? entry.cwd : undefined;
+};
+eq(readCwd("s1"), "/work/repo", "resolves the workspace for a listed session");
+eq(readCwd("s2"), undefined, "empty cwd is treated as absent");
+eq(readCwd("missing"), undefined, "unknown session has no workspace");
 
 // Every route the client calls must exist in the host half.
 for (const route of ["changes", "diff", "tree", "file"]) {

@@ -139,7 +139,7 @@ Important context behavior:
 ### `dsh-plugin-diff-viewer`
 
 - `lib/index.js`: read-only git routes `/diff-viewer/changes`, `/diff-viewer/diff`, `/diff-viewer/tree`, and `/diff-viewer/file`. Every route resolves the caller's `cwd` to a git repository root and confines `path` to that root through `realpath`, so `..`, an absolute path, a symlink escape, and `.git` internals are all rejected. Nothing writes; `git` runs only read-only queries.
-- `lib/client.js`: session-header trigger plus a fixed panel with a changes tab (files differing from HEAD) and a files tab (directory browse). Diff rows carry context lines and both gutters; the panel is display-only, with no editing or revert.
+- `lib/client.js`: session-header trigger plus a fixed panel with a changes tab (files differing from HEAD) and a files tab (directory browse). Diff rows carry context lines and both gutters; the panel is display-only, with no editing or revert. The workspace comes from the sessions list store via the standard `useSessions` prop (`state.byId[sessionId]?.cwd`) — the per-session conversation snapshot has no `cwd`, and the service exposes no top-level `getSnapshot`/`items`.
 - `package.json`: Web runtime/locale/conversation/primitives client injection and package exports.
 - Baseline is HEAD, not session start, so committing re-bases the view. See `docs/diff-viewer.md`.
 

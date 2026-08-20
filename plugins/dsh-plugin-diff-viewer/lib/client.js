@@ -436,11 +436,23 @@ window.__ModuleLoader__.load({
       });
     }
 
-    /** Header trigger plus the panel, scoped to one session. */
-    function DiffViewerTrigger({ sessionId, useSession, resolveCwd, t }) {
+    /**
+     * Header trigger plus the panel, scoped to one session.
+     *
+     * The workspace comes from the sessions list store, which is the only client
+     * surface carrying it: the per-session conversation snapshot has no cwd.
+     * `useSessions` is a standard prop on every slot component and subscribes, so
+     * the panel picks the workspace up when the list resolves instead of caching
+     * an early undefined (the host's own header rows read `byId[sessionId]` the
+     * same way).
+     */
+    function DiffViewerTrigger({ sessionId, useSession, useSessions, t }) {
       const running = useSession((snapshot) => snapshot.running);
       const [open, setOpen] = react.useState(false);
-      const cwd = react.useMemo(() => resolveCwd(), [resolveCwd, sessionId, open]);
+      const cwd = useSessions((state) => {
+        const entry = state?.byId?.[sessionId];
+        return typeof entry?.cwd === "string" && entry.cwd !== "" ? entry.cwd : undefined;
+      });
       return jsxs("span", {
         className: "dsh-dv-root",
         "data-diff-viewer-session": sessionId,
@@ -475,15 +487,6 @@ window.__ModuleLoader__.load({
         id: "diff-viewer",
         order: 70,
         locale: NS,
-        inject: (sessionId) => ({
-          // The session snapshot carries no cwd; the sessions list entry does.
-          resolveCwd: () => {
-            const items = ctx.get("sessions")?.getSnapshot?.()?.items;
-            if (!Array.isArray(items)) return undefined;
-            const entry = items.find((candidate) => candidate.sessionId === sessionId);
-            return typeof entry?.cwd === "string" && entry.cwd !== "" ? entry.cwd : undefined;
-          },
-        }),
       }, DiffViewerTrigger));
     }
 

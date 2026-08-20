@@ -86,9 +86,25 @@ has a changes tab and a files tab, and a selected file replaces the list with a
 detail view reached through a breadcrumb with a back button.
 
 One non-obvious dependency: the per-session snapshot exposed to slot components
-carries no `cwd`. It comes from the sessions *list* entry instead, read through
-`ctx.get("sessions").getSnapshot().items`, which is why the slot registration
-injects a `resolveCwd` callback.
+carries no `cwd`. It lives in the sessions *list* store, read with the standard
+`useSessions` prop:
+
+```js
+const cwd = useSessions((state) => state?.byId?.[sessionId]?.cwd);
+```
+
+`useSessions` reaches session-scope slot components because the renderer builds
+their props as `standard = { ...cache.root }`, so every slot inherits the root
+scope's `useSessions`/`useWorkspaces` — the host's own header rows
+(`AgentPresetLabel`, `JobListAction`) read their session fields exactly this way.
+
+This was originally written as a private `resolveCwd` callback reading
+`ctx.get("sessions").getSnapshot().items`, which is wrong twice: the service has
+no top-level `getSnapshot`, and `SessionListState` is `{ ids, byId, current,
+phase, ... }` with no `items` array. The panel therefore always reported "this
+session has no working directory". Reading through the selector hook also fixes a
+latent race: a callback memoized on mount froze whatever the store held before
+the session list resolved, while the hook re-renders when it arrives.
 
 Both views refetch when the session's `running` flag changes, so the change list
 refreshes on its own when the agent finishes a turn.
