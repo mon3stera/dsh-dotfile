@@ -78,18 +78,20 @@ window.__ModuleLoader__.load({
 .dsh-dv-trigger:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .dsh-dv-trigger[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary)}
 .dsh-dv-badge{min-width:16px;padding:0 4px;border-radius:8px;background:var(--dsw-alias-interactive-bg-selected);color:var(--dsw-alias-label-secondary);font-size:11px;font-variant-numeric:tabular-nums;line-height:16px}
-.dsh-dv-panel{position:fixed;z-index:60;top:58px;right:12px;bottom:132px;box-sizing:border-box;width:min(720px,calc(100vw - 24px));min-width:0;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-base);box-shadow:var(--dsw-shadow-lv3);color:var(--dsw-alias-label-primary)}
+.dsh-dv-panel{position:fixed;z-index:60;top:58px;right:12px;bottom:132px;box-sizing:border-box;width:min(720px,calc(100vw - 24px));min-width:0;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:color-mix(in oklab,var(--dsw-alias-bg-layer-1) 86%,transparent);backdrop-filter:blur(20px) saturate(1.4);box-shadow:var(--dsw-shadow-lv3);color:var(--dsw-alias-label-primary)}
+@supports not (backdrop-filter:blur(1px)){.dsh-dv-panel{background:var(--dsw-alias-bg-layer-1)}}
 .dsh-dv-header{display:flex;align-items:center;gap:8px;min-height:48px;padding:8px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none}
 .dsh-dv-title{min-width:0;flex:none;font-size:14px;font-weight:600;line-height:20px}
 .dsh-dv-branch{min-width:0;flex:1;overflow:hidden;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;white-space:nowrap;text-overflow:ellipsis;display:inline-flex;align-items:center;gap:4px}
 .dsh-dv-tabs{flex:none;display:inline-flex;gap:2px;padding:2px;border-radius:7px;background:var(--dsw-alias-interactive-bg-hover)}
 .dsh-dv-tab{padding:4px 10px;border:0;border-radius:5px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:12px;line-height:18px}
-.dsh-dv-tab[aria-selected=true]{background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);box-shadow:var(--dsw-shadow-lv1)}
+.dsh-dv-tab[aria-selected=true]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);box-shadow:var(--dsw-shadow-lv1)}
 .dsh-dv-icon{width:28px;height:28px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;display:grid;place-items:center;flex:none}
 .dsh-dv-icon:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .dsh-dv-crumbs{display:flex;align-items:center;gap:6px;padding:6px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none;min-height:34px}
 .dsh-dv-crumbpath{min-width:0;flex:1;overflow:hidden;font-family:${MONO};font-size:12px;line-height:18px;white-space:nowrap;text-overflow:ellipsis;direction:rtl;text-align:left}
 .dsh-dv-body{min-height:0;flex:1;overflow:auto;overscroll-behavior:contain}
+.dsh-dv-read{margin:0}
 .dsh-dv-list{margin:0;padding:6px;list-style:none}
 .dsh-dv-item{width:100%;display:flex;align-items:center;gap:8px;margin:0;padding:6px 8px;border:0;background:transparent;text-align:left;color:var(--dsw-alias-label-secondary);cursor:pointer;border-radius:6px;font-size:13px;line-height:18px}
 .dsh-dv-item:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
@@ -104,7 +106,7 @@ window.__ModuleLoader__.load({
 .dsh-dv-plus{color:#16a34a}
 .dsh-dv-minus{color:#dc2626}
 .dsh-dv-note{padding:20px 12px;color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:20px;text-align:center}
-.dsh-dv-hunk{padding:3px 12px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-tertiary);font-family:${MONO};font-size:11px;line-height:18px;position:sticky;top:0}
+.dsh-dv-hunk{padding:3px 12px;background-color:var(--dsw-alias-bg-layer-1);background-image:linear-gradient(var(--dsw-alias-interactive-bg-hover),var(--dsw-alias-interactive-bg-hover));color:var(--dsw-alias-label-tertiary);font-family:${MONO};font-size:11px;line-height:18px;position:sticky;top:0}
 .dsh-dv-row{display:grid;grid-template-columns:48px 48px 1fr;font-family:${MONO};font-size:12px;line-height:18px;white-space:pre-wrap;overflow-wrap:anywhere}
 .dsh-dv-row[data-kind=add]{background:color-mix(in oklab,#22c55e 13%,transparent)}
 .dsh-dv-row[data-kind=del]{background:color-mix(in oklab,#ef4444 13%,transparent)}
@@ -221,18 +223,21 @@ window.__ModuleLoader__.load({
       if (data === null) return null;
       if (data.binary) return note(t("binary"));
       if (data.tooLarge) return note(t("tooLarge"));
-      return jsxs("div", {
-        children: [
-          ...data.lines.map((line) => jsxs("div", {
-            className: "dsh-dv-row",
-            children: [
-              jsx("span", { className: "dsh-dv-no", children: line.no }),
-              jsx("span", { className: "dsh-dv-no", children: "" }),
-              jsx("span", { className: "dsh-dv-text", children: line.text }),
-            ],
-          }, line.no)),
-          data.truncated ? note(t("truncated")) : null,
-        ],
+      // The host's own read card: Shiki highlighting through the shared
+      // `css-variables` theme (so it follows the active theme and any
+      // wallpaper-derived palette), line-number gutter, and a copy button.
+      // `lang` is already derived server-side by `langOf()`; an unsupported or
+      // absent language degrades to plain text inside ReadBlock rather than
+      // throwing. `maxLines` is the served line count because the panel body is
+      // the scroller — the default 16 would collapse every file.
+      const lines = data.lines.map((line) => ({ number: line.no, text: line.text }));
+      return jsx(primitives.ReadBlock, {
+        label: data.path ?? "",
+        lines,
+        totalLines: data.totalLines ?? lines.length,
+        ...(data.lang === undefined ? {} : { lang: data.lang }),
+        maxLines: lines.length,
+        className: "dsh-dv-read",
       });
     }
 

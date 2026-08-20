@@ -109,6 +109,48 @@ the session list resolved, while the hook re-renders when it arrives.
 Both views refetch when the session's `running` flag changes, so the change list
 refreshes on its own when the agent finishes a turn.
 
+### File view: the host's read card
+
+A file is rendered by `primitives.ReadBlock`, the same card the `read` tool
+produces, rather than by hand-rolled rows. That buys real syntax highlighting:
+the block tokenizes through the host's Shiki singleton against the
+`css-variables` theme, so colors resolve from the `--shiki-token-*` variables the
+theme plugin defines and `dsh-plugin-background` can re-tint per wallpaper.
+
+Two contracts matter when feeding it:
+
+- Lines are `{ number, text }`, while the `file` route emits `{ no, text }`.
+- `maxLines` defaults to **16** and collapses the remainder behind an expander.
+  The panel body is already the scroller, so the view passes the served line
+  count and nothing collapses.
+
+`lang` is derived server-side by `langOf()` and is only a hint: `ReadBlock` looks
+it up in the host's alias table and falls back to unhighlighted text when the
+language is absent or unknown, so an unsupported extension degrades instead of
+throwing. `LANG_BY_EXT` accepts both spellings the table knows (`javascript` and
+`js` alike). Four of its values — `diff`, `graphql`, `svelte`, `vue` — have no
+grammar in the shipped bundle and therefore render as plain text; the smoke test
+pins that set so a shrinking host table shows up as a failure rather than as
+silently uncolored files.
+
+### Legibility over a wallpaper
+
+The panel paints `--dsw-alias-bg-layer-1`, not `--dsw-alias-bg-base`:
+`dsh-plugin-background` sets `--dsw-alias-bg-base: transparent !important` while a
+wallpaper is on, which made the panel vanish into the image. `bg-layer-1` is the
+floating-surface token (`#fff` / `#232324`), and the wallpaper plugin never
+overrides it. It is mixed to 86% and paired with `backdrop-filter: blur(20px)
+saturate(1.4)` for a frosted panel, with an opaque `@supports` fallback where
+`backdrop-filter` is unavailable.
+
+`backdrop-filter` is safe on this root specifically because the panel has no
+`position: fixed` descendants — a filtered element becomes the containing block
+for fixed children, which is the trap `dsh-plugin-background` documents for the
+app shell. Two related fills were transparent for the same reason and are now
+`bg-layer-1`: the selected tab, and the sticky hunk header, which carried only a
+6–8% tint and let diff rows scroll visibly through it. The header keeps that tint
+as a `linear-gradient` composited over the opaque base.
+
 ## Deployment notes
 
 The loader entry must be the bare package name:

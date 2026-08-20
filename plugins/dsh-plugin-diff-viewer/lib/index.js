@@ -53,6 +53,7 @@ const LANG_BY_EXT = {
   c: "c", h: "c", cc: "cpp", cpp: "cpp", hpp: "cpp", cxx: "cpp",
   css: "css", scss: "scss", less: "less", html: "html", xml: "xml",
   sql: "sql", lua: "lua", php: "php", swift: "swift", kt: "kotlin",
+  cs: "csharp", mdx: "mdx",
   vue: "vue", svelte: "svelte", graphql: "graphql", diff: "diff",
 };
 

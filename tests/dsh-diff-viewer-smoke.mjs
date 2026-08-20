@@ -4,7 +4,7 @@
 // parsing is checked against actual `git diff` output rather than a fixture that
 // could drift from what git emits.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, symlinkSync, globSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
@@ -187,6 +187,7 @@ const client = captured.factory((spec) => {
       IconChevronLeftOutline14: icon,
       IconFolderClose16: icon,
       IconFolderOpen16: icon,
+      ReadBlock: (props) => ({ type: "ReadBlock", props }),
     };
   }
   throw new Error(`unexpected require: ${spec}`);
@@ -278,5 +279,61 @@ for (const route of ["changes", "diff", "tree", "file"]) {
     `host registers the ${route} route`,
   );
 }
+
+// ------------------------------------------------- file view: host highlighting
+// The file view renders through the host's own `ReadBlock`, which highlights via
+// the shared `css-variables` Shiki theme. Two contracts must hold: the plugin
+// must feed it the shape it destructures, and it must not inherit the collapsing
+// default (`maxLines = 16`) that would hide all but 16 lines of every file.
+ok(raw.includes("primitives.ReadBlock"), "file view renders the host read block");
+ok(/number: line\.no, text: line\.text/.test(raw), "line shape mapped from {no} to {number}");
+ok(/maxLines: lines\.length/.test(raw), "maxLines is the served line count, never the collapsing default");
+ok(!raw.includes('className: "dsh-dv-no", children: line.no'), "the hand-rolled unhighlighted file rows are gone");
+
+const frontendBundle = globSync(
+  "/home/mon3tr/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist/assets/index-*.js",
+);
+ok(frontendBundle.length > 0, "installed web frontend bundle located");
+const frontendSource = readFileSync(frontendBundle[0], "utf8");
+// Prop names survive minification because they are destructured from our object.
+for (const prop of ["label:", "lines:", "totalLines:", "lang:", "maxLines:"]) {
+  ok(frontendSource.includes(prop), `host still destructures ReadBlock's ${prop} prop`);
+}
+ok(/maxLines:[a-zA-Z$_]+=16/.test(frontendSource), "host ReadBlock still defaults maxLines to 16");
+
+// Which languages actually highlight is host data, not a plugin promise: the
+// alias table is the gate, and an unlisted language falls back to plain text
+// instead of throwing. Assert the split so a shrinking host table is visible
+// here rather than as silently unhighlighted files.
+const aliasKeys = new Set([...frontendSource.matchAll(/\["([a-z]+)","([a-z]+)"\]/g)].map((m) => m[1]));
+ok(aliasKeys.has("typescript") && aliasKeys.has("python"), "host language alias table found");
+const hostSource = readFileSync(new URL("../plugins/dsh-plugin-diff-viewer/lib/index.js", import.meta.url), "utf8");
+const langTable = hostSource.slice(
+  hostSource.indexOf("const LANG_BY_EXT = {"),
+  hostSource.indexOf("};", hostSource.indexOf("const LANG_BY_EXT = {")),
+);
+const emitted = [...new Set([...langTable.matchAll(/: *"([a-z]+)"/g)].map((m) => m[1]))];
+ok(emitted.length >= 30, "language table is populated");
+const degrades = emitted.filter((lang) => !aliasKeys.has(lang)).sort();
+eq(degrades.join(","), "diff,graphql,svelte,vue", "only the grammars the host does not ship degrade to plain text");
+for (const lang of ["typescript", "javascript", "python", "markdown", "bash", "csharp", "mdx"]) {
+  ok(emitted.includes(lang) && aliasKeys.has(lang), `${lang} is emitted and highlightable`);
+}
+
+// ------------------------------------------------------- panel legibility CSS
+// `--dsw-alias-bg-base` is forced to `transparent` by dsh-plugin-background
+// while a wallpaper is on, so a panel painted with it disappears. The floating
+// surface token stays opaque and the wallpaper plugin never overrides it.
+const css = styleTags[0].textContent;
+ok(/\.dsh-dv-panel\{[^}]*backdrop-filter:blur\(/.test(css), "panel frosts its backdrop");
+ok(/\.dsh-dv-panel\{[^}]*color-mix\(in oklab,var\(--dsw-alias-bg-layer-1\)/.test(css), "panel fill is the floating surface token, not bg-base");
+ok(!/\.dsh-dv-panel\{[^}]*background:var\(--dsw-alias-bg-base\)/.test(css), "panel no longer depends on the wallpaper-neutralized token");
+ok(css.includes("@supports not (backdrop-filter:blur(1px))"), "opaque fallback where backdrop-filter is unsupported");
+ok(/\.dsh-dv-tab\[aria-selected=true\]\{background:var\(--dsw-alias-bg-layer-1\)/.test(css), "selected tab keeps a fill over a wallpaper");
+// The sticky hunk header carried only a 6-8% tint, so diff rows scrolled
+// visibly through it.
+ok(/\.dsh-dv-hunk\{[^}]*background-color:var\(--dsw-alias-bg-layer-1\)/.test(css), "sticky hunk header sits on an opaque base");
+ok(/\.dsh-dv-hunk\{[^}]*linear-gradient\(var\(--dsw-alias-interactive-bg-hover\)/.test(css), "hunk tint composited over that base");
+ok(css.includes(".dsh-dv-read{margin:0}"), "read block starts flush in the scrolling body");
 
 console.log(`diff-viewer ok (${checks} checks)`);
