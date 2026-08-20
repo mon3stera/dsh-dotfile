@@ -165,6 +165,8 @@ Important context behavior:
 - Other groups mount shell, filesystem, skills, goals, planning, delegation, and UI tools.
 - Isolated group realms are intentional. Do not move services between realms without checking host/preset ownership and collision behavior.
 
+`profile/cordis.patch.example.yml` also pins the **browse** directory picker. The shipped `directory-picker` row is adaptive and resolves `native` whenever the bind is loopback, a display is present, a chooser binary exists, and no SSH env is set — signals that cannot see a browser arriving through an SSH tunnel. In that setup the native dialog opens on an unwatched desktop, `host.pickDirectory` hangs on an orphan `zenity --file-selection`, and `host.listDirectory` refuses with `directory-picker-unavailable`. Pinning browse keeps selection in the browser. Note that `name` on an id-targeted patch row is an assertion, not a rename, so the adaptive row must be disabled and the browse pair inserted.
+
 After changing profile composition or plugin manifests, a new DSH process is required. Do not restart the primary service directly.
 
 ## Syncing Runtime Plugins

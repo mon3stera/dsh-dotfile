@@ -37,3 +37,25 @@
 - id: agent-presets
   config:
     default: context-compact
+
+# Pin the browse directory picker (needed for remote/tunneled access).
+#
+# `directory-picker` is the adaptive chooser: at boot it samples the bind host,
+# SSH env, platform, DISPLAY/WAYLAND_DISPLAY, and whether zenity/kdialog is on
+# PATH, then mounts either the native or the browse pair. A loopback bind plus a
+# live display plus no SSH_CONNECTION reads as "the operator can see this host's
+# desktop" — which is wrong when the browser arrives through an SSH tunnel. The
+# native dialog then opens on a desktop nobody is watching and
+# `host.pickDirectory` never settles; `host.listDirectory` meanwhile refuses
+# with `directory-picker-unavailable` because the composed picker serves
+# "native". Pinning browse keeps directory selection inside the browser.
+#
+# `name` on an id-targeted patch row is an assertion, not a rename (a mismatch
+# skips the row), so the auto row is disabled and the browse pair is inserted.
+- id: directory-picker
+  disabled: true
+- insert:
+    - id: directory-picker-browse
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: directory-picker-browse-ui
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
