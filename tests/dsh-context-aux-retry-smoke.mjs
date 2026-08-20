@@ -404,12 +404,14 @@ const unescapedXml = compartmentXml("<fact importance=\"7\">package.json <name> 
 		};
 		const engine = new ContextEngine(fakeCtx, { embeddingDim: 4 });
 		const notices = [];
+		const rowEvents = [];
 		const session = {
 			id: "failure-session",
 			requestHeader: () => ({ system: "sys", tools: [], config: { provider: "p", model: "m" } }),
 			events: { 1: { type: "user/message", data: { content: [{ type: "text", text: "work" }] } } },
 			surface: { nodes: [] },
 			deriveEventMessage: (event) => ({ role: "user", content: event.data.content }),
+			append: (type, data) => { rowEvents.push({ type, data }); return { type, data, seq: rowEvents.length }; },
 		};
 		const agent = { session, inject: (message) => notices.push(message) };
 		const range = { start: 1, end: 1, shadowedSeqs: [1] };
@@ -444,10 +446,13 @@ const unescapedXml = compartmentXml("<fact importance=\"7\">package.json <name> 
 		const row = engine.cdb.compartmentById(1);
 		check("generation failure still propagates", thrown?.code === "RATE_LIMIT");
 		check("failed row records the reason", row.status === "failed" && row.error.includes("tpm (InputTokens)"));
-		const noticeText = notices.map((notice) => notice.content?.map((block) => block.text ?? "").join("\n")).join("\n");
-		const noticeSummaries = notices.map((notice) => notice.source?.summary ?? "");
-		check("failure notice reaches the UI", noticeSummaries.some((summary) => summary.includes("Compartment generation failed")) && noticeText.includes("failed after retries: Rate limit exceeded: tpm (InputTokens)"));
-		check("failure notice reports the deferral", noticeText.includes("Consecutive failures: 1") && noticeText.includes("deferred"));
+		const runRow = rowEvents.find((event) => event.type === "command/run");
+		const doneRow = rowEvents.find((event) => event.type === "command/done");
+		const rowText = doneRow?.data.text ?? "";
+		check("generation opens one running row", runRow?.data.name === "Context: compartment generation 1" && rowEvents.filter((event) => event.type === "command/run").length === 1);
+		check("failure settles that row as an error", doneRow?.data.kind === "error" && doneRow.data.commandId === runRow.data.commandId && rowText.includes("failed after retries: Rate limit exceeded: tpm (InputTokens)"));
+		check("failure row reports the deferral", rowText.includes("Consecutive failures: 1") && rowText.includes("deferred"));
+		check("failure never reaches the model surface", notices.length === 0 && rowEvents.every((event) => event.type === "command/run" || event.type === "command/done"));
 		const first = engine.generateFailures.get(session.id);
 		check("first failure arms a cooldown", first.failures === 1 && first.until > Date.now());
 

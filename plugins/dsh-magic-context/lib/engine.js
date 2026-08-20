@@ -35,7 +35,7 @@ import {
 	RerankClient,
 } from "./retrieval.js";
 import { buildDreamerBrief, DEFAULT_DREAMER_MAX_TOKENS, runArchival, runDreamer, summarizeDreamerActions } from "./dreamer.js";
-import { injectContextNotice } from "./notifications.js";
+import { recordActivity, settleActivity, startActivity } from "./notifications.js";
 import { mergeContextConfig } from "./settings.js";
 import { clearContextUsage, setContextUsage } from "./usage.js";
 import { describeAuxFailure } from "./aux-llm.js";
@@ -391,9 +391,9 @@ export class ContextEngine extends BasicCompactionEngine {
 		this.injection.set(session, { text, memoryCount: selected.length, memoryTokens });
 		this._refreshContextUsage(session);
 		if (selected.length > 0) {
-			this._notify(
+			this._activity(
 				this.agentBySession.get(session),
-				`Inject Memory: ${selected.length} project memor${selected.length === 1 ? "y" : "ies"}`,
+				"Context: project memory injection",
 				`Injected ${selected.length} project memor${selected.length === 1 ? "y" : "ies"} into the next model request.`,
 			);
 		}
@@ -423,20 +423,45 @@ export class ContextEngine extends BasicCompactionEngine {
 		});
 	}
 
-	/** Keep secondary UI notices from changing the compaction outcome. */
-	_notify(agent, summary, text) {
+	/**
+	 * Record one settled human-facing activity row.
+	 *
+	 * Rows are reported through the command lifecycle, so they are invisible to
+	 * the model and never queue anything in the agent inbox. Delivery must stay
+	 * off the critical path: a UI row can never change a compaction outcome.
+	 */
+	_activity(agent, title, text, kind = "success") {
 		try {
-			injectContextNotice(agent, summary, text);
+			recordActivity(agent?.session, title, text, kind);
 		} catch (error) {
-			this.ctx.logger.warn(`context UI notice failed: ${error instanceof Error ? error.message : String(error)}`);
+			this.ctx.logger.warn(`context activity row failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	/** Open one running activity row and return its pairing id. */
+	_activityStart(agent, title) {
+		try {
+			return startActivity(agent?.session, title);
+		} catch (error) {
+			this.ctx.logger.warn(`context activity row failed: ${error instanceof Error ? error.message : String(error)}`);
+			return undefined;
+		}
+	}
+
+	/** Settle one activity row opened by {@link _activityStart}. */
+	_activitySettle(agent, activityId, kind, text) {
+		try {
+			settleActivity(agent?.session, activityId, kind, text);
+		} catch (error) {
+			this.ctx.logger.warn(`context activity row failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
 	/** Announce one checkpoint entering the model-visible surface. */
 	_announceCompartment(agent, compartment, result) {
-		this._notify(
+		this._activity(
 			agent,
-			`Inject Compartments: generation ${compartment.generation}`,
+			`Context: compartment generation ${compartment.generation} landed`,
 			[
 				`Injected compartment generation ${compartment.generation} into the conversation surface.`,
 				`Covered paragraphs: ${compartment.start_para}-${compartment.end_para}.`,
@@ -593,11 +618,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			summary: "",
 			shadowedTokens,
 		});
-		this._notify(
-			agent,
-			`Compartment generation started: generation ${generation}`,
-			`Started background summary generation for compartment generation ${generation}.`,
-		);
+		const activityId = this._activityStart(agent, `Context: compartment generation ${generation}`);
 		try {
 			const target = this._summarizationTarget(session);
 			const parsed = await summarizeCompartment(this.ctx, this.cdb, {
@@ -609,9 +630,10 @@ export class ContextEngine extends BasicCompactionEngine {
 				maxTokens: this.ownConfig.summarizationMaxTokens,
 			});
 			this.generateFailures.delete(id);
-			this._notify(
+			this._activitySettle(
 				agent,
-				`Compartment summary ready: #${compartmentId}`,
+				activityId,
+				"success",
 				[
 					`Compartment ${compartmentId} summary completed.`,
 					`Captured range: ${range.start}-${range.end}.`,
@@ -621,7 +643,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		} catch (error) {
 			const reason = describeAuxFailure(error instanceof Error ? error.message : String(error));
 			this.cdb.setCompartmentStatus(compartmentId, "failed", reason);
-			this._recordGenerationFailure(agent, compartmentId, generation, shadowedTokens, reason);
+			this._recordGenerationFailure(agent, compartmentId, generation, shadowedTokens, reason, activityId);
 			throw error;
 		}
 		return compartmentId;
@@ -632,11 +654,13 @@ export class ContextEngine extends BasicCompactionEngine {
 	 *
 	 * Without a cooldown the next step boundary immediately re-sends the whole
 	 * range (56k-133k tokens in observed sessions), which turns one throttled
-	 * provider into a self-sustaining flood; without a notice the only trace is
-	 * a process-log warning nobody sees while the UI still shows "generation
-	 * started".
+	 * provider into a self-sustaining flood; without a settled row the only trace
+	 * is a process-log warning nobody sees while the UI still shows a running
+	 * generation. The row opened at generation start is settled as an error here,
+	 * so one attempt stays one row; `activityId` is absent only when opening it
+	 * failed, and a replacement row is opened so the failure is never silent.
 	 */
-	_recordGenerationFailure(agent, compartmentId, generation, shadowedTokens, reason) {
+	_recordGenerationFailure(agent, compartmentId, generation, shadowedTokens, reason, activityId) {
 		const id = agent.session.id;
 		const failures = (this.generateFailures.get(id)?.failures ?? 0) + 1;
 		const cooldownMs = Math.min(
@@ -644,9 +668,10 @@ export class ContextEngine extends BasicCompactionEngine {
 			GENERATE_COOLDOWN_MS * 2 ** (failures - 1),
 		);
 		this.generateFailures.set(id, { failures, until: Date.now() + cooldownMs });
-		this._notify(
+		this._activitySettle(
 			agent,
-			`Compartment generation failed: generation ${generation}`,
+			activityId ?? this._activityStart(agent, `Context: compartment generation ${generation}`),
+			"error",
 			[
 				`Compartment ${compartmentId} (generation ${generation}) failed after retries: ${reason}`,
 				`Source range: ${shadowedTokens} tokens. Consecutive failures: ${failures}.`,
@@ -816,14 +841,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			return { skipped: true, rounds: 0, ...material };
 		}
 		this.dreamerBusy = true;
-		this._notify(
-			agent,
-			"Dreamer started",
-			[
-				"Dreamer started its background memory-maintenance pass.",
-				`Pending facts: ${material.facts.length}; memories to verify: ${material.memories.length}; compartments to distill: ${material.compartments.length}.`,
-			].join("\n"),
-		);
+		const activityId = this._activityStart(agent, "Context: Dreamer maintenance pass");
 		try {
 			const workspaceRoot = agent.session.header?.cwd;
 			const result = await runDreamer(this.ctx, this.cdb, {
@@ -841,11 +859,12 @@ export class ContextEngine extends BasicCompactionEngine {
 				retrieval: this.ownConfig.retrievalConfig,
 			});
 			const archival = runArchival(this.cdb, { budgetTokens: dreamer.compartmentBudgetTokens });
-			this._notify(
+			this._activitySettle(
 				agent,
-				"Dreamer completed",
+				activityId,
+				"success",
 				[
-					"Dreamer completed its background memory-maintenance pass.",
+					`Pending facts: ${material.facts.length}; memories verified: ${material.memories.length}; compartments distilled: ${material.compartments.length}.`,
 					`Completed ${result.rounds} round${result.rounds === 1 ? "" : "s"}.`,
 					`Summary: ${summarizeDreamerActions(result.actions)}.`,
 					`Archived compartments: ${archival.archived.length}.`,
@@ -853,9 +872,10 @@ export class ContextEngine extends BasicCompactionEngine {
 			);
 			return { ...result, archival };
 		} catch (error) {
-			this._notify(
+			this._activitySettle(
 				agent,
-				"Dreamer failed",
+				activityId,
+				"error",
 				`Dreamer failed during its background memory-maintenance pass: ${describeAuxFailure(error instanceof Error ? error.message : String(error))}`,
 			);
 			throw error;

@@ -269,20 +269,28 @@ const check = (label, ok) => {
 		await wait(100);
 		check("dreamer runs again after a new turn", dreamerCalls === 2);
 
-		// A completed pass publishes a concise UI notice with the action summary.
+		// A completed pass settles its activity row with the action summary, and
+		// reports it through the command lifecycle so the model never sees it.
 		engine._runDreamerForAgent = realDreamer;
-		const completionNotices = [];
+		const rowEvents = [];
+		const injected = [];
 		const completionSession = {
 			id: "dreamer-completion",
 			header: { cwd: process.cwd() },
 			requestHeader: () => ({ config: { provider: "p", model: "m" } }),
 			events: [],
+			append: (type, data) => { rowEvents.push({ type, data }); return { type, data, seq: rowEvents.length }; },
 		};
 		engine.cdb.writeMemory({ category: "CONVENTIONS", scopePath: process.cwd(), summary: "completion notice test", content: "test", importance: 5 });
 		fakeCtx.llm = { async *stream() { yield { type: "text-delta", text: "done" }; } };
-		await engine._runDreamerForAgent({ session: completionSession, inject: (message) => completionNotices.push(message) });
-		const completionText = completionNotices.map((notice) => notice.content?.map((block) => block.text ?? "").join("\n")).join("\n");
-		check("dreamer completion notice", completionText.includes("Dreamer completed") && completionText.includes("Summary:") && completionText.includes("Archived compartments: 0."));
+		await engine._runDreamerForAgent({ session: completionSession, inject: (message) => injected.push(message) });
+		const runRow = rowEvents.find((event) => event.type === "command/run");
+		const doneRow = rowEvents.find((event) => event.type === "command/done");
+		const completionText = doneRow?.data.text ?? "";
+		check("dreamer opens a running activity row", runRow?.data.name === "Context: Dreamer maintenance pass");
+		check("dreamer completion row", doneRow?.data.kind === "success" && completionText.includes("Summary:") && completionText.includes("Archived compartments: 0."));
+		check("dreamer row pairs with its start", doneRow?.data.commandId === runRow?.data.commandId);
+		check("dreamer status never enters the model surface", injected.length === 0 && !rowEvents.some((event) => event.type === "user/message"));
 
 		const shortAgent = { session: { id: "short-history" } };
 		const shortResult = await engine._createAndSummarize(shortAgent, { start: 1, end: 2 }, 100);

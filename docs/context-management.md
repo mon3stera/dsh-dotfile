@@ -512,20 +512,31 @@ ContextEngine 为当前 agent 注册用户侧命令：
 
 ## 8. UI 展示
 
-已接入 DSH 现有的上下文注入 UI。通知使用 `agent.inject(createUserMessage(...))` 排队到下一次 pre-step，并以 `source: { kind: "plugin", plugin: "dsh-magic-context", form: "notice" }` 写入 session；Web 的 `ContextInjectionRow` 会将它显示为默认折叠的上下文注入行。Host bridge 使用 `/magic-context/config`、`/magic-context/usage` 和 `/magic-context/models/*` 路径。
+状态汇报走 **activity row**：`notifications.js` 直接向 session 追加一对 `command/run` + `command/done`，Web 客户端把它们按 `commandId` 配对成一张可折叠的 `GenericCommandCard`——`command/done` 到达前显示为运行中，`kind: "error"` 显示为红色失败态。Host bridge 使用 `/magic-context/config`、`/magic-context/usage` 和 `/magic-context/models/*` 路径。
 
 **展示内容**
 
-| 事件 | 内容 |
+| Activity row | 内容 |
 |---|---|
-| Inject Memory | 选中的 project memory 数量；自动 landing 通过 deriveMessages 动态注入，`/inject-memory` 则将完整 block 追加到下一次请求 |
-| Inject Compartments | Compartment 代次、覆盖段落区间、替换的历史项数量和估算 token 数 |
-| Dreamer started | Dreamer 启动及本次维护批次中的 pending facts、待校验 memories、待整理 compartments 数量 |
-| Dreamer completed | Dreamer 完成轮数、实际调用的维护动作摘要和归档的 Compartment 数量 |
-| Dreamer failed | Dreamer 维护失败原因 |
-| Compartment summary ready | 总结完成的 Compartment id、捕获的事件范围和抽取出的 project facts 数量 |
+| `Context: project memory injection` | 选中的 project memory 数量；自动 landing 通过 deriveMessages 动态注入，`/inject-memory` 则将完整 block 追加到下一次请求 |
+| `Context: compartment generation N landed` | Compartment 代次、覆盖段落区间、替换的历史项数量和估算 token 数 |
+| `Context: compartment generation N` | 生成开始时开启（运行中），成功后落为 Compartment id、捕获范围与抽取的 project facts 数量，失败则落为红色行：归一化原因、源范围 token 数、连续失败次数和冷却秒数 |
+| `Context: Dreamer maintenance pass` | Dreamer 启动时开启（运行中），完成后落为本批 pending facts / 待校验 memories / 待整理 compartments 数量、完成轮数、维护动作摘要和归档 Compartment 数量；失败落为红色行 |
 
-通知本身是模型可见的 context message，因此与 plan-mode、jobs 等现有 context notice 行为一致；完整 checkpoint 摘要仍由内置 compaction 行渲染。自动 landing 的 memory 正文保持动态注入；`/inject-memory` 明确追加完整 memory block。
+一次生成对应**一行**，而不是"started"和"ready"两条独立通知；完整 checkpoint 摘要仍由内置 compaction 行渲染。
+
+### 8.1 为什么状态汇报不用 context notice
+
+早期实现用 `agent.inject(createUserMessage(...))` + `form: "notice"` 渲染 `ContextInjectionRow`。这条路有两个无法接受的代价：
+
+- **模型可见**。surface-eligible 的事件类型只有 `user/message`、`assistant/message`、`tool/result` 三种，且 `deriveEventMessage` 无条件投影它们，所以任何占据 transcript 位置的行必然进入模型上下文。写给人看的 "Dreamer started" 会永久占据每一次后续请求的前缀。
+- **多一次 LLM 请求**。`agent.inject()` 等价于 `send(message, "next-step", false)`，落进 `inbox.nextStep`；而 agent loop 的收尾条件是 `if (turnEnds && this.inbox.nextStep.length === 0) break`。落在 turn 边界上的状态通知因此强制多跑一个 step——为一句人类可读的状态文本，付一次整窗口的模型请求。
+
+反过来 `command/run` / `command/done` 是纯日志追加：没有 turn 包裹它们，不进 inbox，且两者都不是 surface-eligible。
+
+自定义事件类型（例如 `magic-context/notice`）不可行：`Session.append()` 只接受 `sourceEventSeqs` 和 `surfaceOp`，插件无法设置 envelope 的 `ignorable` 标记，而 `dsh-session-persistence` 会拒绝解析任何含未知类型且未标记 `ignorable` 的日志——一条这样的通知就会让整个 session 打不开。上游明确写着该注册面"deferred until such a consumer exists"。
+
+`createContextNotice()` 保留给**真正面向模型**的内容：`/inject-memory` 有意把 memory 正文摆到模型面前，那属于 context message 而不是状态汇报。`tests/dsh-context-notifications-smoke.mjs` 用源码级断言守住这条边界（引擎不得出现 `.inject(`）。
 
 ## 9. 实现阶段
 
@@ -538,4 +549,4 @@ ContextEngine 为当前 agent 注册用户侧命令：
 7. **整理者产生 session_facts**：摘要时抽取事实写入 session_facts（pending）
 8. **挂载与测试**：dsh-magic-context bundle、context-compact preset、patch、烟雾测试（真实 GUI 验证）
 9. **Dreamer**：只读工具集（sql_query/fs_read/memory_*/promote_fact/compartment_mark）、轻量 loop、会话空闲触发、归档例程（compaction/prune 协议 + 预算 + 优先级）
-10. **UI 展示**：复用 DSH `agent.inject()` + `form: "notice"` 的 ContextInjectionRow，接入 Inject Memory、Inject Compartments、Dreamer started 和 Compartment summary ready 四类通知
+10. **UI 展示**：状态汇报走 `command/run` + `command/done` activity row（模型不可见、不进 agent inbox），覆盖 memory injection、compartment landing、compartment generation 和 Dreamer 四类；`createContextNotice()` 仅保留给 `/inject-memory` 这类面向模型的注入
