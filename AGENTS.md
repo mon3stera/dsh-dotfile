@@ -32,6 +32,7 @@ plugins/
   dsh-plugin-outline/         Browser-only session outline panel
   dsh-plugin-diff-viewer/     Read-only git diff and file browser panel
   dsh-plugin-session-id/      Session id label in the session header
+  dsh-plugin-mobile/          Phone-viewport ergonomics for the Web shell
   dsh-plugin-logo/            Custom Mon3tr brand mark and name
   dsh-plugin-image-model/     Image-generation endpoints as selectable models
   dsh-header-rewrite/         Header rewrite for LLM provider requests
@@ -49,6 +50,7 @@ tests/
   dsh-outline-smoke.mjs       Outline client smoke test
   dsh-diff-viewer-smoke.mjs   Diff viewer host routes and client contract test
   dsh-session-id-smoke.mjs    Session id header label client contract test
+  dsh-mobile-smoke.mjs        Mobile stylesheet, drawer scrim, and host anchor checks
   dsh-logo-smoke.mjs          Logo asset routes and brand-slot contract test
   dsh-image-model-smoke.mjs   Image adapter contract, prompt selection, admission limits
 ```
@@ -157,6 +159,19 @@ Important context behavior:
 - `package.json`: Web runtime/locale/conversation client injection and package exports.
 - Purpose is diagnosis: the session id ties a UI symptom to durable evidence (session logs, `compartments` rows, Dreamer notices) and is otherwise only visible in the URL.
 
+### `dsh-plugin-mobile`
+
+- `lib/index.js`: no-op Node entry; the browser half does all the work.
+- `lib/client.js`: one stylesheet wrapped in a single `@media (max-width: 640px)` block, plus one entry in the declared `shell.overlay` list slot rendering the drawer scrim. Nothing outside phone widths is touched.
+- The host is already responsive: `dsh-client-ui-layout` watches the frame with a ResizeObserver and auto-collapses the sidebar to its 56px rail below `SIDEBAR_AUTO_COLLAPSE` (1024px). What it does not do is change *how* the columns share the width, because all three stay in grid flow at every size. The plugin's 640px breakpoint is a deliberate strict subset of that 1024px narrow mode, which is what lets the drawer rules treat a missing `data-sidebar-collapsed` as "the user opened the sidebar on a phone" rather than a width preference.
+- The drawer is the substantive fix. With the sidebar open at 390px the host computes `grid-template-columns: 280px 110px 0` (`computeColumns` clamps an open sidebar to at least 264px), so the transcript reflows into 110px and wraps text one character per line; every open/close reflows the whole message list. The plugin collapses the track to `0 minmax(0,1fr) 0` and lets the sidebar paint over the conversation instead.
+- That override must keep the sidebar column **in** grid flow. `position: absolute` on it looked correct and measured wrong: removing it from flow shifts the remaining items one track left, so the conversation lands in the 0px track and the details column takes the `1fr` — Chrome at 390px reported a 0px conversation. `position: relative` with `overflow: visible` and `z-index: 25` keeps placement, lets the 280px content paint outside its 0px track, and still creates the stacking context that puts the drawer above the scrim.
+- The scrim occupies `shell.overlay` (declared `kind: "list"`, `scope: "root"`, rendered into `div[data-shell-overlay]` at `z-index: 20`, `pointer-events: none`). Its visibility is pure CSS keyed on the same `data-sidebar-collapsed` attribute, so no layout state is mirrored into the plugin and no MutationObserver is needed. It dismisses through the `layout` service (`toggleSidebar`), whose only surface is `toggleSidebar`/`openDetails`/`closeDetails` — occupants do **not** receive the declaring entry's store, because `storeOf` is per entry. `toggleSidebar` throws until the root entry attaches its actions, so the tap is guarded. `tabIndex: -1` keeps a viewport-sized element out of the tab order; the sidebar's own toggle stays the keyboard path.
+- Also drops the column drag handles (`div[data-side]`, `cursor: col-resize` with `touch-action: none`, unusable without a pointer but still eating vertical swipes) and sets `overscroll-behavior: contain` on `[data-conversation-scroll]`.
+- Two rules that a bundle read seemed to justify were **measured away and must not be re-added without new measurement**: an iOS focus-zoom fix (the composer input is `font-size: inherit` and its whole ancestor chain already computes 16px; the 13px `--dsw-font-xs-13` in the same bundle belongs to a different editor) and a horizontal-inset reclaim (`--dsh-composer-side-clearance` is not defined anywhere in this build, and the padded node is a hashed composer class with a hardcoded `padding: 0 24px`). The smoke test asserts both are absent.
+- The frame is selected as `div:has(> [data-shell-overlay])` — the element whose direct child is the declared overlay outlet, which is what the frame is by construction. Hashed CSS-module class names (`pI_x6G_frame`) change per build and are never selected.
+- Verified by driving Chrome over the DevTools Protocol at 390x844 with touch emulation, toggling `CSSStyleSheet.disabled` on the plugin's own style tag for a same-page before/after: conversation column 110px -> 390px with the sidebar open, drag handles 1 shown -> 0, overscroll `auto` -> `contain`, scrim `pointer-events` `none` -> `auto`, and a scripted scrim tap restoring `[56, 334, 0]`. Screenshots confirmed the drawer paints and that the host's unmodified 110px column really does wrap one character per line.
+
 ### `dsh-plugin-logo`
 
 - `lib/index.js`: serves the bundled SVGs under the `/logo` prefix (`/logo/mark`, `/logo/wordmark`) as immutable `image/svg+xml`.
@@ -260,7 +275,7 @@ Other useful context tests:
 - `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
 - `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-logo-smoke.mjs`, or `dsh-image-model-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, or `dsh-image-model-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one.
 
 ## Git and Editing Rules
 

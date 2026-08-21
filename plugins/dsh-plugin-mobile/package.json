@@ -1,0 +1,24 @@
+{
+  "name": "dsh-plugin-mobile",
+  "version": "0.1.0",
+  "description": "Phone-viewport ergonomics for the DSH Web shell: reclaim the conversation's horizontal inset, stop iOS focus zoom, drop pointer-only drag handles, and turn an expanded sidebar into a drawer instead of squeezing the conversation.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT"
+}

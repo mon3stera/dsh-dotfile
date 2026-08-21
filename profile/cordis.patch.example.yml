@@ -21,6 +21,15 @@
       name: dsh-plugin-diff-viewer
     - id: dsh-plugin-session-id
       name: dsh-plugin-session-id
+    # Phone-viewport ergonomics, active only below 640px (a strict subset of the
+    # host's own 1024px narrow mode). An expanded sidebar becomes a drawer over
+    # the conversation instead of squeezing it: the host keeps all three columns
+    # in grid flow at every width, so opening the sidebar on a 390px screen
+    # reflows the transcript into ~110px and wraps text one character per line.
+    # Also hides the pointer-only column drag handles and contains transcript
+    # overscroll. No effect above 640px.
+    - id: dsh-plugin-mobile
+      name: dsh-plugin-mobile
     # Image-generation endpoints as selectable models. Each declared model
     # appears in the model selector under its provider id; selecting one turns
     # the session into a generate-only route, because the adapter emits no tool
