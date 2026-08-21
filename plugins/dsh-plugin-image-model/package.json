@@ -9,7 +9,21 @@
     "./adapter": "./lib/adapter.js",
     "./images-api": "./lib/images-api.js",
     "./request": "./lib/request.js",
+    "./config": "./lib/config.js",
+    "./settings": "./lib/settings.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
   },
   "license": "MIT"
 }

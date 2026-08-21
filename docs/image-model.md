@@ -35,6 +35,13 @@ could continue, not because a check forbids it.
 
 ## Configuration
 
+The normal surface is the **Image models** section in Settings. It edits
+`$DSH_HOME/image-model/config.json` through two host routes and applies the
+result immediately: a save re-registers the adapter's route set in the running
+process, so no restart is involved.
+
+The loader patch stays supported as a deployment *seed*:
+
 ```yaml
 - id: dsh-plugin-image-model
   name: dsh-plugin-image-model
@@ -43,13 +50,17 @@ could continue, not because a check forbids it.
       - id: torchai-image          # appears as a provider in the model selector
         name: TorchAI Image
         baseURL: https://torchai.ai/v1
-        apiKeyEnv: OPENAI_API_KEY
+        apiKeyRef: OPENAI_API_KEY   # a credential the host store resolves
         edits: true                # refine the newest image in the session
         models:
           - id: gpt-image-1
             name: GPT Image 1
             size: '1024x1024'      # sent verbatim as `size`
 ```
+
+The settings file wins per provider id, and a provider deleted in the panel is
+recorded in `removed` so it does not reappear from the seed. `apiKeyEnv` is
+accepted as the older name for `apiKeyRef`.
 
 Per-model options are sent only when declared: `size`, `quality`, `background`,
 `outputFormat` (`output_format`), and `responseFormat` (`response_format`,
@@ -59,9 +70,43 @@ parameters they accept and an unknown one is rejected outright.
 
 A route is dropped rather than registered when it has no id, no `baseURL`, or no
 usable model. Registering it would put a provider in the selector that fails on
-first use. The credential is read per call, so a corrected environment variable
-takes effect without a restart and a missing one fails the request with
+first use. Normalization runs before persisting as well, so the file never holds
+an entry the runtime would silently ignore.
+
+### Credentials
+
+`apiKeyRef` is a credential *reference* — a POSIX identifier such as
+`OPENAI_API_KEY` — resolved through the host credential service at call time.
+That service already layers the process environment with its own storage, so the
+same reference works whether the value comes from the environment or from a key
+saved in the panel; the panel can write one because `credentials.set` is part of
+the public service. Values are never written to the plugin's config file, never
+returned by its routes, and never logged. Resolving per call means a corrected
+key takes effect without a restart, and a missing one fails the request with
 `MISSING_CREDENTIAL` instead of hiding the provider.
+
+### Why the panel is its own section
+
+The host's provider editor cannot host these routes. `registerConfigurableProviders()`
+would make an image provider appear in the host's Models list, but that page
+chooses its form by settings namespace:
+
+```js
+function layoutOf(ns) {
+  if (ns === "llm-deepseek") return "deepseek";
+  if (ns === "llm-pi-ai") return "pi-ai";
+  return "unknown";
+}
+```
+
+An unknown namespace renders a hint instead of fields, and `layout === "unknown"`
+is part of `submitDisabled` — the row would be visible and permanently
+uneditable. Writing into `llm-pi-ai` instead is not an option either: that
+namespace belongs to pi-ai, whose adapter would claim the routes and speak a chat
+protocol to an images endpoint. So this plugin owns its storage and registers its
+own section through `settings.section`, the same public list slot the host's own
+Models page uses. The smoke test pins `layoutOf` and that slot's `kind`, so a
+host change that makes reuse viable fails the test rather than going unnoticed.
 
 ## What becomes the prompt
 
@@ -127,6 +172,23 @@ encoded**, and 40 M decoded pixels. Those are reachable: a detailed PNG at
 generated image is the one image the user did not choose the shape of, so an
 admission refusal is rewritten to name the limit, the actual value, and the
 option that fixes it (a smaller `size`, or `outputFormat: jpeg`).
+
+## Reasoning effort must not be pinned onto an image route
+
+An image model declares no `reasoning` capability, and the host refuses any call
+that requests an effort for a model without one:
+
+```
+UNSUPPORTED_REASONING_EFFORT: provider "…" model "…" does not support reasoning effort "xhigh"
+```
+
+Selecting an image model in the Web picker is safe, because switching models
+sends `model.reasoning?.defaultEffort` — `undefined` here — and the default-model
+setting is replaced atomically, so a previously stored effort is dropped rather
+than carried over. The failure mode is a **hand-written** `settings.yaml` that
+keeps `reasoningEffort` under `agent-default-model` while pointing that entry at
+an image route. Remove the effort line in that case; it cannot apply to a route
+that does no reasoning.
 
 ## Failure classification
 

@@ -15,6 +15,7 @@
  * @module dsh-plugin-image-model/adapter
  */
 import { LlmAdapter, LlmError } from "@deepseek-ai/dsh-llm";
+import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import { requestImage } from "./images-api.js";
 import { findSourceImage, modelOptions, resolvePrompt, shouldGenerate } from "./request.js";
 
@@ -31,17 +32,39 @@ export class ImageModelAdapter extends LlmAdapter {
   #routes;
   /** @type {() => object | undefined} late-bound attachment store lookup. */
   #attachments;
+  /** @type {(() => object | undefined) | undefined} late-bound credential store lookup. */
+  #credentials;
   /** @type {typeof fetch} */
   #fetch;
 
   /**
-   * @param options - routes plus the injected attachment store and fetch.
+   * @param options - routes plus the injected attachment store, credential store, and fetch.
    */
-  constructor({ routes, attachments, fetchImpl = fetch }) {
+  constructor({ routes, attachments, credentials, fetchImpl = fetch }) {
     super();
     this.#routes = new Map(routes.map((route) => [route.id, route]));
     this.#attachments = attachments;
+    this.#credentials = credentials;
     this.#fetch = fetchImpl;
+  }
+
+  /**
+   * Replace the served routes in place.
+   *
+   * The settings panel changes routes while the process runs. The registration
+   * handle replaces the route *set* atomically, and this keeps the adapter's own
+   * view in step; swapping one map is a single assignment, so no in-flight call
+   * can observe a half-updated table.
+   *
+   * @param routes - the complete next route list.
+   */
+  setRoutes(routes) {
+    this.#routes = new Map(routes.map((route) => [route.id, route]));
+  }
+
+  /** Every provider id this adapter currently serves. */
+  routeIds() {
+    return [...this.#routes.keys()];
   }
 
   /** Resolve one configured route or fail with a stable code. */
@@ -98,20 +121,32 @@ export class ImageModelAdapter extends LlmAdapter {
   /**
    * Resolve the credential for one route at call time.
    *
-   * Read per call rather than at registration so a corrected environment takes
-   * effect without a restart, and so a missing key fails the request with a
-   * stable code instead of preventing the provider from being offered.
+   * Resolution goes through the host credential store, which already layers the
+   * environment with its own storage - so a reference such as `OPENAI_API_KEY`
+   * works whether the value came from the service environment or from a key the
+   * settings panel saved. Where no credential service is mounted, the
+   * environment is read directly so the plugin still works standalone.
+   *
+   * Read per call rather than at registration, so a corrected key takes effect
+   * without a restart and a missing one fails the request with a stable code
+   * instead of hiding the provider.
    */
-  #apiKey(route) {
-    if (route.apiKeyEnv === undefined) return undefined;
-    const value = process.env[route.apiKeyEnv];
-    if (typeof value !== "string" || value.trim() === "") {
-      throw new LlmError(
-        `image provider "${route.id}" needs ${route.apiKeyEnv}, which is unset or empty`,
-        "MISSING_CREDENTIAL",
-      );
+  async #apiKey(route) {
+    const ref = route.apiKeyRef;
+    if (ref === undefined) return undefined;
+    const store = this.#credentials?.();
+    if (store !== undefined) {
+      const resolved = await store.resolve(credentialRef(ref));
+      const value = typeof resolved?.value === "string" ? resolved.value.trim() : "";
+      if (value !== "") return value;
+    } else {
+      const value = process.env[ref];
+      if (typeof value === "string" && value.trim() !== "") return value.trim();
     }
-    return value.trim();
+    throw new LlmError(
+      `image provider "${route.id}" needs the credential ${ref}, which is unset or empty`,
+      "MISSING_CREDENTIAL",
+    );
   }
 
   /** Load the bytes of the image being refined. */
@@ -159,7 +194,7 @@ export class ImageModelAdapter extends LlmAdapter {
         "INVALID_REQUEST",
       );
     }
-    const apiKey = this.#apiKey(route);
+    const apiKey = await this.#apiKey(route);
     const prompt = resolvePrompt(options.messages);
     if (prompt === "") {
       throw new LlmError(

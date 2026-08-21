@@ -38,6 +38,11 @@
  */
 import z from "@deepseek-ai/schemastery";
 import { ImageModelAdapter, DEFAULT_CONTEXT_WINDOW } from "./adapter.js";
+// Route normalization lives in config.js so the settings bridge and this entry
+// share one definition of what a usable route is.
+import { configPath, createSettingsBridge } from "./settings.js";
+
+export { normalizeModel, normalizeRoute, normalizeRoutes, mergeProviders, isCredentialRef } from "./config.js";
 
 export const name = "dsh-plugin-image-model";
 
@@ -48,6 +53,7 @@ export const Config = z.object({
         id: z.string(),
         name: z.string(),
         baseURL: z.string(),
+        apiKeyRef: z.string(),
         apiKeyEnv: z.string(),
         edits: z.boolean().default(true),
         contextWindow: z.number().default(DEFAULT_CONTEXT_WINDOW),
@@ -70,86 +76,64 @@ export const Config = z.object({
     .default([]),
 });
 
-/**
- * Validate and normalize one configured route.
- *
- * A route with no usable id, baseURL, or model is dropped rather than
- * registered, because registering it would put a provider in the model selector
- * that fails on first use.
- *
- * @param route - one raw configuration entry.
- * @returns the normalized route, or undefined when it is unusable.
- */
-export function normalizeRoute(route) {
-  const id = typeof route?.id === "string" ? route.id.trim() : "";
-  const baseURL = typeof route?.baseURL === "string" ? route.baseURL.trim() : "";
-  if (id === "" || baseURL === "") return undefined;
-  const models = (Array.isArray(route.models) ? route.models : [])
-    .map((model) => {
-      const modelId = typeof model?.id === "string" ? model.id.trim() : "";
-      if (modelId === "") return undefined;
-      return {
-        id: modelId,
-        name: typeof model.name === "string" && model.name !== "" ? model.name : modelId,
-        ...typeof model.description === "string" && model.description !== "" ? { description: model.description } : {},
-        ...typeof model.size === "string" && model.size !== "" ? { size: model.size } : {},
-        ...typeof model.quality === "string" && model.quality !== "" ? { quality: model.quality } : {},
-        ...typeof model.background === "string" && model.background !== "" ? { background: model.background } : {},
-        ...typeof model.outputFormat === "string" && model.outputFormat !== "" ? { outputFormat: model.outputFormat } : {},
-        ...typeof model.responseFormat === "string" && model.responseFormat !== "" ? { responseFormat: model.responseFormat } : {},
-      };
-    })
-    .filter((model) => model !== undefined);
-  if (models.length === 0) return undefined;
-  const contextWindow = Number.isSafeInteger(route.contextWindow) && route.contextWindow > 0
-    ? route.contextWindow
-    : DEFAULT_CONTEXT_WINDOW;
-  return {
-    id,
-    name: typeof route.name === "string" && route.name !== "" ? route.name : id,
-    baseURL,
-    ...typeof route.apiKeyEnv === "string" && route.apiKeyEnv !== "" ? { apiKeyEnv: route.apiKeyEnv } : {},
-    edits: route.edits !== false,
-    contextWindow,
-    models,
-  };
-}
-
-/**
- * Normalize the whole provider list, rejecting duplicate ids.
- * @param providers - the raw configured provider list.
- * @returns usable routes in configuration order.
- */
-export function normalizeRoutes(providers) {
-  const seen = new Set();
-  const routes = [];
-  for (const raw of Array.isArray(providers) ? providers : []) {
-    const route = normalizeRoute(raw);
-    if (route === undefined || seen.has(route.id)) continue;
-    seen.add(route.id);
-    routes.push(route);
-  }
-  return routes;
-}
-
 export function apply(ctx, config) {
-  const routes = normalizeRoutes(config?.providers);
-  if (routes.length === 0) {
-    ctx.logger?.info?.("dsh-plugin-image-model: no usable image providers configured");
-    return;
-  }
-  // The llm registry is the only hard dependency. Attachments are resolved
-  // lazily per call: the store is mounted by the host, and a call that arrives
-  // without it must fail with a clear reason rather than prevent registration.
+  const seed = Array.isArray(config?.providers) ? config.providers : [];
+  // The llm registry is the only hard dependency. Attachments and credentials
+  // are resolved lazily per call: they are mounted by the host, and a call that
+  // arrives without them must fail with a clear reason rather than prevent the
+  // provider from being offered at all.
   ctx.inject(["llm"], (llmCtx) => {
+    const credentials = () => llmCtx.get("credentials");
     const adapter = new ImageModelAdapter({
-      routes,
+      routes: [],
       attachments: () => llmCtx.get("attachments"),
+      credentials,
     });
-    // The registration handle is itself the disposer, so it is returned directly.
-    llmCtx.effect(
-      () => llmCtx.llm.registerAdapter(routes.map((route) => route.id), adapter),
-      `${name}: image adapters`,
-    );
+
+    // The registration is created on first use rather than at boot:
+    // `registerAdapter` rejects an empty initial route set, and a fresh install
+    // has no providers until the settings panel adds one. Once it exists,
+    // `replace` swaps the whole set atomically, so no request sees a gap - and an
+    // empty set is legal there, so removing every provider is also fine.
+    let handle;
+    const applyRoutes = (routes) => {
+      adapter.setRoutes(routes);
+      const ids = routes.map((route) => route.id);
+      if (handle === undefined) {
+        if (ids.length === 0) return;
+        handle = llmCtx.llm.registerAdapter(ids, adapter);
+        return;
+      }
+      handle.replace(ids);
+    };
+
+    const bridge = createSettingsBridge({
+      seed,
+      path: configPath(),
+      credentials,
+      onChange: applyRoutes,
+      logger: llmCtx.logger,
+    });
+
+    llmCtx.effect(() => {
+      applyRoutes(bridge.effective());
+      return () => {
+        handle?.();
+        handle = undefined;
+      };
+    }, `${name}: image adapters`);
+
+    // The settings panel needs these routes. A deployment without a web server
+    // still runs on whatever the loader patch and the settings file declare.
+    llmCtx.inject(["webServer"], (httpCtx) => {
+      httpCtx.effect(
+        () => httpCtx.webServer.register({ kind: "exact", path: "/image-model/config", handler: bridge.handleConfig }),
+        `${name}: config route`,
+      );
+      httpCtx.effect(
+        () => httpCtx.webServer.register({ kind: "exact", path: "/image-model/credential", handler: bridge.handleCredential }),
+        `${name}: credential route`,
+      );
+    });
   });
 }

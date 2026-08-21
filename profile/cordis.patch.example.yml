@@ -29,6 +29,13 @@
     # scratch, which is what a follow-up like "make it bluer" needs. Only the
     # options declared per model are sent, since gateways reject parameters they
     # do not recognize.
+    #
+    # This block is only a seed. The "Image models" settings section edits
+    # $DSH_HOME/image-model/config.json, which wins per provider id and applies
+    # without a restart, so the panel is the normal way to manage these. A
+    # provider deleted in the panel stays deleted even while it is seeded here.
+    # `apiKeyRef` names a credential the host store resolves - an environment
+    # variable of that name, or a key saved in the panel.
     - id: dsh-plugin-image-model
       name: dsh-plugin-image-model
       config:
@@ -36,7 +43,7 @@
           - id: torchai-image
             name: TorchAI Image
             baseURL: https://torchai.ai/v1
-            apiKeyEnv: OPENAI_API_KEY
+            apiKeyRef: OPENAI_API_KEY
             edits: true
             models:
               - id: gpt-image-1

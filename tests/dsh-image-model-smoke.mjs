@@ -5,7 +5,10 @@
 // an image block into an assistant node, and `registerAdapter` must stay the
 // registration seam. Those are cross-checked against the installed host, so a
 // future upgrade fails here instead of silently producing invisible images.
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import vm from "node:vm";
 
 // Imports target the mirrored runtime copy, per the repository test convention.
 
@@ -13,9 +16,18 @@ import {
   Config,
   apply,
   name as pluginName,
+  isCredentialRef,
+  mergeProviders,
   normalizeRoute,
   normalizeRoutes,
 } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-image-model/lib/index.js";
+import {
+  configPath,
+  createSettingsBridge,
+  describeCredentials,
+  readConfig,
+  writeConfig,
+} from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-image-model/lib/settings.js";
 import {
   DEFAULT_CONTEXT_WINDOW,
   ImageModelAdapter,
@@ -115,10 +127,11 @@ const routes = normalizeRoutes([
 ]);
 eq(routes.length, 1, "duplicate and unusable routes are rejected");
 
-// apply() must not register anything when nothing usable is configured.
+// apply() always takes the llm dependency now: the settings panel can add the
+// first provider while the process runs, so registration is deferred, not skipped.
 let injected = false;
 apply({ inject: () => { injected = true; }, logger: { info() {} } }, { providers: [] });
-eq(injected, false, "no adapter is registered without a usable provider");
+eq(injected, true, "apply injects llm even with nothing configured, so a later save can register");
 
 // ------------------------------------------------------------------ request
 eq(messageText(userMessage("hello")), "hello", "text extracted");
@@ -234,7 +247,7 @@ function makeAdapter(overrides = {}) {
       id: "img",
       name: "Image",
       baseURL: "https://example.test/v1",
-      apiKeyEnv: "IMG_TEST_KEY",
+      apiKeyRef: "IMG_TEST_KEY",
       edits: true,
       contextWindow: 4096,
       models: [{ id: "gpt-image-1", name: "GPT Image 1", size: "1024x1024" }],
@@ -440,6 +453,263 @@ eq(fileNameFor("A Cat!!", "image/png"), "a-cat.png", "file name slugged");
 eq(fileNameFor("", "image/jpeg"), "image.jpg", "empty prompt yields a default name");
 eq(fileNameFor("../../etc/passwd", "image/png"), "etc-passwd.png", "path separators cannot survive the slug");
 
+// -------------------------------------------------------- settings persistence
+// The settings file is the panel's storage; the loader patch is only a seed.
+eq(isCredentialRef("OPENAI_API_KEY"), true, "a POSIX identifier is a valid credential reference");
+eq(isCredentialRef("_key1"), true, "a leading underscore is valid");
+eq(isCredentialRef("2KEY"), false, "a leading digit is rejected");
+eq(isCredentialRef("MY-KEY"), false, "a hyphen is rejected");
+eq(isCredentialRef("MY KEY"), false, "whitespace is rejected");
+eq(isCredentialRef(""), false, "an empty reference is rejected");
+
+const withRef = normalizeRoute({ id: "a", baseURL: "https://x/v1", apiKeyRef: "K", models: [{ id: "m" }] });
+eq(withRef.apiKeyRef, "K", "apiKeyRef is kept");
+const withEnv = normalizeRoute({ id: "a", baseURL: "https://x/v1", apiKeyEnv: "LEGACY_KEY", models: [{ id: "m" }] });
+eq(withEnv.apiKeyRef, "LEGACY_KEY", "the older apiKeyEnv name still resolves as a credential reference");
+eq(
+  normalizeRoute({ id: "a", baseURL: "https://x/v1", apiKeyRef: "bad-ref", models: [{ id: "m" }] }).apiKeyRef,
+  undefined,
+  "an unusable reference is dropped rather than stored",
+);
+
+eq(
+  mergeProviders([{ id: "seeded", baseURL: "https://seed/v1" }], { providers: [{ id: "seeded", baseURL: "https://file/v1" }] })[0].baseURL,
+  "https://file/v1",
+  "the settings file wins over the seed for the same id",
+);
+eq(
+  mergeProviders([{ id: "seeded" }], { removed: ["seeded"] }).length,
+  0,
+  "a provider removed in the panel does not come back from the seed",
+);
+eq(
+  mergeProviders([{ id: "seeded" }], { providers: [{ id: "added" }] }).length,
+  2,
+  "seed and file entries coexist when their ids differ",
+);
+
+const home = mkdtempSync(join(tmpdir(), "dsh-image-settings-"));
+const path = configPath(home);
+ok(path.endsWith(join("image-model", "config.json")), "config path is namespaced under the DSH home");
+eq(readConfig(path).providers.length, 0, "a missing config file reads as empty");
+mkdirSync(dirname(path), { recursive: true });
+writeFileSync(path, "{ not json");
+eq(readConfig(path).providers.length, 0, "a corrupt config file reads as empty instead of breaking the panel");
+writeConfig(path, { providers: [{ id: "kept" }], removed: [] });
+eq(readConfig(path).providers[0].id, "kept", "a written document round-trips");
+eq(readdirSync(dirname(path)).filter((entry) => entry.endsWith(".tmp")).length, 0, "no temporary file survives an atomic write");
+
+// ------------------------------------------------------------ settings bridge
+class FakeCredentials {
+  constructor() { this.values = new Map(); }
+  async resolve(ref) { return this.values.has(ref) ? { value: this.values.get(ref), source: "file" } : undefined; }
+  async describe(ref) { return { configured: this.values.has(ref), writable: true, source: this.values.has(ref) ? "file" : undefined }; }
+  async set(ref, value) { this.values.set(ref, value); }
+  async unset(ref) { this.values.delete(ref); }
+}
+
+/** Minimal request/response doubles matching what the host web server passes. */
+function request(method, body) {
+  const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
+  return { method, [Symbol.asyncIterator]: async function* () { yield* chunks; } };
+}
+function response() {
+  return {
+    status: undefined,
+    headers: undefined,
+    body: "",
+    writeHead(status, headers) { this.status = status; this.headers = headers; },
+    end(text) { this.body = text ?? ""; },
+    get json() { return this.body === "" ? undefined : JSON.parse(this.body); },
+  };
+}
+
+const bridgeHome = mkdtempSync(join(tmpdir(), "dsh-image-bridge-"));
+const bridgePath = configPath(bridgeHome);
+const credentials = new FakeCredentials();
+credentials.values.set("SEED_KEY", "secret-value");
+const applied = [];
+const bridge = createSettingsBridge({
+  seed: [{ id: "seeded", baseURL: "https://seed/v1", apiKeyRef: "SEED_KEY", models: [{ id: "seed-model" }] }],
+  path: bridgePath,
+  credentials: () => credentials,
+  onChange: (routes) => applied.push(routes.map((route) => route.id)),
+});
+
+let res = response();
+await bridge.handleConfig(request("GET"), res);
+eq(res.status, 200, "GET config answers 200");
+eq(res.json.providers[0].id, "seeded", "GET config reports the seeded route");
+eq(res.json.seeded[0], "seeded", "GET config marks which ids came from the loader patch");
+eq(res.json.credentials.SEED_KEY.configured, true, "a configured credential is reported as configured");
+ok(!res.body.includes("secret-value"), "a credential value never reaches the panel");
+
+res = response();
+await bridge.handleConfig(request("POST", {
+  providers: [
+    { id: "added", baseURL: "https://added/v1", apiKeyRef: "ADDED_KEY", models: [{ id: "added-model", size: "1024x1024" }] },
+    { id: "junk", baseURL: "https://junk/v1", models: [] },
+  ],
+}), res);
+eq(res.status, 200, "POST config answers 200");
+eq(res.json.providers.length, 1, "a provider without a usable model is not persisted");
+eq(res.json.providers[0].id, "added", "the saved provider is returned");
+eq(applied.length, 1, "saving re-registers the routes in the running process");
+eq(JSON.stringify(applied[0]), JSON.stringify(["added"]), "the applied route set matches what was saved");
+eq(readConfig(bridgePath).removed[0], "seeded", "dropping a seeded provider records it as removed");
+res = response();
+await bridge.handleConfig(request("GET"), res);
+eq(res.json.providers.length, 1, "the removed seed does not return on the next read");
+eq(res.json.providers[0].models[0].size, "1024x1024", "declared generation options persist");
+
+res = response();
+await bridge.handleConfig(request("DELETE"), res);
+eq(res.status, 405, "an unsupported method is refused");
+
+res = response();
+await bridge.handleConfig({ method: "POST", [Symbol.asyncIterator]: async function* () { yield Buffer.from("{ broken"); } }, res);
+eq(res.status, 400, "an unparsable body is refused");
+
+// ---------------------------------------------------------- credential route
+res = response();
+await bridge.handleCredential(request("POST", { ref: "ADDED_KEY", value: "pasted" }), res);
+eq(res.status, 200, "storing a credential answers 200");
+eq(credentials.values.get("ADDED_KEY"), "pasted", "the value goes to the host credential store");
+ok(!res.body.includes("pasted"), "the stored value is not echoed back");
+eq(res.json.credentials.ADDED_KEY.configured, true, "the panel learns the credential is now configured");
+
+res = response();
+await bridge.handleCredential(request("POST", { ref: "ADDED_KEY", value: "" }), res);
+eq(credentials.values.has("ADDED_KEY"), false, "an empty value unsets the credential");
+
+res = response();
+await bridge.handleCredential(request("POST", { ref: "not a ref", value: "x" }), res);
+eq(res.status, 400, "an invalid credential reference is refused");
+
+res = response();
+await bridge.handleCredential(request("GET"), res);
+eq(res.status, 405, "the credential route only accepts writes");
+
+const bridgeless = createSettingsBridge({ seed: [], path: configPath(mkdtempSync(join(tmpdir(), "dsh-image-nocred-"))), credentials: () => undefined });
+res = response();
+await bridgeless.handleCredential(request("POST", { ref: "K", value: "v" }), res);
+eq(res.status, 503, "without a credential service the route says so instead of failing opaquely");
+eq(Object.keys(await describeCredentials(() => undefined, [{ apiKeyRef: "K" }])).length, 0, "describing credentials without a service yields nothing");
+
+// -------------------------------------------------- live registration through apply
+class FakeHandle {
+  constructor(ids) { this.ids = ids; this.disposed = false; }
+  replace(ids) { this.ids = ids; }
+}
+const liveHome = mkdtempSync(join(tmpdir(), "dsh-image-live-"));
+process.env.DSH_HOME = liveHome;
+const registrations = [];
+let liveHandle;
+const llmCtx = {
+  get: () => undefined,
+  logger: { warn() {}, info() {} },
+  effect: (factory) => { const dispose = factory(); return dispose; },
+  inject: () => {},
+  llm: {
+    registerAdapter(ids, adapter) {
+      registrations.push([...ids]);
+      liveHandle = Object.assign(function dispose() { liveHandle.disposed = true; }, new FakeHandle(ids));
+      liveHandle.replace = (next) => { liveHandle.ids = next; registrations.push([...next]); };
+      liveHandle.adapter = adapter;
+      return liveHandle;
+    },
+  },
+};
+apply({ inject: (_deps, callback) => callback(llmCtx), logger: llmCtx.logger }, { providers: [] });
+eq(registrations.length, 0, "an empty configuration registers nothing, since an empty initial route set is rejected");
+
+const liveRoutes = [{ id: "live", baseURL: "https://live/v1", models: [{ id: "m" }] }];
+apply({ inject: (_deps, callback) => callback(llmCtx), logger: llmCtx.logger }, { providers: liveRoutes });
+eq(JSON.stringify(registrations[0]), JSON.stringify(["live"]), "a configured provider registers at boot");
+eq(liveHandle.adapter.routeIds()[0], "live", "the adapter serves the registered route");
+liveHandle.adapter.setRoutes([{ id: "swapped", baseURL: "https://x/v1", models: [{ id: "m" }] }]);
+eq(liveHandle.adapter.routeIds()[0], "swapped", "setRoutes swaps the served table in one assignment");
+delete process.env.DSH_HOME;
+
+// -------------------------------------------- credential resolution in the adapter
+const credAdapter = new ImageModelAdapter({
+  routes: [{ id: "p", name: "P", baseURL: "https://x/v1", apiKeyRef: "STORE_KEY", edits: false, contextWindow: 4096, models: [{ id: "m", name: "m" }] }],
+  attachments: () => undefined,
+  credentials: () => credentials,
+});
+credentials.values.set("STORE_KEY", "from-store");
+let sent;
+const credStream = new ImageModelAdapter({
+  routes: [{ id: "p", name: "P", baseURL: "https://x/v1", apiKeyRef: "STORE_KEY", edits: false, contextWindow: 4096, models: [{ id: "m", name: "m" }] }],
+  attachments: () => ({ async saveImage() { return { id: "sha256:x", mediaType: "image/png", width: 1, height: 1, bytes: 1 }; } }),
+  credentials: () => credentials,
+  fetchImpl: async (_url, options) => {
+    sent = options;
+    return okResponse({ data: [{ b64_json: Buffer.from(PNG).toString("base64") }] });
+  },
+});
+for await (const _chunk of credStream.stream({ provider: "p", model: "m", messages: [userMessage("a cat")] })) { /* drain */ }
+eq(sent.headers.authorization, "Bearer from-store", "the key resolved through the credential store reaches the request");
+
+credentials.values.delete("STORE_KEY");
+await throwsWithCode(
+  () => collect(credAdapter.stream({ provider: "p", model: "m", messages: [userMessage("a cat")] })),
+  "MISSING_CREDENTIAL",
+  "an unset credential fails with a stable code",
+);
+
+// ------------------------------------------------------------------ client half
+const clientSource = readFileSync(new URL("../plugins/dsh-plugin-image-model/lib/client.js", import.meta.url), "utf8");
+let capturedClient;
+globalThis.window = { __ModuleLoader__: { load: (entry) => { capturedClient = entry; } } };
+const styleTags = [];
+globalThis.document = {
+  head: { appendChild: (tag) => styleTags.push(tag) },
+  createElement: () => ({ dataset: {}, textContent: "", remove() {} }),
+};
+vm.runInThisContext(clientSource, { filename: "dsh-plugin-image-model/lib/client.js" });
+eq(capturedClient?.id, "dsh-plugin-image-model", "client module id");
+const clientModule = capturedClient.factory((spec) => {
+  if (spec === "react") {
+    return {
+      useState: (initial) => [typeof initial === "function" ? initial() : initial, () => {}],
+      useEffect: () => {},
+      useCallback: (fn) => fn,
+      useMemo: (factory) => factory(),
+      useRef: (value) => ({ current: value }),
+    };
+  }
+  if (spec === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }) };
+  throw new Error(`unexpected require: ${spec}`);
+});
+eq(clientModule.name, "dsh-plugin-image-model", "client plugin name");
+eq(JSON.stringify(clientModule.inject), JSON.stringify(["slots", "locale"]), "client inject contract");
+eq(clientModule.blankProvider(2).models.length, 1, "a new provider starts with one model row");
+eq(clientModule.blankProvider(2).edits, true, "refinement is on by default for a new provider");
+eq(clientModule.providersOf({ providers: [{ id: "x" }] }).length, 1, "a provider list is read from the response");
+eq(clientModule.providersOf({ ok: false }).length, 0, "a failure body yields no providers");
+
+const slotRegistrations = [];
+const clientCtx = {
+  effect: (factory) => { factory(); },
+  locale: { register: () => () => {}, bind: () => (key) => key },
+  slots: {
+    inject: (_name, register) => register(),
+    register: (entry, component) => { slotRegistrations.push({ entry, component }); return () => {}; },
+  },
+};
+clientModule.apply(clientCtx);
+eq(slotRegistrations.length, 1, "the client registers exactly one settings section");
+eq(slotRegistrations[0].entry.name, "settings.section", "it uses the public settings.section slot");
+eq(slotRegistrations[0].entry.id, "image-models", "section id");
+eq(slotRegistrations[0].entry.locale, "dsh-plugin-image-model", "the section declares its locale namespace");
+ok(slotRegistrations[0].entry.order > 10, "the section sorts after the host's own Models section");
+eq(styleTags.length, 1, "the client injects exactly one style tag");
+eq(styleTags[0].dataset.plugin, "dsh-plugin-image-model", "the style tag is attributable to this plugin");
+ok(!/--dsw-alias-bg-base/.test(clientSource), "the panel does not paint the token the wallpaper plugin forces transparent");
+ok(/loading/.test(String(slotRegistrations[0].component({ t: (key) => key })?.props?.children)), "the section renders a loading state before the first fetch");
+
+
 // ------------------------------------------------- installed-host cross-checks
 const llmTypes = readFileSync(`${HOST}/dsh-llm/lib/types/types.d.ts`, "utf8");
 ok(/'image':\s*ImageBlock/.test(llmTypes), "the host still declares an image content block");
@@ -458,5 +728,25 @@ ok(/case "image": \{\s*const start = i;/.test(conversation), "AssistantMarkdown 
 const attachmentTypes = readFileSync(`${HOST}/dsh-attachment/lib/types/index.d.ts`, "utf8");
 ok(attachmentTypes.includes("abstract saveImage"), "saveImage is still the commit seam");
 ok(attachmentTypes.includes("abstract readImage"), "readImage is still available for refinement");
+
+// The panel exists because the host's provider editor cannot host a third-party
+// namespace: it selects its form by namespace name and disables submit for an
+// unknown one. If that ever changes, this design should be revisited.
+const settingsModels = readFileSync(`${HOST}/dsh-client-ui-settings-models/lib/client.js`, "utf8");
+ok(/function layoutOf\(ns\)/.test(settingsModels), "the host still picks a provider form by settings namespace");
+ok(settingsModels.includes('if (ns === "llm-pi-ai") return "pi-ai";'), "only the host's own namespaces have an editor");
+ok(/return "unknown"/.test(settingsModels), "any other namespace still falls through to unknown");
+ok(/layout === "unknown"/.test(settingsModels), "an unknown namespace still renders the inert branch with submit disabled");
+const settingsGeneral = readFileSync(`${HOST}/dsh-client-ui-settings-general/lib/client.js`, "utf8");
+ok(/"settings\.section": \{\s*kind: "list"/.test(settingsGeneral), "settings.section is still a list slot a plugin may join");
+
+const credentialTypes = readFileSync(`${HOST}/dsh-credentials/lib/types/index.d.ts`, "utf8");
+for (const method of ["abstract resolve", "abstract describe", "abstract set", "abstract unset"]) {
+  ok(credentialTypes.includes(method), `the credential service still exposes ${method.split(" ")[1]}`);
+}
+ok(credentialTypes.includes("export declare function credentialRef"), "credentialRef is still the branding helper");
+
+const llmDirectory = readFileSync(`${HOST}/dsh-llm/lib/types/index.d.ts`, "utf8");
+ok(llmDirectory.includes("replace(entries"), "a registration handle still replaces its route set atomically");
 
 console.log(`image-model ok (${checks} checks)`);
