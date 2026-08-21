@@ -31,6 +31,7 @@ plugins/
   dsh-plugin-outline/         Browser-only session outline panel
   dsh-plugin-diff-viewer/     Read-only git diff and file browser panel
   dsh-plugin-session-id/      Session id label in the session header
+  dsh-plugin-logo/            Custom Mon3tr brand mark and name
   dsh-header-rewrite/         Header rewrite for LLM provider requests
 
 profile/
@@ -46,6 +47,7 @@ tests/
   dsh-outline-smoke.mjs       Outline client smoke test
   dsh-diff-viewer-smoke.mjs   Diff viewer host routes and client contract test
   dsh-session-id-smoke.mjs    Session id header label client contract test
+  dsh-logo-smoke.mjs          Logo asset routes and brand-slot contract test
 ```
 
 ## Plugin Structure
@@ -152,6 +154,15 @@ Important context behavior:
 - `package.json`: Web runtime/locale/conversation client injection and package exports.
 - Purpose is diagnosis: the session id ties a UI symptom to durable evidence (session logs, `compartments` rows, Dreamer notices) and is otherwise only visible in the URL.
 
+### `dsh-plugin-logo`
+
+- `lib/index.js`: serves the bundled SVGs under the `/logo` prefix (`/logo/mark`, `/logo/wordmark`) as immutable `image/svg+xml`.
+- `lib/client.js`: occupies the three declared brand slots - `sidebar.brand.mark` (wide row and collapsed rail, owner prop `size: 24`), `sidebar.brand.name` (the occupant owns its content and width), and `conversation.hero.brand.mark` (`size: 34` plus a `className` carrying the hero hover animation, so it must be forwarded).
+- All three are `kind: "single"` and already occupied by `@deepseek-ai/dsh-client-ui-brand-official` at the default priority 0. A single slot **throws** on a second registration at the same priority and renders the **lowest** priority present, so this plugin registers at `priority: -1`. `entriesOfSlot` de-duplicates a single slot to its first sorted entry, and a component that throws is marked abdicated, which makes the shipped occupant a live fallback.
+- Each slot is registered independently rather than as one nested `slots.inject` chain, so a shell that stops declaring one of them still brands the other two.
+- `assets/mon3tr-logo.svg` is white-on-transparent, so the light theme applies `filter: invert(1)`; `assets/mon3tr-wordmark.svg` is full-colour and must never be inverted. The Harness pill is reproduced in CSS from `--dsw-alias-label-primary` on `--dsw-alias-label-primary-inverted` text; it cannot use `background: currentColor`, because in the same rule `currentColor` resolves against that rule's own `color`.
+- This replaced a DOM-scanning implementation that matched the brand SVG by `viewBox` and hid it behind an inserted sibling. It half-broke on a DSH update that began rendering the name through `BrandWordmark({ includeMark: false })`, whose viewBox is `26 0 156 24` instead of `0 0 182 24`: the mark still matched, so only the lettering reverted to the stock artwork. Prefer a declared slot over host geometry.
+
 ### `dsh-header-rewrite`
 
 - `lib/index.js`: wraps the global `fetch` once and applies configurable header rules (set/delete) matched by host, path, body model, and method. Rules come from the persisted `$DSH_HOME/header-rewrite/config.yaml` (validated, applied immediately) or the patch config as seed; the `/header-rewrite/config` route reads and writes that file. Use it to adapt to gateways with strict client policies (e.g. a User-Agent allowlist that rejects the harness attribution header).
@@ -229,7 +240,7 @@ Other useful context tests:
 - `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
 - `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, or `dsh-session-id-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, or `dsh-logo-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary.
 
 ## Git and Editing Rules
 

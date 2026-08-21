@@ -1,9 +1,24 @@
 /**
  * Browser half of dsh-plugin-logo.
  *
- * The built-in brand is one SVG wordmark. Keep the React-owned SVG in the DOM
- * but hide it, then place a sibling replacement so React can continue to own
- * the original node without fighting the plugin.
+ * The shell exposes branding as three declared `single` slots, so this plugin
+ * registers occupants instead of rewriting the DOM:
+ *
+ *   sidebar.brand.mark          owner props { size }            (wide row + collapsed rail)
+ *   sidebar.brand.name          owner props {}                  (occupant owns content and width)
+ *   conversation.hero.brand.mark owner props { size, className } (hero headline)
+ *
+ * `@deepseek-ai/dsh-client-ui-brand-official` already occupies all three at the
+ * default priority 0. A `single` slot rejects a second registration at the *same*
+ * priority and renders the lowest priority present, so these register at -1 to
+ * shadow the shipped occupant while leaving it in place as a fallback.
+ *
+ * This replaces an earlier DOM-scanning implementation that matched the brand
+ * SVG by `viewBox` and hid it behind a sibling. That broke when the shell began
+ * rendering the name through `BrandWordmark({ includeMark: false })`, whose
+ * viewBox is `26 0 156 24` rather than `0 0 182 24`: the mark still matched, so
+ * only the lettering reverted to the stock artwork. Slots carry no such
+ * coupling to host geometry.
  */
 window.__ModuleLoader__.load({
   id: "dsh-plugin-logo",
@@ -12,23 +27,29 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
+    const { jsx, jsxs } = require("react/jsx-runtime");
+
     const name = "dsh-plugin-logo";
-    const SVG_NS = "http://www.w3.org/2000/svg";
-    const FULL_VIEWBOX = "0 0 182 24";
-    const COMPACT_VIEWBOX = "0 0 23.16 17.04";
     const MARK_URL = "/logo/mark";
     const WORDMARK_URL = "/logo/wordmark";
-    const replacements = new Map();
-    let harnessId = 0;
+    /** assets/mon3tr-logo.svg is `viewBox="0 0 809 744"`; keep that ratio at any size. */
+    const MARK_ASPECT = 809 / 744;
+    /** Below the shipped occupant's default 0. For a single slot the lowest priority renders. */
+    const PRIORITY = -1;
+    const BRAND_SLOTS = ["sidebar.brand.mark", "sidebar.brand.name", "conversation.hero.brand.mark"];
 
+    // The mark art is white-on-transparent, so the light theme inverts it. The
+    // wordmark is full-colour and must never be inverted. The badge reproduces
+    // the shell's own Harness pill (a 52x14 rx=2 rect filled `currentColor`
+    // with inverted lettering); it takes the fill from an explicit token rather
+    // than `currentColor`, because within one rule `currentColor` resolves
+    // against that same rule's `color` and would paint the pill on itself.
     const CSS = `
-svg[data-dsh-logo-source]{display:none!important}
-.dsh-plugin-logo-full{box-sizing:border-box;display:inline-flex;align-items:center;flex:none;min-width:0;height:24px;gap:6px;line-height:0;color:var(--dsw-alias-label-primary)}
-.dsh-plugin-logo-mark{display:block;flex:none;width:26px;height:24px;object-fit:contain}
-.dsh-plugin-logo-wordmark{display:block;flex:none;width:auto;max-width:98px;height:16px;object-fit:contain}
-.dsh-plugin-logo-harness{display:block;flex:none;width:52px;height:24px;overflow:visible;color:var(--dsw-alias-label-primary)}
-.dsh-plugin-logo-compact{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;flex:none;width:24px;height:24px;line-height:0;color:var(--dsw-alias-label-primary)}
+.dsh-plugin-logo-mark{display:block;flex:none;object-fit:contain}
 body:not([data-ds-dark-theme]) .dsh-plugin-logo-mark{filter:invert(1)}
+.dsh-plugin-logo-name{display:inline-flex;align-items:center;gap:6px;min-width:0;line-height:0}
+.dsh-plugin-logo-wordmark{display:block;flex:none;width:auto;max-width:98px;height:16px;object-fit:contain}
+.dsh-plugin-logo-badge{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;flex:none;height:14px;padding:0 5px;border-radius:2px;background:var(--dsw-alias-label-primary);color:var(--dsw-alias-label-primary-inverted);font-size:10px;font-weight:600;line-height:14px;letter-spacing:.02em}
 `;
 
     function injectCss() {
@@ -41,135 +62,63 @@ body:not([data-ds-dark-theme]) .dsh-plugin-logo-mark{filter:invert(1)}
       return style;
     }
 
-    function createImage(url, className, alt) {
-      const image = document.createElement("img");
-      image.className = className;
-      image.src = url;
-      image.alt = alt;
-      image.decoding = "async";
-      image.draggable = false;
-      return image;
-    }
-
-    /** Clone the original Harness badge paths into a small inline SVG. */
-    function createHarness(source) {
-      const rect = Array.from(source.children).find((child) => (
-        child.localName === "rect" && child.getAttribute("x") === "129.348" && child.getAttribute("width") === "52"
-      ));
-      const badgeGroup = Array.from(source.children).find((child) => (
-        child.localName === "g" && String(child.getAttribute("clip-path") || "").includes("badge-clip")
-      ));
-      const badgeClip = source.querySelector('clipPath[id*="badge-clip"]');
-      if (!rect || !badgeGroup || !badgeClip) {
-        const fallback = document.createElement("span");
-        fallback.className = "dsh-plugin-logo-harness-fallback";
-        fallback.textContent = "Harness";
-        return fallback;
-      }
-
-      harnessId += 1;
-      const clipId = `${name}-harness-clip-${harnessId}`;
-      const svg = document.createElementNS(SVG_NS, "svg");
-      svg.classList.add("dsh-plugin-logo-harness");
-      svg.setAttribute("viewBox", "129.348 0 52 24");
-      svg.setAttribute("aria-hidden", "true");
-      svg.setAttribute("focusable", "false");
-      svg.appendChild(rect.cloneNode(true));
-
-      const group = badgeGroup.cloneNode(true);
-      group.setAttribute("clip-path", `url(#${clipId})`);
-      svg.appendChild(group);
-
-      const defs = document.createElementNS(SVG_NS, "defs");
-      const clip = badgeClip.cloneNode(true);
-      clip.setAttribute("id", clipId);
-      defs.appendChild(clip);
-      svg.appendChild(defs);
-      return svg;
-    }
-
-    function createFullReplacement(source) {
-      const root = document.createElement("span");
-      root.className = "dsh-plugin-logo-full";
-      root.dataset.dshLogoReplacement = "full";
-      root.setAttribute("role", "img");
-      root.setAttribute("aria-label", "Mon3tr Harness");
-      root.title = "Mon3tr Harness";
-      root.appendChild(createImage(MARK_URL, "dsh-plugin-logo-mark", ""));
-      root.appendChild(createImage(WORDMARK_URL, "dsh-plugin-logo-wordmark", ""));
-      root.appendChild(createHarness(source));
-      return root;
-    }
-
-    function createCompactReplacement() {
-      const root = document.createElement("span");
-      root.className = "dsh-plugin-logo-compact";
-      root.dataset.dshLogoReplacement = "compact";
-      root.setAttribute("role", "img");
-      root.setAttribute("aria-label", "Mon3tr");
-      root.title = "Mon3tr";
-      root.appendChild(createImage(MARK_URL, "dsh-plugin-logo-mark", ""));
-      return root;
-    }
-
-    function enhance(source, kind) {
-      const current = replacements.get(source);
-      if (current) {
-        if (current.isConnected) return;
-        replacements.delete(source);
-      }
-      const replacement = kind === "full" ? createFullReplacement(source) : createCompactReplacement();
-      source.dataset.dshLogoSource = kind;
-      source.parentNode?.insertBefore(replacement, source.nextSibling);
-      replacements.set(source, replacement);
-    }
-
-    function scan() {
-      document.querySelectorAll("svg").forEach((source) => {
-        const viewBox = source.getAttribute("viewBox");
-        if (viewBox === FULL_VIEWBOX) enhance(source, "full");
-        else if (viewBox === COMPACT_VIEWBOX) enhance(source, "compact");
+    /**
+     * The Mon3tr mark. The owner supplies the square edge it wants (24 in the
+     * sidebar, 34 in the hero) and the hero also supplies a className carrying
+     * its hover animation, so both are honoured.
+     */
+    function BrandMark({ size, className }) {
+      const edge = typeof size === "number" && Number.isFinite(size) && size > 0 ? size : 24;
+      return jsx("img", {
+        className: className ? `dsh-plugin-logo-mark ${className}` : "dsh-plugin-logo-mark",
+        src: MARK_URL,
+        alt: "",
+        width: Math.round(edge * MARK_ASPECT),
+        height: edge,
+        decoding: "async",
+        draggable: false,
       });
-      for (const [source, replacement] of replacements) {
-        if (!source.isConnected || !replacement.isConnected) {
-          replacement.remove();
-          replacements.delete(source);
-          if (source.isConnected) source.removeAttribute("data-dsh-logo-source");
-        }
-      }
+    }
+
+    /**
+     * The Mon3tr name plus the Harness badge. The owning row supplies the flex
+     * context, so this only contributes its own two children.
+     */
+    function BrandName() {
+      return jsxs("span", {
+        className: "dsh-plugin-logo-name",
+        children: [
+          jsx("img", {
+            className: "dsh-plugin-logo-wordmark",
+            src: WORDMARK_URL,
+            alt: "Mon3tr",
+            decoding: "async",
+            draggable: false,
+          }),
+          jsx("span", { className: "dsh-plugin-logo-badge", children: "Harness" }),
+        ],
+      });
     }
 
     function apply(ctx) {
       const style = injectCss();
-      let observer = null;
-      let started = false;
-      const start = () => {
-        if (started) return;
-        started = true;
-        scan();
-        if (typeof MutationObserver === "undefined" || !document.body) return;
-        observer = new MutationObserver(scan);
-        observer.observe(document.body, { childList: true, subtree: true });
-      };
-      if (document.body) start();
-      else document.addEventListener("DOMContentLoaded", start, { once: true });
-
-      ctx.effect(() => () => {
-        if (observer) observer.disconnect();
-        document.removeEventListener("DOMContentLoaded", start);
-        for (const [source, replacement] of replacements) {
-          replacement.remove();
-          if (source.isConnected) source.removeAttribute("data-dsh-logo-source");
-        }
-        replacements.clear();
-        style.remove();
-      }, `${name}: teardown`);
+      ctx.effect(() => () => style.remove(), `${name}: styles`);
+      // Registered per slot rather than as one nested set, so a shell that stops
+      // declaring one of them still gets the other two branded.
+      for (const slot of BRAND_SLOTS) {
+        const component = slot === "sidebar.brand.name" ? BrandName : BrandMark;
+        ctx.slots.inject(slot, () => ctx.slots.register({ name: slot, priority: PRIORITY }, component));
+      }
     }
 
-    const inject = [];
+    const inject = ["slots"];
     exports.name = name;
     exports.apply = apply;
     exports.inject = inject;
+    exports.BrandMark = BrandMark;
+    exports.BrandName = BrandName;
+    exports.BRAND_SLOTS = BRAND_SLOTS;
+    exports.PRIORITY = PRIORITY;
     return module.exports;
   }
 });
