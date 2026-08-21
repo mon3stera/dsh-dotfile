@@ -20,6 +20,7 @@ The repository currently has no root `package.json` or unified test runner. Most
 ```text
 docs/
   context-management.md       Context Compact, memory, retrieval, and Dreamer design
+  image-model.md              Image-generation adapter, prompt selection, storage limits
   session-outline.md          Outline plugin behavior notes
   diff-viewer.md              Diff viewer routes, confinement, and baseline choice
 
@@ -32,6 +33,7 @@ plugins/
   dsh-plugin-diff-viewer/     Read-only git diff and file browser panel
   dsh-plugin-session-id/      Session id label in the session header
   dsh-plugin-logo/            Custom Mon3tr brand mark and name
+  dsh-plugin-image-model/     Image-generation endpoints as selectable models
   dsh-header-rewrite/         Header rewrite for LLM provider requests
 
 profile/
@@ -48,6 +50,7 @@ tests/
   dsh-diff-viewer-smoke.mjs   Diff viewer host routes and client contract test
   dsh-session-id-smoke.mjs    Session id header label client contract test
   dsh-logo-smoke.mjs          Logo asset routes and brand-slot contract test
+  dsh-image-model-smoke.mjs   Image adapter contract, prompt selection, admission limits
 ```
 
 ## Plugin Structure
@@ -163,6 +166,18 @@ Important context behavior:
 - `assets/mon3tr-logo.svg` is white-on-transparent, so the light theme applies `filter: invert(1)`; `assets/mon3tr-wordmark.svg` is full-colour and must never be inverted. The Harness pill is reproduced in CSS from `--dsw-alias-label-primary` on `--dsw-alias-label-primary-inverted` text; it cannot use `background: currentColor`, because in the same rule `currentColor` resolves against that rule's own `color`.
 - This replaced a DOM-scanning implementation that matched the brand SVG by `viewBox` and hid it behind an inserted sibling. It half-broke on a DSH update that began rendering the name through `BrandWordmark({ includeMark: false })`, whose viewBox is `26 0 156 24` instead of `0 0 182 24`: the mark still matched, so only the lettering reverted to the stock artwork. Prefer a declared slot over host geometry.
 
+### `dsh-plugin-image-model`
+
+- `lib/index.js`: validates the configured provider routes and registers one `LlmAdapter` for them through `ctx.llm.registerAdapter()`. A route with no id, `baseURL`, or usable model is dropped rather than registered, since it would appear in the selector and fail on first use.
+- `lib/adapter.js`: the adapter. `listModels`/`resolveModel` advertise the declared models; `stream()` performs one images request, commits the bytes through `attachments.saveImage()`, and yields a single `image` block plus a `stop` finish.
+- `lib/images-api.js`: the two endpoint encodings (`/images/generations` as JSON, `/images/edits` as multipart), media-type sniffing, and failure classification onto harness codes.
+- `lib/request.js`: prompt selection, source-image selection, and per-model option shaping.
+- An image endpoint is not reachable through `settings.yaml`: a configured provider's `api` field selects a pi-ai *chat* protocol, and model metadata has `inputModalities` but no output-modality field. The adapter seam is public and `image` is already a declared content-block type the client renders, so no host change is needed. Generate-only is a consequence of emitting no tool call, not an added restriction — the loop ends the turn when a step produces none.
+- The prompt is the newest message whose `source.kind` is `user`, **not** the newest user-role message. The harness delivers workspace instructions, the skill catalog, and the runtime-context snapshot as user-role messages; selecting by role sent the repository guide and the sandbox policy to the endpoint as the subject of the picture. `<system-reminder>` framing is stripped as a second line of defence.
+- Auxiliary purposes are refused with a non-retryable `INVALID_REQUEST` before the credential check. `dsh-session-title-llm` requests a title on every new session through the session's own route, so without this an image route silently generated a billed image per session; its callers already tolerate a failed call.
+- The local attachment store enforces 2000 px per side, 3.5 MiB encoded, and 40 M decoded pixels by default. These are reachable for real generations, so an admission refusal is rewritten to name the limit, the actual value, and the fix (smaller `size`, or `outputFormat: jpeg`). Media type comes from the bytes' signature, because `saveImage()` verifies the declared type against the decoded raster.
+- See `docs/image-model.md`.
+
 ### `dsh-header-rewrite`
 
 - `lib/index.js`: wraps the global `fetch` once and applies configurable header rules (set/delete) matched by host, path, body model, and method. Rules come from the persisted `$DSH_HOME/header-rewrite/config.yaml` (validated, applied immediately) or the patch config as seed; the `/header-rewrite/config` route reads and writes that file. Use it to adapt to gateways with strict client policies (e.g. a User-Agent allowlist that rejects the harness attribution header).
@@ -240,7 +255,7 @@ Other useful context tests:
 - `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
 - `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, or `dsh-logo-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-logo-smoke.mjs`, or `dsh-image-model-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary.
 
 ## Git and Editing Rules
 
