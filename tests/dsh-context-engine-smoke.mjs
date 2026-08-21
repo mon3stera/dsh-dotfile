@@ -333,6 +333,35 @@ const check = (label, ok) => {
 		engine._registerUnownedCheckpoints({ session: chained });
 		const chained2 = engine.cdb.allActiveCompartments();
 		check("second legacy checkpoint registered", chained2.length === 2 && chained2[1].landing_seq === 3 && chained2[1].generation === 2);
+
+		// Archiving a visible checkpoint replaces it with an empty plugin-owned
+		// message. Message sources are required at the durable replay boundary.
+		const removedCompartmentIds = [];
+		const archivedEvents = [
+			{ seq: 0, type: "user/message", data: { content: [{ type: "text", text: "checkpoint" }], source: { kind: "plugin", plugin: "compact", compactionId: "archived-cp" }, role: "user", id: "checkpoint-message" }, surfaceOp: "append" },
+		];
+		const archivedSession = {
+			id: "archived-checkpoint",
+			events: archivedEvents,
+			surface: { nodes: [0] },
+			append(type, data, extra = {}) {
+				const event = { type, seq: this.events.length, time: Date.now(), data, ...extra };
+				this.events.push(event);
+				if (event.surfaceOp?.op === "replace") this.surface.nodes.splice(0, 1, event.seq);
+				return event;
+			},
+		};
+		const archiveCdb = engine.cdb;
+		engine.cdb = {
+			archivedCompartments: () => [{ id: 88, landing_seq: 0 }],
+			markCompartmentRemoved: (id) => removedCompartmentIds.push(id),
+		};
+		await engine._removeArchivedCheckpoints({ session: archivedSession });
+		engine.cdb = archiveCdb;
+		const archivedReplacement = archivedEvents[2];
+		check("archived checkpoint replacement has plugin source", archivedReplacement?.type === "user/message" && archivedReplacement.data.source?.kind === "plugin" && archivedReplacement.data.source.plugin === "dsh-magic-context");
+		check("archived checkpoint is marked removed", removedCompartmentIds.join(",") === "88");
+
 		// session/event handlers: the paragraph assigner must ignore non-surface
 		// events; the boundary handler must ignore non-boundary events.
 		const boundaryHandler = stubs.find(([n, h]) => n === "session/event" && String(h).includes("maybeGenerate"))?.[1];

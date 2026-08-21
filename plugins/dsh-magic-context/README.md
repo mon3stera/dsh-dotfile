@@ -24,9 +24,10 @@ npm pack
 dsh plugin --profile web add ./dsh-magic-context-0.1.0.tgz
 ```
 
-The bundle adds the host-side settings bridge and the browser settings panel.
-It does not change the user's default agent preset. If the packaged preset is
-missing, the next DSH startup prints this command:
+The bundle adds one `host: true` bare-package shell that mounts the settings
+bridge and startup guidance. That row also makes the browser panel available from
+the first Web page load. It does not change the user's default agent preset. If
+the packaged preset is missing, the next DSH startup prints this command:
 
 ```sh
 dsh plugin --profile web exec dsh-magic-context-install-preset
@@ -72,7 +73,7 @@ The compaction group must retain the command and tool-result-pruner rows:
     toolResultPruner: true
   config:
     - id: context-engine
-      name: dsh-magic-context
+      name: dsh-magic-context/engine
     - id: command-compact
       name: '@deepseek-ai/dsh-command-compact'
     - id: tool-result-pruner

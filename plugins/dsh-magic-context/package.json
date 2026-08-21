@@ -24,6 +24,7 @@
   ],
   "exports": {
     ".": "./lib/index.js",
+    "./engine": "./lib/engine-plugin.js",
     "./db": "./lib/db.js",
     "./settings": "./lib/settings.js",
     "./client": "./lib/client.js",

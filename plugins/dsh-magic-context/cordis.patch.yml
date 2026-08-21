@@ -1,10 +1,11 @@
 # dsh-magic-context bundle layer.
 #
-# The host-side settings bridge is safe to load once per profile. The
-# ContextEngine itself remains an agent-preset service and must be mounted
-# inside an isolated compaction realm, not as a process-global host row.
+# The bare host shell mounts settings and startup guidance once per profile. Its
+# exact package name also lets dsh-client-modules discover the browser half at
+# Web boot. ContextEngine remains on the explicit /engine entry inside the
+# isolated context-compact compaction realm.
 - insert:
-    - id: dsh-magic-context-startup-notice
-      name: dsh-magic-context/notice
-    - id: dsh-magic-context-settings
-      name: dsh-magic-context/settings
+    - id: dsh-magic-context
+      name: dsh-magic-context
+      config:
+        host: true

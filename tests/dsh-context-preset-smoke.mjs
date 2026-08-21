@@ -8,6 +8,7 @@ const composition = readFileSync(new URL("agent.cordis.yml", presetPath), "utf8"
 if (!/- id: agent-presets\n  config:\n    default: context-compact/.test(patch)) throw new Error("Web profile does not default new sessions to context-compact");
 if (!/^name: Context Compact$/m.test(preset)) throw new Error("Context Compact preset label changed");
 if (/tool-bootstrap|anchored-tool-bootstrap/.test(composition)) throw new Error("Context Compact still contains bootstrap logic");
-if (!/id: context-engine\n      name: dsh-magic-context/.test(composition)) throw new Error("Context Compact does not mount the Context Engine");
+if (!/id: context-engine\n      name: dsh-magic-context\/engine/.test(composition)) throw new Error("Context Compact does not mount the explicit agent-plane Context Engine entry");
+if (/(^|\n)\s*name:\s*dsh-magic-context\s*$/m.test(composition)) throw new Error("Context Compact must not use the bare host-shell entry for ContextEngine");
 if (/id: compaction-basic\n/.test(composition)) throw new Error("Context Compact still mounts compaction-basic");
 console.log("dsh-context preset smoke: OK");

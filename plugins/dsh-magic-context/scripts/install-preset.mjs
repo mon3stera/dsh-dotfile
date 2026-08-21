@@ -28,7 +28,7 @@ export function presetState(homeDir = resolvePresetHome()) {
 	try {
 		const composition = readFileSync(join(directory, "agent.cordis.yml"), "utf8");
 		return {
-			state: /(^|\n)\s*name:\s*["']?dsh-magic-context["']?\s*$/m.test(composition) ? "installed" : "conflict",
+			state: /(^|\n)\s*name:\s*["']?dsh-magic-context(?:\/engine)?["']?\s*$/m.test(composition) ? "installed" : "conflict",
 			directory,
 		};
 	} catch {

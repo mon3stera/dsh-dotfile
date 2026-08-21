@@ -10,9 +10,13 @@ if (manifest.dsh?.bundle?.patch !== "./cordis.patch.yml") throw new Error("dsh-m
 if (!Array.isArray(manifest.files) || !manifest.files.includes("cordis.patch.yml") || !manifest.files.includes("preset") || !manifest.files.includes("scripts")) throw new Error("bundle assets are not included in package files");
 if (manifest.bin?.["dsh-magic-context-install-preset"] !== "scripts/install-preset.mjs") throw new Error("preset installer binary is not declared");
 if (manifest.dependencies?.["@huggingface/transformers"] !== undefined || manifest.peerDependenciesMeta?.["@huggingface/transformers"]?.optional !== true) throw new Error("Transformers.js must remain optional for clean profile installs");
-if (!/- id: dsh-magic-context-startup-notice\n      name: dsh-magic-context\/notice/.test(patch)) throw new Error("bundle patch does not mount the startup notice");
-if (!/- id: dsh-magic-context-settings\n      name: dsh-magic-context\/settings/.test(patch)) throw new Error("bundle patch does not mount the settings bridge");
-if (/name: dsh-magic-context\s*$/.test(patch)) throw new Error("bundle patch must not mount the agent-plane ContextEngine host-wide");
+if (manifest.exports?.["./engine"] !== "./lib/engine-plugin.js") throw new Error("explicit agent-plane ContextEngine export is missing");
+if (!/- id: dsh-magic-context\n      name: dsh-magic-context\n      config:\n        host: true/.test(patch)) throw new Error("bundle patch does not mount the marked bare host shell for boot-time client discovery");
+if (/dsh-magic-context\/(?:settings|notice)/.test(patch)) throw new Error("bundle patch still mounts subpath host rows that client discovery cannot materialize");
+const hostShell = await import(`${packageRoot}/lib/index.js`);
+if (typeof hostShell.apply !== "function" || typeof hostShell.ContextEngine !== "function") throw new Error("bare host shell does not preserve the public ContextEngine export");
+const enginePlugin = await import(`${packageRoot}/lib/engine-plugin.js`);
+if (enginePlugin.default !== enginePlugin.ContextEngine) throw new Error("explicit engine plugin does not default-export ContextEngine");
 
 const notice = await import(`${packageRoot}/lib/notice.js`);
 const installer = await import(`${packageRoot}/scripts/install-preset.mjs`);

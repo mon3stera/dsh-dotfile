@@ -144,7 +144,7 @@
     toolResultPruner: true
   config:
     - id: context-engine
-      name: dsh-magic-context
+      name: dsh-magic-context/engine
       config:
         thresholdRatio: 0.8
         generateThreshold: 0.65

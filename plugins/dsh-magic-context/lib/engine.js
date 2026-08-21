@@ -816,7 +816,10 @@ export class ContextEngine extends BasicCompactionEngine {
 				shadowedSeqs: [seq],
 				shadowedTokenCount: tokenCount,
 			});
-			session.append("user/message", createUserMessage({ content: [{ type: "text", text: "" }] }), {
+			session.append("user/message", createUserMessage({
+				content: [{ type: "text", text: "" }],
+				source: { kind: "plugin", plugin: "dsh-magic-context" },
+			}), {
 				surfaceOp: { op: "replace", start: seq, end: seq },
 				sourceEventSeqs: [seq],
 			});

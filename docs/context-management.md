@@ -132,7 +132,7 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 - `↳ Compartment` 作为小计**不带色块**——它的 token 已计入 `对话消息` 的颜色，再给一个色块会暗示它是独立分段。行级 `padding-left: 28px` 兼顾两件事：补偿被去掉的色块占位（8px 宽 + 6px `margin-right`），再加 14px 层级缩进，使标签正好比父行标签右移一档。宿主行是 `display:flex` + `justify-content:space-between`，左侧 padding 只推动标签一侧，右侧数值仍右对齐。
 - 组件挂在 `conversation.input.right`（`scope: "session"`）上，只为借用 session 域的生命周期与 `sessionId`；它自身渲染 `null`。轮询仅在面板打开时进行，卸载时移除自己注入的行。
 
-> 客户端半边的注册条件：`dsh-client-modules` 用 `require.resolve(\`${entryName}/package.json\`)` 解析 loader 条目名，因此只有名字**恰为包名**的条目才会注册 client bundle。`dsh-magic-context/settings`、`/notice` 这类子路径条目会以 `ERR_PACKAGE_PATH_NOT_EXPORTED` 静默跳过。裸名条目由 agent preset（`agent.cordis.yml`）提供，所以面板两行在首个 context-compact agent 加载后才出现，而不是进程启动时。
+> 客户端半边的注册条件：`dsh-client-modules` 用 `require.resolve(\`${entryName}/package.json\`)` 解析 loader 条目名，因此只有名字**恰为包名**的条目才会注册 client bundle。`dsh-magic-context/settings`、`/notice` 这类子路径条目会以 `ERR_PACKAGE_PATH_NOT_EXPORTED` 静默跳过。bundle patch 现在在宿主根挂载带 `host: true` 的裸名 `dsh-magic-context` shell，它负责 settings/notice 并让浏览器半边从 Web 首次启动就进入 boot manifest；agent preset 另挂 `dsh-magic-context/engine`，所以 ContextEngine 仍只存在于隔离的 compaction realm。
 
 ### 3.3 落地事务（事件契约，与内置一致）
 
