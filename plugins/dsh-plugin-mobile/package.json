@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-mobile",
   "version": "0.1.0",
-  "description": "Phone-viewport ergonomics for the DSH Web shell: reclaim the conversation's horizontal inset, stop iOS focus zoom, drop pointer-only drag handles, and turn an expanded sidebar into a drawer instead of squeezing the conversation.",
+  "description": "Phone-viewport ergonomics for the DSH Web shell: turn an expanded sidebar into a drawer, promote the details panel to an overlay below the host's 996px inline-layout bound, stack the settings dialog single-column, keep wide transcript tables scrollable, contain overscroll, drop pointer-only drag handles, and request the keyboard-resizing viewport behavior on Android.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

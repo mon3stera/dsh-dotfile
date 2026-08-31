@@ -15,9 +15,24 @@
 //     bands.
 //   * Transcript overscroll is handed to the shell, so a flick at either end
 //     rubber-bands the whole page instead of stopping in the transcript.
+//   * A wide markdown table is clipped by the transcript's `overflow: hidden`:
+//     measured with a probe table, 872px of content inside a 326px scrollport,
+//     with no way to reach the cut-off columns.
+//   * The settings dialog is an 800px flex row - a 188px nav plus a `flex: 1`
+//     content pane. At 390px the panel is 342px wide, which leaves the content
+//     154px and wraps CJK text one character per line.
+//   * An open details panel is invisible below 996px. `computeColumns` keeps
+//     the details track inline only while `56 (rail) + 300 (details min) +
+//     640 (centre min)` fits; below that bound it always returns
+//     `details: 0`, and `.pI_x6G_detailsCol` has `overflow: hidden`, so the
+//     panel is clipped away entirely - its close button sits off-screen at
+//     x=411 on a 390px viewport.
+//   * The served viewport meta carries no `interactive-widget` key. Android
+//     Chrome's default `resizes-visual` overlays the virtual keyboard on the
+//     layout viewport, which hides a bottom-anchored composer while typing.
 //
-// Two further phone defects were expected here and measured away instead, which
-// is why no rule addresses them. Reading a bundle is not evidence:
+// Three further phone defects were expected here and measured away instead,
+// which is why no rule addresses them. Reading a bundle is not evidence:
 //
 //   * A composer font under iOS's 16px focus-zoom threshold. The composer input
 //     is `font-size: inherit` and its whole ancestor chain computes 16px; the
@@ -29,12 +44,16 @@
 //     scrollport is a hashed composer class with a hardcoded `padding: 0 24px`.
 //     Overriding the token changed nothing, and reclaiming that inset would mean
 //     selecting a per-build hash.
+//   * Hover-gated message actions. The host styles every `:hover` rule in the
+//     conversation bundle as a colour change, and the only hover-gated reveal
+//     (message timestamps) is already wrapped in `@media (hover:hover)`, so
+//     touch users lose nothing.
 //
 // Everything that remains is keyed on host contracts that survive a rebuild:
-// declared slots and `data-*` hooks. CSS module class names are hashed per build
-// (`pI_x6G_frame`) and are never selected. The frame itself is identified as the
-// element whose direct child is the declared `shell.overlay` outlet, which is
-// what the frame is by construction.
+// declared slots, `data-*` hooks, and structural positions. CSS module class
+// names are hashed per build (`pI_x6G_frame`) and are never selected. The frame
+// itself is identified as the element whose direct child is the declared
+// `shell.overlay` outlet, which is what the frame is by construction.
 window.__ModuleLoader__.load({
 	id: "dsh-plugin-mobile",
 	factory: (require) => {
@@ -54,8 +73,28 @@ window.__ModuleLoader__.load({
 		// `narrowExpanded` rather than the width preference.
 		const PHONE_MAX = 640;
 
+		// Details overlay bound. `computeColumns` keeps an open details panel
+		// inline only while `56 + 300 + 640` fits the viewport; at 996px and up
+		// the host lays the panel out itself, and this plugin must not touch it.
+		const DETAILS_MAX = 995;
+
 		// The frame: the element whose direct child is the shell.overlay outlet.
 		const FRAME = `div:has(> [data-shell-overlay])`;
+
+		// The details column: the third child of the frame (sidebar, centre,
+		// details, then the absolutely positioned overlay outlet, which never
+		// participates in the grid flow). Taking the LAST in-flow column out of
+		// the grid with `position:absolute` shifts nothing - unlike the sidebar,
+		// where the centre and details columns follow it and an absolute
+		// position moved every remaining item one track left.
+		const DETAILS_COL = `${FRAME}>:nth-child(3)`;
+
+		// Set on <html> by the layout-service wrapper in apply() while the
+		// details panel is open. The frame's own `data-details-collapsed`
+		// attribute keys on the computed track (`cols.details === 0`), which is
+		// always true below 996px whether the user opened details or not, so it
+		// cannot drive the overlay on a phone.
+		const DETAILS_OPEN = `[data-dsh-plugin-mobile-details="open"]`;
 
 		const zh = { dismiss: "关闭导航" };
 		const en = { dismiss: "Close navigation" };
@@ -104,6 +143,48 @@ window.__ModuleLoader__.load({
 				+ `transition:opacity var(--ds-transition-duration-slow,.2s) ease}`,
 			`${FRAME}:not([data-sidebar-collapsed]) .${NS}-scrim{opacity:1;pointer-events:auto}`,
 
+			// 4. Wide markdown tables scroll within themselves. The transcript
+			// scrollport clips at `overflow:hidden`, so without this a table wider
+			// than the column loses its right-hand columns for good. `display:
+			// block` + `overflow-x:auto` is the standard containment pattern;
+			// `width:fit-content` keeps narrow tables at their natural size. The
+			// selector deliberately does not reach the details panel, which lives
+			// outside `[data-conversation-scroll]` and already scrolls its own
+			// panes.
+			`[data-conversation-scroll] table{`
+				+ `display:block;width:fit-content;max-width:100%;overflow-x:auto}`,
+
+			// 5. Settings dialog: stack it. The host panel is an 800px flex row
+			// (a 188px nav plus a `flex:1` content pane) inside a
+			// `max-width:calc(100vw - 48px)` shell, so on a 390px screen the
+			// content pane gets 154px and CJK text wraps one character per line.
+			// The dialog is identified through the declared `sidebar.settings`
+			// slot outlet and its `role=dialog` panel - never a hashed class. The
+			// specificity of the attribute selector (0,2,0) beats every host rule
+			// here (0,1,0), so no `!important` is needed. Height switches the
+			// host's `100vh` (the large-viewport height on Android Chrome, which
+			// overflows under the URL bar) to `100dvh`; on engines without `dvh`
+			// the declaration is dropped and the host value survives.
+			`[data-slot="sidebar.settings"] [role="dialog"]{`
+				+ `flex-direction:column;height:min(800px,100dvh - 48px)}`,
+			`[data-slot="sidebar.settings"] [role="dialog"]>nav{`
+				+ `width:auto;flex:none;padding:10px 12px 0}`,
+			`[data-slot="sidebar.settings"] [role="dialog"]>nav>div+div{`
+				+ `flex-direction:row;overflow-x:auto}`,
+			`[data-slot="sidebar.settings"] [role="dialog"]>nav+div{min-height:0}`,
+
+			`}`,
+
+			// 6. Details overlay below the host's inline-layout bound. When the
+			// layout service reports an open details panel at these widths, the
+			// host still computes a 0px track, so the column is promoted to a
+			// right-hand overlay at the service's own preferred width (360px,
+			// the value `openDetails` stores). The close button travels with the
+			// panel and clears the state through the same service.
+			`@media (max-width:${DETAILS_MAX}px){`,
+			`${DETAILS_OPEN} ${DETAILS_COL}{`
+				+ `position:absolute;top:0;bottom:0;right:0;width:min(360px,100vw);`
+				+ `z-index:25;box-shadow:-12px 0 40px rgb(0 0 0/.45)}`,
 			`}`,
 		].join("\n");
 
@@ -128,11 +209,72 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Install the phone stylesheet and the drawer scrim.
+		 * Track the details panel through the layout service face.
+		 *
+		 * Every host caller - the tool rows in the conversation bundle and the
+		 * session runner - opens and closes details through this same service
+		 * object, so wrapping the two actions observes all of them. The wrapper
+		 * only flips the `<html>` attribute the stylesheet keys on; the store
+		 * actions themselves run untouched.
+		 *
+		 * @param ctx - client plugin context.
+		 */
+		function trackDetails(ctx) {
+			const layout = ctx.layout;
+			if (!layout || typeof layout.openDetails !== "function" || typeof layout.closeDetails !== "function") return;
+			const openDetails = layout.openDetails;
+			const closeDetails = layout.closeDetails;
+			const mark = (open) => {
+				const root = document.documentElement;
+				if (open) root.setAttribute("data-dsh-plugin-mobile-details", "open");
+				else root.removeAttribute("data-dsh-plugin-mobile-details");
+			};
+			layout.openDetails = (...args) => {
+				mark(true);
+				return openDetails.apply(layout, args);
+			};
+			layout.closeDetails = (...args) => {
+				mark(false);
+				return closeDetails.apply(layout, args);
+			};
+			ctx.effect(() => () => {
+				layout.openDetails = openDetails;
+				layout.closeDetails = closeDetails;
+				mark(false);
+			}, `${NS}: details tracking`);
+		}
+
+		/**
+		 * Ask Android Chrome to resize the layout viewport for the keyboard.
+		 *
+		 * Chrome 108+ honours `interactive-widget` in the viewport meta; the
+		 * default `resizes-visual` overlays the keyboard on the layout viewport,
+		 * which hides a bottom-anchored composer while typing.
+		 * `resizes-content` shrinks the layout viewport instead, so the shell
+		 * reflows above the keyboard. Only set when absent: an explicit host
+		 * choice must win. The change is global rather than phone-scoped
+		 * because it only takes effect while a virtual keyboard is open, which
+		 * is exactly the surface it fixes.
+		 *
+		 * @returns true when the meta was extended.
+		 */
+		function applyKeyboardViewport() {
+			const meta = document.querySelector('meta[name="viewport"]');
+			if (!meta || meta.content.includes("interactive-widget=")) return false;
+			meta.content = `${meta.content.trim()}, interactive-widget=resizes-content`;
+			return true;
+		}
+
+		/**
+		 * Install the phone stylesheet, the keyboard viewport fix, the details
+		 * tracking, and the drawer scrim.
 		 *
 		 * @param ctx - client plugin context.
 		 */
 		function apply(ctx) {
+			applyKeyboardViewport();
+			trackDetails(ctx);
+
 			const style = document.createElement("style");
 			style.dataset.plugin = NS;
 			style.dataset.pluginCss = `${NS}/ui.css`;
@@ -165,8 +307,13 @@ window.__ModuleLoader__.load({
 		exports.apply = apply;
 		exports.CSS = CSS;
 		exports.PHONE_MAX = PHONE_MAX;
+		exports.DETAILS_MAX = DETAILS_MAX;
 		exports.FRAME = FRAME;
+		exports.DETAILS_COL = DETAILS_COL;
+		exports.DETAILS_OPEN = DETAILS_OPEN;
 		exports.MobileScrim = MobileScrim;
+		exports.applyKeyboardViewport = applyKeyboardViewport;
+		exports.trackDetails = trackDetails;
 		return module.exports;
 	},
 });
