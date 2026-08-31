@@ -13,6 +13,8 @@ import {
 	createMemoryTool,
 	createSearchTool,
 	searchMemories,
+	filterDuplicateFacts,
+	isDuplicateMemoryText,
 } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/memory.js";
 import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/db.js";
 
@@ -76,6 +78,10 @@ const now = Date.now();
 		check("ctx_memory write", wrote.ok === true && typeof wrote.id === "number" && cdb.memoryById(wrote.id).category === "CONSTRAINTS");
 		const badWrite = await memTool.execute({ action: "write", category: "CONSTRAINTS" });
 		check("ctx_memory write validation", badWrite.ok === false);
+		const updated = await memTool.execute({ action: "update", id: wrote.id, summary: "still no prod writes", content: "never write the prod DB directly, including replicas" });
+		check("ctx_memory update", updated.ok === true && cdb.memoryById(wrote.id).summary === "still no prod writes" && cdb.memoryById(wrote.id).verified_at === null);
+		const badUpdate = await memTool.execute({ action: "update", id: wrote.id });
+		check("ctx_memory update requires fields", badUpdate.ok === false);
 		const del = await memTool.execute({ action: "delete", id: wrote.id });
 		check("ctx_memory delete", del.ok === true && cdb.memoryById(wrote.id) === undefined);
 		const badDel = await memTool.execute({ action: "delete", id: 99999 });
@@ -111,6 +117,12 @@ const now = Date.now();
 		check("scoped update rejects cross-project memory", cdb.updateMemory(scopedB, { summary: "wrong" }, "/repo/a") === false);
 		const none = await searchTool.execute({ query: "nonexistentxyz" });
 		check("ctx_search empty", none.results.length === 0);
+		check("duplicate text detects restated summary", isDuplicateMemoryText("JWT auth design with 30d expiry", { summary: "JWT auth design", content: "JWT 30d expiry", archived: 0 }));
+		const kept = filterDuplicateFacts(cdb, [
+			{ text: "JWT auth design still uses 30 day expiry", importance: 8 },
+			{ text: "deploy uses an unrelated rsync workflow", importance: 4 },
+		], undefined);
+		check("duplicate facts are filtered", kept.length === 1 && kept[0].text.includes("rsync"));
 		cdb.close();
 	} finally {
 		rmSync(home, { recursive: true, force: true });

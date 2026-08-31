@@ -52,6 +52,8 @@ const KNOWN_ELEMENTS = new Set([
 	"url",
 	"facts",
 	"fact",
+	"memory_maintenance",
+	"stale",
 	"none",
 ]);
 
@@ -73,6 +75,7 @@ const LEAF_ELEMENTS = new Set([
 	"commit",
 	"url",
 	"fact",
+	"stale",
 ]);
 
 function addError(errors, path, message) {
@@ -343,6 +346,41 @@ function parseFacts(factsNode, errors) {
 	return facts;
 }
 
+function parseMemoryMaintenance(node, errors) {
+	validateAttributes(node, new Set(), "memory_maintenance", errors);
+	if (node.text.trim().length > 0) addError(errors, "memory_maintenance", "must contain stale elements, not direct text");
+	if (node.children.length === 1 && node.children[0].name === "none") {
+		const none = node.children[0];
+		validateAttributes(none, new Set(), "memory_maintenance.none", errors);
+		if (!none.selfClosing || none.text.trim().length > 0) addError(errors, "memory_maintenance", "<none/> must be self-closing");
+		return [];
+	}
+	if (node.children.length === 0) {
+		addError(errors, "memory_maintenance", "must contain stale entries or <none/>");
+		return [];
+	}
+	const ids = [];
+	const seen = new Set();
+	for (const child of node.children) {
+		if (child.name !== "stale") {
+			addError(errors, `memory_maintenance.${child.name}`, "unexpected child element");
+			continue;
+		}
+		validateAttributes(child, new Set(["id"]), "memory_maintenance.stale", errors);
+		if (child.children.length > 0) addError(errors, "memory_maintenance.stale", "must contain text only");
+		const rawId = child.attrs.id;
+		const id = Number(rawId);
+		if (rawId === undefined || !/^\d+$/.test(String(rawId)) || !Number.isSafeInteger(id) || id < 1) {
+			addError(errors, "memory_maintenance.stale@id", "must be a positive integer");
+			continue;
+		}
+		if (seen.has(id)) continue;
+		seen.add(id);
+		ids.push(id);
+	}
+	return ids;
+}
+
 /** Escape ampersands that do not already start a legal XML entity. */
 function escapeStrayAmpersands(value) {
 	return value.replace(/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-f]+;)/gi, "&amp;");
@@ -457,11 +495,13 @@ export function validateOrganizerOutput(text) {
 	if (root.name !== "output") addError(errors, "XML", `root must be <output>, found <${root.name}>`);
 	if (root.text.trim().length > 0) addError(errors, "output", "must contain compartments and facts, not direct text");
 	const rootNames = root.children.map((child) => child.name);
-	if (rootNames.length !== 2 || rootNames[0] !== "compartments" || rootNames[1] !== "facts") {
-		addError(errors, "output", "children must be <compartments> followed by <facts>");
+	const hasMaintenance = rootNames.length === 3 && rootNames[2] === "memory_maintenance";
+	if (!(rootNames[0] === "compartments" && rootNames[1] === "facts" && (rootNames.length === 2 || hasMaintenance))) {
+		addError(errors, "output", "children must be <compartments>, <facts>, and optional <memory_maintenance>");
 	}
 	const compartmentsNode = children(root, "compartments")[0];
 	const factsNode = children(root, "facts")[0];
+	const maintenanceNode = children(root, "memory_maintenance")[0];
 	let compartment;
 	if (!compartmentsNode) {
 		addError(errors, "output.compartments", "required element is missing");
@@ -476,18 +516,21 @@ export function validateOrganizerOutput(text) {
 	let facts = [];
 	if (!factsNode) addError(errors, "output.facts", "required element is missing");
 	else facts = parseFacts(factsNode, errors);
+	let staleIds = [];
+	if (maintenanceNode) staleIds = parseMemoryMaintenance(maintenanceNode, errors);
 	if (errors.length > 0 || !compartment) return { ok: false, errors: errors.slice(0, MAX_VALIDATION_ERRORS) };
 	return {
 		ok: true,
 		summary: text.slice(compartment.start, compartment.end).trim(),
 		facts,
+		staleIds,
 	};
 }
 
 /** Parse valid new XML, while retaining compatibility with the legacy format. */
 export function parseOrganizerOutput(text) {
 	const validated = validateOrganizerOutput(text);
-	if (validated.ok) return { summary: validated.summary, facts: validated.facts };
+	if (validated.ok) return { summary: validated.summary, facts: validated.facts, staleIds: validated.staleIds ?? [] };
 	const summaryMatch = text.match(/<compacted-summary>([\s\S]*?)<\/compacted-summary>/);
 	const summary = summaryMatch ? summaryMatch[1].trim() : text.trim();
 	const facts = [];
@@ -501,7 +544,7 @@ export function parseOrganizerOutput(text) {
 			}
 		}
 	}
-	return { summary, facts };
+	return { summary, facts, staleIds: [] };
 }
 
 /** Build a repair prompt that reports exact schema failures to the organizer. */

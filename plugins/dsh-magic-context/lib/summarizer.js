@@ -15,6 +15,7 @@ import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { isCompactCheckpointSource } from "@deepseek-ai/dsh-compaction";
 import { buildOrganizerRepairInstruction, sanitizeOrganizerOutput, validateOrganizerOutput } from "./organizer-xml.js";
 import { clampMaxTokens, resolveAuxImageSupport, resolveAuxMaxTokens, streamAux } from "./aux-llm.js";
+import { filterDuplicateFacts, searchMemoriesForOrganizer } from "./memory.js";
 
 /**
  * Output budget for one organizer call.
@@ -67,6 +68,32 @@ function memoryPriority(a, b) {
 	return Number(b.created_at ?? 0) - Number(a.created_at ?? 0);
 }
 
+function textFromMessages(messages) {
+	const parts = [];
+	for (const message of messages ?? []) {
+		const content = message?.content;
+		if (typeof content === "string") parts.push(content);
+		else if (Array.isArray(content)) {
+			for (const block of content) {
+				if (block?.type === "text" && typeof block.text === "string") parts.push(block.text);
+			}
+		}
+	}
+	return parts.join("\n");
+}
+
+/** Archive live memories the organizer marked stale. Unknown ids are ignored. */
+export function applyOrganizerStaleMemories(cdb, staleIds, scopePath) {
+	const archived = [];
+	for (const id of staleIds ?? []) {
+		if (!Number.isSafeInteger(id) || id < 1) continue;
+		if (typeof cdb.memoryById === "function" && cdb.memoryById(id, scopePath) === undefined) continue;
+		if (typeof cdb.updateMemory !== "function") continue;
+		if (cdb.updateMemory(id, { archived: 1 }, scopePath)) archived.push(id);
+	}
+	return archived;
+}
+
 function unescapeXmlText(value) {
 	return String(value ?? "")
 		.replaceAll("&lt;", "<")
@@ -83,25 +110,40 @@ function referenceTitle(summary, generation) {
 	return match?.[1]?.trim() || `generation ${generation}`;
 }
 
+function mergeOrganizerMemories(injectable, searchHits) {
+	const merged = [];
+	const seen = new Set();
+	for (const memory of [...(searchHits ?? []), ...(injectable ?? [])]) {
+		const id = Number(memory?.id);
+		if (!Number.isSafeInteger(id) || seen.has(id)) continue;
+		seen.add(id);
+		merged.push(memory);
+		if (merged.length >= MAX_PROJECT_MEMORIES) break;
+	}
+	return merged;
+}
+
 /**
  * Build bounded continuity material for the organizer.
  *
- * Current raw messages remain the source of truth. Project memories and old
- * compartments are deliberately separate, labeled reference blocks so the
- * organizer can connect an ongoing work arc without recursively summarizing
- * the entire session.
+ * Current raw messages remain the source of truth. Project memories (search
+ * hits for this range plus the injectable set) and old compartments are
+ * deliberately separate, labeled reference blocks so the organizer can
+ * connect an ongoing work arc without recursively summarizing the entire session.
  */
-export function buildOrganizerReferences(cdb, sessionId, scopePath) {
-	const memories = typeof cdb.allInjectableMemories === "function"
-		? cdb.allInjectableMemories(scopePath).slice().sort(memoryPriority).slice(0, MAX_PROJECT_MEMORIES)
+export function buildOrganizerReferences(cdb, sessionId, scopePath, { searchHits } = {}) {
+	const injectable = typeof cdb.allInjectableMemories === "function"
+		? cdb.allInjectableMemories(scopePath).slice().sort(memoryPriority)
 		: [];
+	const memories = mergeOrganizerMemories(injectable, searchHits);
 	const memoryLines = [];
 	let memoryChars = 0;
 	for (const memory of memories) {
 		const summary = clipText(memory.summary, 360);
 		const content = clipText(memory.content, MAX_REFERENCE_CONTENT_CHARS);
+		const archived = memory.archived === 1 || memory.archived === true;
 		const line = [
-			`<memory id="${escapeXmlAttr(memory.id)}" category="${escapeXmlAttr(memory.category)}">`,
+			`<memory id="${escapeXmlAttr(memory.id)}" category="${escapeXmlAttr(memory.category)}" archived="${archived ? "true" : "false"}">`,
 			`<summary>${escapeXmlText(summary)}</summary>`,
 			content.length > 0 ? `<details>${escapeXmlText(content)}</details>` : "",
 			"</memory>",
@@ -176,8 +218,11 @@ const ORGANIZER_CONTRACT = [
 	"    </compartment>",
 	"  </compartments>",
 	"  <facts>",
-	"    <fact importance=\"8\">one durable project fact</fact>",
+	"    <fact importance=\"8\">one durable project fact not already in project_memory</fact>",
 	"  </facts>",
+	"  <memory_maintenance>",
+	"    <stale id=\"12\">existing memory contradicted by current evidence</stale>",
+	"  </memory_maintenance>",
 	"</output>",
 	"",
 	"Rules:",
@@ -188,7 +233,9 @@ const ORGANIZER_CONTRACT = [
 	"- For a substantive engineering arc, preserve useful detail across the sections instead of reducing the result to one or two generic bullets.",
 	"- Preserve exact file paths, commands, error strings, identifiers, numeric values, function names, syntax fragments, URLs, and commit hashes when present.",
 	"- Use XML escaping for text: &amp; for &, &lt; for <, and &gt; for >. Do not put raw XML or markdown fences inside text nodes.",
-	"- Facts are raw material for project memory: architecture decisions, constraints, conventions, preferences, and environment/config facts. Do not include one-off task details or duplicate an existing project memory unless current evidence changes it.",
+	"- The <project_memory> block is a search result for this range (live and matching archived rows, with ids). Read it before emitting facts.",
+	"- Facts are raw material for project memory: architecture decisions, constraints, conventions, preferences, and environment/config facts. Do not include one-off task details. Do not emit a fact that restates an existing live memory.",
+	"- If current evidence supersedes or contradicts a listed live memory, emit it as <stale id=\"N\">reason</stale> under optional <memory_maintenance> and do not also restate it as a new fact. Use <none/> when nothing is stale. Omit the section if you have no maintenance.",
 	"- Do not mention this summarization request, the reference blocks, or the organizer in the output.",
 	"- Do not call tools or take any other action.",
 ].join("\n");
@@ -207,22 +254,107 @@ export function buildOrganizerInstruction({ projectMemory, sessionReferences } =
 /** Default prompt retained as a stable export for callers and tests. */
 export const ORGANIZER_INSTRUCTION = buildOrganizerInstruction();
 
+/** Return tool-call ids, or null when a tool-call block is malformed. */
+function toolCallIds(message) {
+	if (message?.role !== "assistant" || !Array.isArray(message.content)) return undefined;
+	const calls = message.content.filter((block) => block?.type === "tool-call");
+	if (calls.length === 0) return undefined;
+	const ids = calls.map((block) => block.id);
+	return ids.every((id) => typeof id === "string" && id.length > 0) ? ids : null;
+}
+
+/** Return the id carried by one durable tool-result event. */
+function toolResultId(message) {
+	if (message?.role !== "user" || !Array.isArray(message.content)) return undefined;
+	const result = message.content.find((block) => block?.type === "tool-result");
+	return typeof result?.toolCallId === "string" && result.toolCallId.length > 0 ? result.toolCallId : undefined;
+}
+
+/**
+ * Project a selected range without creating an invalid tool transcript.
+ *
+ * The live surface is balanced, but a compartment may contain ctx_reduce skip
+ * marks in the middle of an assistant tool-call batch. Filtering those events
+ * one at a time leaves an assistant `tool_calls` message without all of its
+ * replies, which OpenAI-compatible providers reject before generation. Treat a
+ * call batch and its contiguous results as one atomic history unit: retain it
+ * only when every expected result is selected, unskipped, and matched.
+ * successfully projected. Orphan results are never useful to the organizer.
+ */
+function projectToolSafeMessages(session, range, skipSeqs) {
+	const entries = range.shadowedSeqs.map((seq) => {
+		const event = session.events[seq];
+		// Never re-summarize a prior checkpoint (chain design).
+		const checkpoint = event?.type === "user/message"
+			&& event.data?.source !== undefined
+			&& isCompactCheckpointSource(event.data.source);
+		return {
+			seq,
+			event,
+			skipped: skipSeqs.has(seq),
+			checkpoint,
+			message: event === undefined ? undefined : session.deriveEventMessage(event),
+		};
+	});
+	const accepted = new Set();
+	const suppressed = new Set();
+
+	for (let index = 0; index < entries.length; index += 1) {
+		const entry = entries[index];
+		const ids = toolCallIds(entry.message);
+		if (ids === undefined) continue;
+		const results = [];
+		let next = index + 1;
+		while (next < entries.length && entries[next].event?.type === "tool/result") {
+			results.push(entries[next]);
+			next += 1;
+		}
+		const resultIds = results.map((result) => toolResultId(result.message));
+		const uniqueIds = new Set(resultIds);
+		const complete = Array.isArray(ids)
+			&& !entry.skipped
+			&& !entry.checkpoint
+			&& new Set(ids).size === ids.length
+			&& ids.length === resultIds.length
+			&& uniqueIds.size === ids.length
+			&& ids.every((id, resultIndex) => resultIds[resultIndex] === id)
+			&& results.every((result) => !result.skipped && result.message !== undefined && toolResultId(result.message) !== undefined);
+		if (complete) {
+			accepted.add(entry.seq);
+			for (const result of results) accepted.add(result.seq);
+		} else {
+			// Suppress the whole batch, including any results that did survive the
+			// skip filter, so no orphan tool message reaches the provider.
+			suppressed.add(entry.seq);
+			for (const result of results) suppressed.add(result.seq);
+		}
+	}
+
+	const messages = [];
+	for (const entry of entries) {
+		if (entry.message === undefined || entry.checkpoint || entry.skipped || suppressed.has(entry.seq)) continue;
+		if (entry.event?.type === "tool/result") {
+			if (accepted.has(entry.seq)) messages.push(entry.message);
+			continue;
+		}
+		if (toolCallIds(entry.message) !== undefined) {
+			if (accepted.has(entry.seq)) messages.push(entry.message);
+			continue;
+		}
+		messages.push(entry.message);
+	}
+	return messages;
+}
+
 /** Build the stable input snapshot for a compartment's fixed span. */
 export function buildSummarizationInput(session, range, skipSeqs) {
 	const header = session.requestHeader();
-	const messages = [];
-	for (const seq of range.shadowedSeqs) {
-		if (skipSeqs.has(seq)) continue;
-		const event = session.events[seq];
-		// Never re-summarize a prior checkpoint (chain design).
-		if (event.type === "user/message" && event.data.source !== undefined && isCompactCheckpointSource(event.data.source)) continue;
-		const msg = session.deriveEventMessage(event);
-		if (msg) messages.push(msg);
-	}
 	return {
 		...(header?.system === undefined ? {} : { system: header.system }),
+		// Kept in the input snapshot for callers that inspect the session header;
+		// the organizer request intentionally omits executable session tools.
 		...(header?.tools === undefined ? {} : { tools: header.tools }),
-		messages,
+		messages: projectToolSafeMessages(session, range, skipSeqs),
 	};
 }
 
@@ -288,7 +420,9 @@ function acceptOrganizerOutput(text) {
  */
 export async function summarizeCompartment(ctx, cdb, { session, compartment, range, target: configuredTarget, scopePath, signal, retry, maxTokens }) {
 	const input = buildSummarizationInput(session, range, cdb.skippedSeqs(session.id));
-	const references = buildOrganizerReferences(cdb, session.id, scopePath);
+	const rangeText = textFromMessages(input.messages).slice(0, 24000);
+	const searchHits = searchMemoriesForOrganizer(cdb, rangeText, scopePath);
+	const references = buildOrganizerReferences(cdb, session.id, scopePath, { searchHits });
 	const organizerInstruction = buildOrganizerInstruction(references);
 	const target = configuredTarget ?? session.requestHeader()?.config;
 	if (typeof target?.provider !== "string" || target.provider.length === 0
@@ -323,7 +457,9 @@ export async function summarizeCompartment(ctx, cdb, { session, compartment, ran
 				}),
 			],
 			...(input.system === undefined ? {} : { system: input.system }),
-			...(input.tools === undefined ? {} : { tools: input.tools }),
+			// The organizer is an extraction call, not an agent turn. Historical
+			// tool blocks remain transcript evidence, but executable session tool
+			// schemas are unnecessary and can invite a fresh tool call.
 			maxTokens: budget,
 			sessionId: session.id,
 			purpose: "compaction",
@@ -365,9 +501,12 @@ export async function summarizeCompartment(ctx, cdb, { session, compartment, ran
 		ctx.logger?.info?.("organizer output accepted after local XML escaping repair");
 	}
 
-	const parsed = { summary: accepted.validation.summary, facts: accepted.validation.facts };
+	const staleIds = accepted.validation.staleIds ?? [];
+	applyOrganizerStaleMemories(cdb, staleIds, scopePath);
+	const facts = filterDuplicateFacts(cdb, accepted.validation.facts, scopePath);
+	const parsed = { summary: accepted.validation.summary, facts, staleIds };
 	cdb.setCompartmentSummary(compartment.id, { summary: parsed.summary, provider: attempt.options.provider, model: attempt.options.model });
-	for (const fact of parsed.facts) {
+	for (const fact of facts) {
 		cdb.insertFact({ sessionId: session.id, scopePath, compartmentId: compartment.id, fact: fact.text, importance: fact.importance });
 	}
 	return parsed;

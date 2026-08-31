@@ -101,7 +101,8 @@ The settings bridge exposes:
 
 ## Commands and tools
 
-The ContextEngine adds `/dream`, `/ctx-search`, and `/inject-memory`, plus the
+The ContextEngine adds `/dream`, `/ctx-search`, `/inject-memory`, and
+`/organize-memories`, plus the
 `ctx_reduce`, `ctx_expand`, `ctx_memory`, and `ctx_search` tools when mounted in
 an agent preset.
 

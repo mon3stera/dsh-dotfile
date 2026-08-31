@@ -459,8 +459,24 @@ export class ContextDb {
 		}
 	}
 
-	discardFact(id) {
+	discardFact(id, scopePath) {
+		const fact = this.db.prepare("SELECT status, scope_path FROM session_facts WHERE id = ?").get(id);
+		if (fact === undefined) throw new Error(`fact ${id} does not exist`);
+		if (scopePath !== undefined && fact.scope_path !== scopePath) throw new Error(`fact ${id} does not belong to this workspace`);
+		if (fact.status !== "pending") throw new Error(`fact ${id} is not pending`);
 		this.db.prepare("UPDATE session_facts SET status = 'discarded' WHERE id = ?").run(id);
+		return true;
+	}
+
+	/** Stamp verification time on live memories still visible in this scope. */
+	markMemoriesVerified(ids, now = Date.now(), scopePath) {
+		let changed = 0;
+		for (const id of ids ?? []) {
+			const row = this.memoryById(id, scopePath);
+			if (row === undefined || row.archived !== 0) continue;
+			if (this.updateMemory(id, { verified_at: now }, scopePath)) changed += 1;
+		}
+		return changed;
 	}
 
 	// ── retrieval ───────────────────────────────────────────────────────────
@@ -486,7 +502,7 @@ export class ContextDb {
 		}
 		params.push(limit);
 		return this.db.prepare(
-			`SELECT m.id, m.category, m.scope_path, m.summary, m.content, m.importance, m.hits,
+			`SELECT m.id, m.category, m.scope_path, m.summary, m.content, m.importance, m.hits, m.archived,
 			        bm25(memories_fts) AS rank
 			 FROM memories_fts JOIN memories m ON m.id = memories_fts.rowid
 			 WHERE memories_fts MATCH ?${scopeClause}

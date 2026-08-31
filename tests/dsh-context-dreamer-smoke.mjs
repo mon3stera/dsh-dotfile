@@ -48,7 +48,7 @@ try {
 	// memory tools
 	const wrote = await run("memory_write", { category: "ARCHITECTURE", summary: "jwt ttl", content: "TOKEN_TTL=3600", importance: 8 });
 	check("memory_write", typeof wrote.id === "number");
-	check("memory_update", (await run("memory_update", { id: wrote.id, importance: 9 })).ok === true && cdb.memoryById(wrote.id).importance === 9);
+	check("memory_update", (await run("memory_update", { id: wrote.id, importance: 9 })).ok === true && cdb.memoryById(wrote.id).importance === 9 && cdb.memoryById(wrote.id).verified_at !== null);
 	check("memory_archive", (await run("memory_archive", { id: wrote.id })).ok === true && cdb.memoryById(wrote.id).archived === 1);
 	cdb.updateMemory(wrote.id, { archived: 0 });
 
@@ -57,6 +57,9 @@ try {
 	const promoted = await run("promote_fact", { factId, category: "ARCHITECTURE", summary: "auth ttl", content: "TOKEN_TTL=3600 in src/auth.ts", importance: 8 });
 	check("promote_fact", promoted.id !== undefined && cdb.pendingFacts().length === 0 && cdb.memoryById(promoted.id) !== undefined);
 	check("promoted fact provenance", cdb.memoryById(promoted.id).source_session_id === "s");
+	const duplicateFact = cdb.insertFact({ sessionId: "s", scopePath: workspace, fact: "auth still uses TOKEN_TTL 3600s", importance: 4 });
+	check("discard_fact", (await run("discard_fact", { factId: duplicateFact })).ok === true && cdb.db.prepare("SELECT status FROM session_facts WHERE id = ?").get(duplicateFact).status === "discarded");
+	check("discard_fact rejects promoted", (() => { try { run("discard_fact", { factId }); return false; } catch { return true; } })());
 	const c1 = cdb.insertCompartment({ sessionId: "s", scopePath: workspace, generation: 1, startSeq: 1, endSeq: 5, startPara: 1, endPara: 5, summary: "x".repeat(20000) });
 	cdb.setCompartmentStatus(c1, "ready");
 	cdb.markCompartmentLanded(c1, 42);
@@ -109,6 +112,7 @@ try {
 	check("dreamer records actions", dreamerResult.actions.some((action) => action.name === "promote_fact" && action.ok === true));
 	check("dreamer action summary", summarizeDreamerActions(dreamerResult.actions).includes("promoted facts"));
 	check("dreamer promoted fact", cdb.pendingFacts().length === 0 && cdb.db.prepare("SELECT COUNT(*) AS n FROM session_facts WHERE status='promoted'").get().n === 2);
+	check("settled pass stamps verified_at", dreamerResult.settled === true && brief.memories.every((memory) => cdb.memoryById(memory.id).archived === 1 || cdb.memoryById(memory.id).verified_at !== null));
 	// mark the remaining compartment distilled and all memories verified so
 	// the next pass has no material
 	await run("compartment_mark", { compartmentId: c2, processed: true });

@@ -1,4 +1,5 @@
 import {
+	distinctiveMemoryTerms,
 	formatSearchResults,
 	recordInjectionHit,
 	renderInjectionText,
@@ -10,6 +11,8 @@ import { createContextNotice } from "./notifications.js";
 export const CTX_SEARCH_USAGE = "Usage: /ctx-search <query> [--limit N]";
 export const DREAM_USAGE = "Usage: /dream";
 export const INJECT_MEMORY_USAGE = "Usage: /inject-memory";
+export const ORGANIZE_MEMORIES_USAGE = "Usage: /organize-memories";
+const MAX_RELATED_ORGANIZE_MEMORIES = 20;
 
 /** Parse the human command input while keeping the query text intact. */
 export function parseCtxSearchInput(rawInput) {
@@ -99,6 +102,89 @@ export async function executeInjectMemoryCommand(invocation, { cdb, memoryConfig
 	}
 }
 
+/** Parse the argument-free memory-organization command. */
+export function parseOrganizeMemoriesInput(rawInput) {
+	return String(rawInput ?? "").trim().length === 0 ? {} : { error: ORGANIZE_MEMORIES_USAGE };
+}
+
+function formatOrganizeMemory(memory) {
+	const archived = memory.archived === 1 || memory.archived === true ? " archived" : "";
+	return `#${memory.id} [${memory.category}]${archived} ${memory.summary}\n${memory.content}`;
+}
+
+/** Related rows for the organize notice: FTS neighbors, including archived, excluding the injected set. */
+export function collectRelatedMemories(cdb, selected, scopePath, limit = MAX_RELATED_ORGANIZE_MEMORIES) {
+	if (typeof cdb?.ftsSearch !== "function" || !Array.isArray(selected) || selected.length === 0) return [];
+	const selectedIds = new Set(selected.map((memory) => memory.id));
+	const byId = new Map();
+	for (const memory of selected) {
+		const terms = distinctiveMemoryTerms(memory.summary, 4);
+		for (const term of terms.length > 0 ? terms : [memory.summary]) {
+			let rows;
+			try {
+				rows = cdb.ftsSearch(term, 5, scopePath);
+			} catch {
+				continue;
+			}
+			for (const row of rows ?? []) {
+				if (row?.id === undefined || selectedIds.has(row.id) || byId.has(row.id)) continue;
+				const full = typeof cdb.memoryById === "function" ? cdb.memoryById(row.id, scopePath) ?? row : row;
+				if (full?.id === undefined) continue;
+				byId.set(full.id, full);
+				if (byId.size >= limit) return [...byId.values()];
+			}
+		}
+	}
+	return [...byId.values()];
+}
+
+/** Model-facing body: injected memories plus instructions to dedupe/retire, asking the user when unsure. */
+export function renderOrganizeMemoriesText(selected, related = []) {
+	const lines = [
+		"Organize the currently injected project memories.",
+		"Find duplicates and stale or contradicted rows.",
+		"Use ctx_search first (archived memories stay searchable).",
+		"If a live memory already covers a fact, ctx_memory update the keeper and delete extra ids.",
+		"If a memory is stale or wrong, ctx_memory delete it.",
+		"If two rows might be the same fact, or a delete is not obvious, ask the user before changing anything.",
+		"Do not write a new memory unless the set is missing a durable fact the user confirms.",
+		"",
+		`CURRENTLY INJECTED (${selected.length}):`,
+		selected.map((memory) => formatOrganizeMemory(memory)).join("\n\n") || "(none)",
+	];
+	if (related.length > 0) {
+		lines.push("", `RELATED (${related.length}; not in the injection set, including archived):`, related.map((memory) => formatOrganizeMemory(memory)).join("\n\n"));
+	}
+	return lines.join("\n");
+}
+
+/** Ask the main Agent to review the current injection set for duplicates and stale rows. */
+export async function executeOrganizeMemoriesCommand(invocation, { cdb, memoryConfig, resolveScope }) {
+	const parsed = parseOrganizeMemoriesInput(invocation.rawInput);
+	if (parsed.error !== undefined) return { kind: "error", text: parsed.error };
+	const agent = invocation.agent;
+	if (agent === undefined || typeof agent.inject !== "function") {
+		return { kind: "error", text: "organize-memories failed: no active agent is available." };
+	}
+	try {
+		const scopePath = typeof resolveScope === "function" ? resolveScope(agent.session) : undefined;
+		const selected = selectInjectionMemories(cdb, memoryConfig, Date.now(), scopePath);
+		if (selected.length === 0) return { kind: "success", text: "No injectable project memories are available to organize." };
+		for (const memory of selected) recordInjectionHit(cdb, memory, memoryConfig);
+		const related = collectRelatedMemories(cdb, selected, scopePath);
+		agent.inject(createContextNotice(
+			`Organize Memories: ${selected.length} injected`,
+			renderOrganizeMemoriesText(selected, related),
+		));
+		return {
+			kind: "success",
+			text: `Queued ${selected.length} injected memor${selected.length === 1 ? "y" : "ies"} for the model to review. It will ask before changing anything uncertain.`,
+		};
+	} catch (error) {
+		return { kind: "error", text: `organize-memories failed: ${error instanceof Error ? error.message : String(error)}` };
+	}
+}
+
 /** Register per-agent ContextEngine commands over the current memory database. */
 export function installContextCommands(ctx, dependencies) {
 	const active = new Set();
@@ -113,6 +199,7 @@ export function installContextCommands(ctx, dependencies) {
 		runDreamer: (agent) => dependencies.runDreamer(agent),
 	}));
 	const injectMemoryHandler = (invocation) => track(executeInjectMemoryCommand(invocation, dependencies));
+	const organizeMemoriesHandler = (invocation) => track(executeOrganizeMemoriesCommand(invocation, dependencies));
 	return ctx.effect(function* () {
 		yield async () => Promise.allSettled(active);
 		yield ctx.commands.register({
@@ -132,6 +219,12 @@ export function installContextCommands(ctx, dependencies) {
 			description: "Append project memories to the next model request",
 			input: { hint: "(no arguments)" },
 			handler: injectMemoryHandler,
+		});
+		yield ctx.commands.register({
+			name: "organize-memories",
+			description: "Ask the model to review injected memories for duplicates and stale rows",
+			input: { hint: "(no arguments)" },
+			handler: organizeMemoriesHandler,
 		});
 	}, "dsh-magic-context: user commands");
 }

@@ -68,7 +68,7 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 
 当前版本暂不实现 Magic Context 的 P1-P4 衰减层，而是先采用一份结构化 flat XML 摘要。每次整理的当前 raw conversation 是唯一事实来源；整理者另外收到两个有界参考块：
 
-1. `<project_memory>`：当前 Git worktree scope 可见的 project memories（包含全局 `PREFERENCES`），用于去重、命名和识别长期约束。
+1. `<project_memory>`：针对本次覆盖范围检索到的 project memories（含全局 `PREFERENCES`、匹配的归档行，以及当前可注入集合），每条带 id 与 `archived` 标记，用于去重、去陈旧、命名和识别长期约束。
 2. `<session_references>`：同一 session 最近最多 6 个未归档 Compartment，用于判断当前工作是否延续旧目标。参考摘要不是本次覆盖范围，也不能覆盖当前 raw evidence。
 
 整理者输出一个 XML `<output>`，包含一个 flat `<compartment>` 和 `<facts>`：
@@ -89,12 +89,13 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
     </compartment>
   </compartments>
   <facts><fact importance="8">...</fact></facts>
+  <memory_maintenance><stale id="12">...</stale></memory_maintenance>
 </output>
 ```
 
-固定区段让摘要同时保留工作目标、连续性、结果、决策、当前状态、验证结果、未完成项、用户纠正和可搜索锚点。`<facts>` 仍然先进入 `session_facts`，由 Dreamer 决定是否提升为正式 memory。当前落地协议仍将整个 `<compartment>` XML 作为一份 flat summary 存储；未来可以在不改变输入参考模型的情况下增加 `p1`-`p4`。
+固定区段让摘要同时保留工作目标、连续性、结果、决策、当前状态、验证结果、未完成项、用户纠正和可搜索锚点。`<facts>` 只应包含尚未被 live memory 覆盖的耐久事实，写入前代码会再做一次 FTS 去重。可选的 `<memory_maintenance>` 列出被当前证据推翻的 live memory id，整理者落地时将它们归档（仍可被 `ctx_search` 搜到，只是不再自动注入）。`<facts>` 仍然先进入 `session_facts`，由 Dreamer 决定提升或 `discard_fact`。当前落地协议仍将整个 `<compartment>` XML 作为一份 flat summary 存储；未来可以在不改变输入参考模型的情况下增加 `p1`-`p4`。
 
-落地前会先进行 XML token/标签栈校验和 schema 校验，包括根节点、区段顺序、必填节点、属性枚举、fact importance 和 XML 转义。校验失败时，Organizer 会收到带有具体路径和错误原因的 `<validation_errors>`，并最多重新生成一次。修复仍失败时 Compartment 标记为 `failed`，不会写入无效 summary 或 session fact。
+落地前会先进行 XML token/标签栈校验和 schema 校验，包括根节点、区段顺序、必填节点、属性枚举、fact importance、可选 `memory_maintenance`/`stale@id` 和 XML 转义。校验失败时，Organizer 会收到带有具体路径和错误原因的 `<validation_errors>`，并最多重新生成一次。修复仍失败时 Compartment 标记为 `failed`，不会写入无效 summary 或 session fact。
 
 ### 3.2 段落号系统（§N§）
 
@@ -354,15 +355,16 @@ S(t) = I₀ · (1 + α·ln(1+k)) · exp(−(ln2/τ_eff)·Δt)
 
 ### 4.5 ctx_memory 工具
 
+- 主 Agent 必须先 `ctx_search` 再写：live 重复 → `update` 该 id；陈旧/被推翻 → `delete`；两者都没有才 `write`。
 - `{action: "write", category, summary, content, importance}`：写入新记忆（I₀ 由 LLM 给定，0~10）。
-- `{action: "delete", id}`：按 id 删除（LLM 需先 ctx_search 获取 id）。
-- 更新语义：按 id 更新不支持（写入即新条目）；重复膨胀靠 ctx_search 先查后写缓解，后续可加"按 id 更新" action。
-- Agent 直接写入的记忆 `verified_at = NULL`，等待 Dreamer 校验。
+- `{action: "update", id, ...}`：就地更新已有记忆（至少提供 category/summary/content/importance 之一），并清空 `verified_at` 以便 Dreamer 再校验。
+- `{action: "delete", id}`：按 id 物理删除（LLM 需先 ctx_search 获取 id）。归档行仍可被 `ctx_search` 搜到；delete 才会拿掉这一行。
+- Agent 直接写入或更新的记忆 `verified_at = NULL`，等待 Dreamer 校验。
 
 ### 4.6 Session Facts（整理者的原始产物）
 
-- 整理者（Compartment 生成器）**不再直接写记忆**，只产生 Session Facts（`session_facts.status = 'pending'`），事实内容面向 Dreamer（可带代码/文件引用）。
-- 状态机：`pending → promoted`（Dreamer 提升为正式记忆，记 `promoted_memory_id`）/ `discarded`（Dreamer 判断不构成项目记忆，如一次性琐事）。
+- 整理者（Compartment 生成器）**不再直接写记忆**，只产生 Session Facts（`session_facts.status = 'pending'`），事实内容面向 Dreamer（可带代码/文件引用）。生成前会检索当前 scope 的 memories（含归档命中），提示词要求不去重述 live memory，并可用 `<stale id>` 归档被推翻的条目；写入 `session_facts` 前代码再按 FTS 去掉与 live memory 重复的 fact。
+- 状态机：`pending → promoted`（Dreamer 提升为正式记忆，记 `promoted_memory_id`）/ `discarded`（Dreamer 的 `discard_fact`：一次性琐事，或与已有 live memory 重复/被其覆盖）。
 - 注意：Session Facts 不是记忆——不参与注入、不进 ctx_search 主检索（仅 Dreamer 消费）。
 
 ### 4.7 Dreamer（后台记忆整理者）
@@ -371,8 +373,8 @@ S(t) = I₀ · (1 + α·ln(1+k)) · exp(−(ln2/τ_eff)·Δt)
 
 **职责**
 
-1. **校验记忆 vs 代码库**：携带待校验记忆（30 天校验周期）扫描代码库（只读），核对是否符合事实；不符 → 修正 summary/content/importance，或注销（archived）过时记忆；校验后更新 `verified_at`。
-2. **提升 Session Facts**：把 pending facts 评估为正式记忆（Dreamer 定 category / importance / summary 措辞），并**合并**重复记忆（多会话产生的相同事实 → 合并到一条，更新 hits/内容）。
+1. **校验记忆 vs 代码库**：携带待校验记忆（30 天校验周期）扫描代码库（只读），核对是否符合事实；不符 → 修正 summary/content/importance，或注销（archived）过时记忆。`memory_update` 成功时由代码写入 `verified_at`；一轮在无 tool-call 的情况下正常结束时，也会给本批仍存活的待校验记忆盖上时间戳。
+2. **提升 Session Facts**：把 pending facts 评估为正式记忆（Dreamer 定 category / importance / summary 措辞）。重复或陈旧 fact 用 `discard_fact` 丢弃，并 `memory_update` 已有行；禁止再 `promote_fact` 出第二条。
 3. **Compartment 重整**：评估旧 Compartments 的重要度（写 `importance`），标记待归档（`archive_flagged`）。Dreamer 只打标记——**真实归档由代码逻辑执行**。
 
 **启动输入**（三个查询打包为初始消息；字段可按实现调整）
@@ -402,10 +404,11 @@ FROM compartments WHERE has_promoted_facts = 0 ORDER BY created_at;
 | `memory_write` | 直接写记忆（合并时用） |
 | `memory_update` | 修正已有记忆（id + 字段） |
 | `memory_archive` | 注销过时记忆 |
-| `promote_fact` | fact id → 提升为记忆（Dreamer 定 category/importance/summary），facts 置 promoted |
+| `promote_fact` | fact id → 提升为**新**记忆（Dreamer 定 category/importance/summary），facts 置 promoted；重复 fact 不要走这条 |
+| `discard_fact` | fact id → pending fact 标为 discarded，不建记忆 |
 | `compartment_mark` | compartments id → 设 archive_flagged / importance |
 
-主 Agent 的 `context-tool-guidance` system-prompt section 明确指导：不需要或过时的段落用 `ctx_reduce`，重要持久信息用 `ctx_memory`，需要记忆全文时用 `ctx_search`，需要段落原文时用 `ctx_expand`。
+主 Agent 的 `context-tool-guidance` system-prompt section 明确指导：不需要或过时的段落用 `ctx_reduce`；写入记忆前先 `ctx_search`，重复则 `ctx_memory` update、陈旧则 delete、确认无重复/陈旧后再 write；需要记忆全文时用 `ctx_search`（含归档行）；需要段落原文时用 `ctx_expand`。
 
 **循环实现**：插件内自建轻量 loop（不走 DSH agent/deriveMessages，不占段落号）：system（角色 + schema + 工具说明）+ 素材初始消息 → `ctx.llm.stream` → 解析 tool_calls → 执行 → 结果回填 → 直到无 tool_calls 或轮次上限（默认 20）/总超时（默认 10 分钟）。进程级 single-flight（同时只跑一个 Dreamer）。Dreamer 是辅助 LLM 调用，路由默认跟随会话（或配置 provider/model）。
 
@@ -510,6 +513,12 @@ ContextEngine 为当前 agent 注册用户侧命令：
 
 重新选择当前 workspace 下的可注入 Memories，并将一个完整的 `<project_memory>` block **追加**到下一次模型请求。它不会改写 deriveMessages 首部已有的 Memory block，因此不会让原有请求前缀整体失效；没有可注入 Memory 时返回成功但不排队消息。
 
+```text
+/organize-memories
+```
+
+把**当前会注入的** project memories（带 id 和全文）交给主 Agent 审查重复和陈旧项。通知是模型可见的 context notice，和 `/inject-memory` 一样走 `agent.inject()`。模型应先 `ctx_search`（含归档行）；明确的重复用 `ctx_memory` update 保留行并 delete 多余 id，明确陈旧则 delete；拿不准时先问用户再改。命令还会附上 FTS 找到的相关行（含归档、不含当前注入集）作对照。没有可注入 Memory 时返回成功但不排队消息。
+
 ## 8. UI 展示
 
 状态汇报走 **activity row**：`notifications.js` 直接向 session 追加一对 `command/run` + `command/done`，Web 客户端把它们按 `commandId` 配对成一张可折叠的 `GenericCommandCard`——`command/done` 到达前显示为运行中，`kind: "error"` 显示为红色失败态。Host bridge 使用 `/magic-context/config`、`/magic-context/usage` 和 `/magic-context/models/*` 路径。
@@ -536,7 +545,7 @@ ContextEngine 为当前 agent 注册用户侧命令：
 
 自定义事件类型（例如 `magic-context/notice`）不可行：`Session.append()` 只接受 `sourceEventSeqs` 和 `surfaceOp`，插件无法设置 envelope 的 `ignorable` 标记，而 `dsh-session-persistence` 会拒绝解析任何含未知类型且未标记 `ignorable` 的日志——一条这样的通知就会让整个 session 打不开。上游明确写着该注册面"deferred until such a consumer exists"。
 
-`createContextNotice()` 保留给**真正面向模型**的内容：`/inject-memory` 有意把 memory 正文摆到模型面前，那属于 context message 而不是状态汇报。`tests/dsh-context-notifications-smoke.mjs` 用源码级断言守住这条边界（引擎不得出现 `.inject(`）。
+`createContextNotice()` 保留给**真正面向模型**的内容：`/inject-memory` 和 `/organize-memories` 有意把 memory 正文摆到模型面前，那属于 context message 而不是状态汇报。`tests/dsh-context-notifications-smoke.mjs` 用源码级断言守住这条边界（引擎不得出现 `.inject(`）。
 
 ## 9. 实现阶段
 
@@ -549,4 +558,4 @@ ContextEngine 为当前 agent 注册用户侧命令：
 7. **整理者产生 session_facts**：摘要时抽取事实写入 session_facts（pending）
 8. **挂载与测试**：dsh-magic-context bundle、context-compact preset、patch、烟雾测试（真实 GUI 验证）
 9. **Dreamer**：只读工具集（sql_query/fs_read/memory_*/promote_fact/compartment_mark）、轻量 loop、会话空闲触发、归档例程（compaction/prune 协议 + 预算 + 优先级）
-10. **UI 展示**：状态汇报走 `command/run` + `command/done` activity row（模型不可见、不进 agent inbox），覆盖 memory injection、compartment landing、compartment generation 和 Dreamer 四类；`createContextNotice()` 仅保留给 `/inject-memory` 这类面向模型的注入
+10. **UI 展示**：状态汇报走 `command/run` + `command/done` activity row（模型不可见、不进 agent inbox），覆盖 memory injection、compartment landing、compartment generation 和 Dreamer 四类；`createContextNotice()` 仅保留给 `/inject-memory`、`/organize-memories` 这类面向模型的注入

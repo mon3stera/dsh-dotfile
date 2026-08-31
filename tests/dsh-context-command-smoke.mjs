@@ -1,6 +1,6 @@
 // User-side /ctx-search command parser and execution smoke test.
 import { DEFAULT_MEMORY_CONFIG } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/memory.js";
-import { executeCtxSearchCommand, executeDreamCommand, executeInjectMemoryCommand, parseCtxSearchInput, parseDreamInput, parseInjectMemoryInput } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/commands.js";
+import { collectRelatedMemories, executeCtxSearchCommand, executeDreamCommand, executeInjectMemoryCommand, executeOrganizeMemoriesCommand, parseCtxSearchInput, parseDreamInput, parseInjectMemoryInput, parseOrganizeMemoriesInput, renderOrganizeMemoriesText } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/commands.js";
 
 let failed = 0;
 const check = (label, ok) => {
@@ -67,6 +67,46 @@ const injectResult = await executeInjectMemoryCommand({
 check("inject command succeeds", injectResult.kind === "success");
 check("inject command appends one message", injectedMessages.length === 1 && injectedMessages[0].content[0].text.includes("<project_memory>") && injectedMessages[0].source.form === "notice");
 check("inject command records memory hit", injectHits.length === 1 && injectHits[0] === 9);
+
+check("organize parser accepts no args", JSON.stringify(parseOrganizeMemoriesInput("")) === "{}");
+check("organize parser rejects args", parseOrganizeMemoriesInput("now").error === "Usage: /organize-memories");
+const organizeRows = [
+	{ id: 9, category: "CONVENTIONS", summary: "Use append-only context injections.", content: "Keep the existing request prefix stable.", importance: 8, hits: 0, last_hit_at: Date.now(), archived: 0 },
+];
+const relatedRow = { id: 11, category: "CONVENTIONS", summary: "Use append-only injections.", content: "Older wording of the same convention.", archived: 1 };
+const organizeHits = [];
+const organizedMessages = [];
+const organizeCdb = {
+	allInjectableMemories() { return organizeRows; },
+	recordMemoryHit(id) { organizeHits.push(id); },
+	updateMemory() {},
+	ftsSearch() { return [relatedRow]; },
+	memoryById(id) { return id === 11 ? relatedRow : organizeRows.find((row) => row.id === id); },
+};
+const organizeResult = await executeOrganizeMemoriesCommand({
+	rawInput: "",
+	agent: { session: { id: "agent-1" }, inject(message) { organizedMessages.push(message); } },
+}, {
+	cdb: organizeCdb,
+	memoryConfig: DEFAULT_MEMORY_CONFIG,
+	resolveScope: () => "/repo",
+});
+check("organize command succeeds", organizeResult.kind === "success");
+check("organize command appends one notice", organizedMessages.length === 1 && organizedMessages[0].source.form === "notice" && organizedMessages[0].content[0].text.includes("CURRENTLY INJECTED"));
+check("organize command includes ids and related archived", organizedMessages[0].content[0].text.includes("#9 [CONVENTIONS]") && organizedMessages[0].content[0].text.includes("#11 [CONVENTIONS] archived"));
+check("organize command asks before uncertain deletes", organizedMessages[0].content[0].text.includes("ask the user before changing anything"));
+check("organize command records memory hit", organizeHits.length === 1 && organizeHits[0] === 9);
+check("organize related collector skips the injected id", collectRelatedMemories(organizeCdb, organizeRows, "/repo").map((row) => row.id).join(",") === "11");
+check("organize renderer lists injected content", renderOrganizeMemoriesText(organizeRows).includes("Keep the existing request prefix stable."));
+const emptyOrganize = await executeOrganizeMemoriesCommand({
+	rawInput: "",
+	agent: { session: { id: "agent-1" }, inject() { throw new Error("should not inject"); } },
+}, {
+	cdb: { allInjectableMemories() { return []; }, updateMemory() {} },
+	memoryConfig: DEFAULT_MEMORY_CONFIG,
+	resolveScope: () => "/repo",
+});
+check("organize command skips empty set", emptyOrganize.kind === "success" && emptyOrganize.text.includes("No injectable"));
 
 if (failed > 0) {
 	console.error(`${failed} assertion(s) failed`);

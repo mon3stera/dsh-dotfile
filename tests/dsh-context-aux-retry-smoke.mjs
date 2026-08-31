@@ -138,6 +138,9 @@ const unescapedXml = compartmentXml("<fact importance=\"7\">package.json <name> 
 	check("sanitizer repairs an unescaped leaf tag", revalidated.ok);
 	check("sanitizer keeps the literal text", revalidated.ok && revalidated.facts[0].text.includes("<name>") && revalidated.facts[0].text.includes("& bundle"));
 	check("sanitizer leaves valid documents alone", sanitizeOrganizerOutput(validXml) === validXml);
+	const withMaintenance = validXml.replace("</output>", "<memory_maintenance><stale id=\"4\">obsolete</stale></memory_maintenance></output>");
+	check("optional memory_maintenance validates", validateOrganizerOutput(withMaintenance).ok && validateOrganizerOutput(withMaintenance).staleIds[0] === 4);
+	check("sanitizer keeps stale markup", sanitizeOrganizerOutput(withMaintenance).includes("<stale id=\"4\">"));
 	check("sanitizer keeps known structure", sanitizeOrganizerOutput(unescapedXml).includes("<facts>"));
 	const fenced = ["Here is the result:", "```xml", validXml, "```"].join("\n");
 	check("fenced output is unwrapped", validateOrganizerOutput(sanitizeOrganizerOutput(fenced)).ok);
@@ -186,6 +189,17 @@ const unescapedXml = compartmentXml("<fact importance=\"7\">package.json <name> 
 		},
 	}, cdb, args);
 	check("organizer survives a throttled attempt", organizerCalls === 2 && summarized.summary.includes("<compartment"));
+
+	let organizerToolOptions;
+	await summarizeCompartment({
+		llm: {
+			async *stream(options) {
+				organizerToolOptions = options;
+				yield { type: "text-delta", text: validXml };
+			},
+		},
+	}, cdb, { ...args, session: { ...session, requestHeader: () => ({ system: "sys", tools: [{ name: "not-for-organizer" }], config: { provider: "p", model: "m" } }) } });
+	check("organizer omits executable session tools", !("tools" in organizerToolOptions));
 
 	let effortOptions;
 	await summarizeCompartment({

@@ -92,7 +92,7 @@ lib/
   organizer-xml.js          Organizer XML/schema validation, local escaping repair, repair prompt
   aux-llm.js                Bounded retry/backoff for auxiliary (non-agent-loop) LLM calls
   landing.js                Stable checkpoint landing and surface replacement
-  commands.js               /dream, /ctx-search, and /inject-memory commands
+  commands.js               /dream, /ctx-search, /inject-memory, and /organize-memories commands
   notifications.js          Model-invisible activity rows and the model-facing notice
   scope.js                  Git-worktree/session scope resolution
   usage.js                  Context usage projection for the UI
@@ -107,7 +107,7 @@ Important context behavior:
 - Tables include `memories`, `memories_fts`, optional `memories_vec`, `paragraphs`, `skip_marks`, `compartments`, and `session_facts`.
 - `sqlite-vec` and `@huggingface/transformers` are optional at runtime; FTS5 remains the fallback, and Transformers.js is only needed for local embedding/rerank models.
 - Dreamer is an auxiliary `ctx.llm.stream()` loop, not a new agent/session. It reads bounded source context with `session_context`, performs dedicated memory/fact/compartment actions, and reports through one activity row per pass.
-- Status reporting uses activity rows, never context notices: `notifications.js` appends a `command/run` + `command/done` pair that the client folds into one collapsible card (running until settled, red on `kind: "error"`). Both types are log-only and non-surface, so the model never sees them and nothing enters the agent inbox. The previous `agent.inject()` notices were model-visible by construction (only `user/message`, `assistant/message`, and `tool/result` are surface-eligible, and `deriveEventMessage` projects each unconditionally) and cost one extra whole-context LLM request per row, because `inject()` writes to `inbox.nextStep` and the loop only ends a turn while that queue is empty. A plugin-owned event type is not an option: `Session.append()` cannot set the envelope `ignorable` marker, and `dsh-session-persistence` refuses to interpret a log carrying an unknown unmarked type, which would make the session unloadable. `createContextNotice()` stays only for deliberately model-facing content such as `/inject-memory`.
+- Status reporting uses activity rows, never context notices: `notifications.js` appends a `command/run` + `command/done` pair that the client folds into one collapsible card (running until settled, red on `kind: "error"`). Both types are log-only and non-surface, so the model never sees them and nothing enters the agent inbox. The previous `agent.inject()` notices were model-visible by construction (only `user/message`, `assistant/message`, and `tool/result` are surface-eligible, and `deriveEventMessage` projects each unconditionally) and cost one extra whole-context LLM request per row, because `inject()` writes to `inbox.nextStep` and the loop only ends a turn while that queue is empty. A plugin-owned event type is not an option: `Session.append()` cannot set the envelope `ignorable` marker, and `dsh-session-persistence` refuses to interpret a log carrying an unknown unmarked type, which would make the session unloadable. `createContextNotice()` stays only for deliberately model-facing content such as `/inject-memory` and `/organize-memories`.
 - Dreamer idle triggering is per session and is deduplicated to one run per interaction round. Background notices must not create another run without a new `turn/start`.
 - Organizer and Dreamer calls are auxiliary: the harness retry plugin never sees them, so they go through `aux-llm.js` for bounded backoff retry of `RATE_LIMIT`/`SERVER`/`TIMEOUT`/`TRANSPORT`/`EMPTY_RESPONSE`. A failed generation stores its reason in `compartments.error`, settles its activity row as an error, and arms a doubling per-session cooldown, because each attempt re-sends the whole range.
 - Organizer and Dreamer targets are configured independently (`summarizationProvider`/`summarizationModel`/`summarizationReasoningEffort` and the `dreamer*` trio); provider and model must both be set to override the session route, while the effort applies either way. The settings panel populates its pickers from `GET /magic-context/models/catalog`, which reuses the host `llm` registry (`listProviders`/`listModels`/`resolveModelInfo`); that route only exists where the registry does, and the panel degrades to manual entry without it.
@@ -117,7 +117,8 @@ Important context behavior:
 - `compactNow` distinguishes a busy agent (the maintenance task never started) from a work failure (`summary`, with the normalized reason) and an abort (`cancelled`). Reporting every failure as `busy` previously hid deterministic summarization failures.
 - Organizer XML stays fail-closed. When validation fails, one local schema-aware pass (`sanitizeOrganizerOutput`) may re-classify unescaped text as text and strip a markdown fence, but its result must pass the unchanged validator; otherwise the single bounded model repair call runs as before.
 - New memory writes and fact promotions carry source session/compartment provenance when available. Old memories may have no recoverable source provenance.
-- The main Agent receives `context-tool-guidance` for `ctx_reduce`, `ctx_expand`, `ctx_memory`, and `ctx_search`.
+- The main Agent receives `context-tool-guidance` for `ctx_reduce`, `ctx_expand`, `ctx_memory`, and `ctx_search`. It must `ctx_search` before writing a memory: update a duplicate, delete a stale row, and write only when neither applies.
+- Dreamer `promote_fact` always inserts a new memory; duplicate or one-off pending facts go through `discard_fact`. A successful `memory_update` stamps `verified_at`, and a settled pass stamps remaining live memories from that verification list.
 
 ### `dsh-plugin-background`
 
@@ -264,7 +265,7 @@ Other useful context tests:
 - `dsh-context-retrieval-smoke.mjs`: embedding, rerank, RRF, and degradation behavior
 - `dsh-context-local-models-smoke.mjs`: local embedding/rerank preset clients
 - `dsh-context-settings-smoke.mjs`: settings schema, model routes, and config merge
-- `dsh-context-command-smoke.mjs`: `/dream` and `/ctx-search`
+- `dsh-context-command-smoke.mjs`: `/dream`, `/ctx-search`, `/inject-memory`, and `/organize-memories`
 - `dsh-context-paragraphs-smoke.mjs`: paragraph numbering and injection
 - `dsh-context-tools-smoke.mjs`: `ctx_reduce` / `ctx_expand`
 - `dsh-context-landing-smoke.mjs`: checkpoint landing and surface stability

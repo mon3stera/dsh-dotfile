@@ -96,6 +96,7 @@ const engineSource = await readFile("/home/mon3tr/.dsh/profiles/node_modules/dsh
 check("engine never injects into the agent inbox", !/\.inject\(/.test(engineSource));
 const commandSource = await readFile("/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/commands.js", "utf8");
 check("inject-memory still delivers memories to the model", /agent\.inject\(createContextNotice\(/.test(commandSource));
+check("organize-memories is model-facing", /organize-memories/.test(commandSource) && /executeOrganizeMemoriesCommand/.test(commandSource) && /agent\.inject\(createContextNotice\(/.test(commandSource));
 
 const notice = createContextNotice("  Inject Memory: 2 project memories  ", "Injected two project memories into the next model request.");
 check("notice has user message shape", notice.role === "user" && notice.content[0]?.type === "text");

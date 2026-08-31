@@ -61,6 +61,37 @@ const check = (label, ok) => {
 	check("input excludes prior checkpoint", input.messages.every((m) => !m.content.some((b) => b.text === "old checkpoint")));
 	check("input keeps q1 q2", input.messages.length === 2);
 	check("input carries system+tools", input.system === "sys" && input.tools.length === 1);
+
+	const toolEvents = {
+		0: { seq: 0, type: "user/message", data: { content: [{ type: "text", text: "before tools" }] } },
+		1: { seq: 1, type: "assistant/message", data: { message: { role: "assistant", content: [
+			{ type: "tool-call", id: "call-a", name: "read", arguments: "{}" },
+			{ type: "tool-call", id: "call-b", name: "grep", arguments: "{}" },
+		] } } },
+		2: { seq: 2, type: "tool/result", data: { message: { role: "user", source: { kind: "tool", callId: "call-a" }, content: [{ type: "tool-result", toolCallId: "call-a", content: [{ type: "text", text: "result-a" }] }] } } },
+		3: { seq: 3, type: "user/message", data: { content: [{ type: "text", text: "after incomplete tools" }] } },
+	};
+	const toolSession = {
+		requestHeader: () => ({ config: { provider: "p", model: "m" } }),
+		events: toolEvents,
+		deriveEventMessage: (event) => event.type === "assistant/message" || event.type === "tool/result" ? event.data.message : event.data,
+	};
+	const incomplete = buildSummarizationInput(toolSession, { shadowedSeqs: [0, 1, 2, 3] }, new Set());
+	const incompleteJson = JSON.stringify(incomplete.messages);
+	check("organizer drops incomplete tool-call batches", !incompleteJson.includes("call-a") && !incompleteJson.includes("call-b") && incompleteJson.includes("after incomplete tools"));
+
+	const balancedEvents = {
+		0: toolEvents[0],
+		1: toolEvents[1],
+		2: toolEvents[2],
+		3: { seq: 3, type: "tool/result", data: { message: { role: "user", source: { kind: "tool", callId: "call-b" }, content: [{ type: "tool-result", toolCallId: "call-b", content: [{ type: "text", text: "result-b" }] }] } } },
+		4: toolEvents[3],
+	};
+	const balancedSession = { ...toolSession, events: balancedEvents };
+	const balanced = buildSummarizationInput(balancedSession, { shadowedSeqs: [0, 1, 2, 3, 4] }, new Set());
+	const balancedJson = JSON.stringify(balanced.messages);
+	check("organizer preserves complete multi-tool batches", ["call-a", "call-b", "result-a", "result-b"].every((marker) => balancedJson.includes(marker)));
+	check("organizer preserves tool batch order", balancedJson.indexOf("call-a") < balancedJson.indexOf("result-a") && balancedJson.indexOf("call-b") < balancedJson.indexOf("result-b"));
 }
 
 // ── organizer continuity references + flat summary contract ──────────────────
@@ -77,7 +108,14 @@ const check = (label, ok) => {
 			summary: `Title: work ${index + 1}\nOutcome: completed ${index + 1}`,
 		})),
 	}, "s", "/workspace");
-	check("references include project memory", references.projectMemory.includes("Never edit production directly"));
+	check("references include project memory", references.projectMemory.includes("Never edit production directly") && references.projectMemory.includes('archived="false"'));
+	check("references merge search hits first", buildOrganizerReferences({
+		allInjectableMemories: () => [{ id: 1, category: "PREFERENCES", summary: "Use concise commits", content: "One unprefixed line.", importance: 5, hits: 0, created_at: 1 }],
+		activeCompartments: () => [],
+	}, "s", "/workspace", { searchHits: [{ id: 9, category: "ARCHITECTURE", summary: "range hit", content: "from FTS", archived: 1, importance: 4, hits: 0, created_at: 0 }] }).projectMemory.includes('id="9"') && buildOrganizerReferences({
+		allInjectableMemories: () => [{ id: 1, category: "PREFERENCES", summary: "Use concise commits", content: "One unprefixed line.", importance: 5, hits: 0, created_at: 1 }],
+		activeCompartments: () => [],
+	}, "s", "/workspace", { searchHits: [{ id: 9, category: "ARCHITECTURE", summary: "range hit", content: "from FTS", archived: 1, importance: 4, hits: 0, created_at: 0 }] }).projectMemory.includes('archived="true"'));
 	check("references are bounded to recent compartments", references.sessionReferences.includes('generation="7"') && !references.sessionReferences.includes('generation="1"'));
 	check("references escape embedded XML", buildOrganizerReferences({
 		allInjectableMemories: () => [{ id: 3, category: "ARCHITECTURE", summary: "a < b", content: "x & y", importance: 1, hits: 0, created_at: 0 }],
@@ -110,6 +148,9 @@ const check = (label, ok) => {
 	const parsedXml = parseOrganizerOutput(xml);
 	const validatedXml = validateOrganizerOutput(xml);
 	check("validate XML output", validatedXml.ok);
+	const xmlWithMaintenance = xml.replace("</output>", "  <memory_maintenance><stale id=\"4\">memory summary is obsolete</stale></memory_maintenance>\n</output>");
+	const validatedMaintenance = validateOrganizerOutput(xmlWithMaintenance);
+	check("validate optional memory_maintenance", validatedMaintenance.ok && validatedMaintenance.staleIds?.[0] === 4);
 	check("parse XML compartment", parsedXml.summary.includes('title=\"Bundle release\"') && parsedXml.summary.includes("<current_state>"));
 	check("parse XML facts", parsedXml.facts.length === 1 && parsedXml.facts[0].text.includes("& verified") && parsedXml.facts[0].importance === 8);
 
@@ -121,7 +162,7 @@ const check = (label, ok) => {
 	let storedSummary;
 	const summarizeSession = {
 		id: "summarize-session",
-		requestHeader: () => ({ system: "sys", tools: [], config: { provider: "p", model: "m" } }),
+		requestHeader: () => ({ system: "sys", tools: [{ name: "historical-tool" }], config: { provider: "p", model: "m" } }),
 		events: { 1: { type: "user/message", data: { content: [{ type: "text", text: "new work" }] } } },
 		deriveEventMessage: (event) => ({ role: "user", content: event.data.content }),
 	};
@@ -151,6 +192,42 @@ const check = (label, ok) => {
 	check("summarizer passes project memory", organizerPrompt.includes("memory summary"));
 	check("summarizer passes old compartments", organizerPrompt.includes("old work"));
 	check("summarizer stores XML compartment", summarized.summary.includes("<compartment") && storedSummary.includes("<current_state>"));
+	check("organizer omits executable session tools", !("tools" in capturedOptions));
+
+	const insertedFacts = [];
+	const archivedIds = [];
+	const maintenanceCdb = {
+		...summarizeCdb,
+		ftsSearch: () => [{ id: 4, category: "ARCHITECTURE", summary: "memory summary", content: "memory detail", archived: 0 }],
+		memoryById: (id) => id === 4 ? { id: 4, category: "ARCHITECTURE", summary: "memory summary", content: "memory detail", archived: 0 } : undefined,
+		updateMemory: (id, fields) => { if (fields.archived === 1) archivedIds.push(id); return true; },
+		insertFact: (row) => { insertedFacts.push(row); },
+	};
+	const duplicateAndNewFacts = [
+		"<output>",
+		xml.slice(xml.indexOf("<compartments>"), xml.indexOf("<facts>")),
+		"<facts>",
+		"<fact importance=\"8\">memory summary remains the architecture</fact>",
+		"<fact importance=\"7\">brand-new widget contract is unique</fact>",
+		"</facts>",
+		"<memory_maintenance><stale id=\"4\">memory summary is obsolete</stale></memory_maintenance>",
+		"</output>",
+	].join("");
+	await summarizeCompartment({
+		llm: {
+			async *stream() {
+				yield { type: "text-delta", text: duplicateAndNewFacts };
+			},
+		},
+	}, maintenanceCdb, {
+		session: summarizeSession,
+		compartment: { id: 7 },
+		range: { shadowedSeqs: [1] },
+		scopePath: "/workspace",
+		target: { provider: "p", model: "m" },
+	});
+	check("organizer archives stale memories", archivedIds.includes(4));
+	check("organizer skips duplicate facts", insertedFacts.length === 1 && insertedFacts[0].fact.includes("widget"));
 
 	let repairCalls = 0;
 	let repairPrompt = "";
@@ -231,6 +308,7 @@ const check = (label, ok) => {
 		check("context tools registered", registeredTools.some((tool) => tool.name === "ctx_reduce") && registeredTools.some((tool) => tool.name === "ctx_expand"));
 		const guidance = promptSections.find((section) => section.name === "context-tool-guidance");
 		check("context tool guidance injected", guidance?.text.includes("ctx_reduce") && guidance.text.includes("ctx_memory") && guidance.text.includes("ctx_search") && guidance.text.includes("ctx_expand"));
+		check("context tool guidance searches before write", guidance.text.includes("ctx_search first") && guidance.text.includes("do not write a second row"));
 		check("triggers registered", stubs.some(([n]) => n === "agent/pre-step") && stubs.some(([n]) => n === "session/event") && stubs.some(([n]) => n === "agent/request-error"));
 		// The memory block is a stable request prefix: a completed step refreshes
 		// usage but must never retract the block, or every turn after the first

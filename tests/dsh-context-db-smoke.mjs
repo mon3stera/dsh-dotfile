@@ -83,13 +83,14 @@ try {
 	check("pending facts", cdb.pendingFacts().length === 1);
 	cdb.promoteFact(f1, m1);
 	check("promote fact", cdb.pendingFacts().length === 0);
+	check("discard promoted rejected", (() => { try { cdb.discardFact(f1); return false; } catch { return true; } })());
 	cdb.insertFact({ sessionId: "s", compartmentId: c1, fact: "deploy via rsync", importance: 4 });
 	cdb.discardFact(cdb.pendingFacts()[0].id);
 	check("discard fact", cdb.pendingFacts().length === 0);
 
 	// verification cycle
 	check("needs verification (fresh)", cdb.memoriesNeedingVerification(Date.now(), 30).length === 2);
-	cdb.updateMemory(m1, { verified_at: Date.now() });
+	check("mark memories verified", cdb.markMemoriesVerified([m1]) === 1);
 	check("needs verification after verify", cdb.memoriesNeedingVerification(Date.now(), 30).length === 1);
 	check("updateMemory unknown field rejected", cdb.updateMemory(m2, { nope: 1 }) === false);
 	cdb.db.exec("DELETE FROM memories_fts");

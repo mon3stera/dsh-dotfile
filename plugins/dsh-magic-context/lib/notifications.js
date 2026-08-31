@@ -120,7 +120,7 @@ export function recordActivity(session, title, text, kind = "success") {
  * Build one durable, model-facing context message.
  *
  * This remains the right shape for content the model is meant to read, such as
- * the memory selection `/inject-memory` deliberately puts in front of it. Status
+ * the memory selection `/inject-memory` and `/organize-memories` deliberately put in front of it. Status
  * reporting must use the activity rows above instead.
  * @param summary - collapsed row summary.
  * @param text - message body.

@@ -26,15 +26,15 @@ export const DREAMER_INSTRUCTION = [
 	"Three material lists are provided: PENDING SESSION FACTS (raw facts extracted from compacted conversations), MEMORIES TO VERIFY (project memories that may be outdated), and UNDISTILLED COMPARTMENTS (checkpoint summaries whose facts have not been promoted yet).",
 	"",
 	"Your jobs, in order:",
-	"1. VERIFY memories against the real codebase using the read-only filesystem tools (fs_read/fs_list/fs_grep; workspace root is given). When a source session or compartment is provided, call session_context before judging the memory so explicit user instructions and original evidence are preserved. Correct factual drift with memory_update (fix summary/content/importance/category), or memory_archive memories that no longer match reality.",
-	"2. PROMOTE pending session facts into project memories with promote_fact (choose category, summary wording, content, importance 0-10). Read the source compartment with session_context before promoting when available. Before promoting, check for duplicates with sql_query against the memories table and merge instead (promote into the existing row is not supported — promote the fact and then memory_update the older row to archived if it is redundant).",
+	"1. VERIFY memories against the real codebase using the read-only filesystem tools (fs_read/fs_list/fs_grep; workspace root is given). When a source session or compartment is provided, call session_context before judging the memory so explicit user instructions and original evidence are preserved. Correct factual drift with memory_update (fix summary/content/importance/category), or memory_archive memories that no longer match reality. A successful memory_update stamps verified_at automatically. If a listed memory is still accurate, you can leave it; finishing the pass also stamps remaining live memories in the list.",
+	"2. PROMOTE pending session facts into project memories with promote_fact (choose category, summary wording, content, importance 0-10) only when the fact is durable and new. Read the source compartment with session_context before promoting when available. Before promoting, check for duplicates with sql_query against the memories table. If the fact restates a live memory, discard_fact it instead of promoting. If current evidence supersedes a live memory, memory_update that row and discard_fact the pending fact. Never promote a duplicate into a second row.",
 	"3. DISTILL undistilled compartments: their facts may already be pending; verify with sql_query, and mark each processed compartment with compartment_mark (compartmentId, processed=true) once its facts are handled.",
 	"4. RECOMMEND ARCHIVAL: mark compartments that should be archived with compartment_mark (compartmentId, archive=true) — prefer compartments already distilled to memory, then low-importance, then old ones. Real archival runs in code afterwards; you only mark.",
 	"",
 	"Rules:",
 	"- Never modify files, never run shell commands, never write SQL other than read-only SELECTs.",
 	"- Treat original session records as evidence: preserve explicit user instructions, and if source context is unavailable, state uncertainty instead of inventing provenance.",
-	"- Keep working until every item in the three lists is handled (verified/promoted/distilled/marked).",
+	"- Keep working until every item in the three lists is handled (verified/promoted/discarded/distilled/marked).",
 	"- Finish with a plain-text summary of what you changed (no tags).",
 ].join("\n");
 
@@ -52,6 +52,7 @@ const DREAMER_ACTION_LABELS = Object.freeze({
 	memory_update: "updated memories",
 	memory_archive: "archived memories",
 	promote_fact: "promoted facts",
+	discard_fact: "discarded facts",
 	compartment_mark: "updated compartments",
 });
 
@@ -245,7 +246,7 @@ export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = 
 		}),
 		add({
 			name: "memory_write",
-			description: "Write a new project memory (used when merging or when a fact was already promoted separately).",
+			description: "Write a new project memory only when no live row covers the fact. Prefer memory_update on a duplicate, or discard_fact when a pending fact is redundant.",
 			parameters: {
 				type: "object",
 				additionalProperties: false,
@@ -291,6 +292,8 @@ export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = 
 				if (cdb.memoryById(args.id, scopePath) === undefined) throw new Error(`memory ${args.id} does not exist in this workspace`);
 				const fields = { ...args };
 				delete fields.id;
+				if (fields.archived !== undefined) fields.archived = fields.archived ? 1 : 0;
+				if (fields.archived !== 1) fields.verified_at = Date.now();
 				const changed = cdb.updateMemory(args.id, fields, scopePath);
 				if (!changed) throw new Error(`memory ${args.id} does not exist`);
 				if (fields.summary !== undefined && retrieval.embedding !== undefined && cdb.vecEnabled) {
@@ -323,7 +326,7 @@ export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = 
 		}),
 		add({
 			name: "promote_fact",
-			description: "Promote one pending session fact into a project memory.",
+			description: "Promote one pending session fact into a NEW project memory. If the fact duplicates a live memory, call discard_fact instead.",
 			parameters: {
 				type: "object",
 				additionalProperties: false,
@@ -354,6 +357,20 @@ export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = 
 					}
 				}
 				return { id };
+			},
+		}),
+		add({
+			name: "discard_fact",
+			description: "Discard one pending session fact without creating a memory. Use this for one-off details and for facts that duplicate or are superseded by an existing live memory.",
+			parameters: {
+				type: "object",
+				additionalProperties: false,
+				properties: { factId: { type: "number" } },
+				required: ["factId"],
+			},
+			execute(args) {
+				cdb.discardFact(args.factId, scopePath);
+				return { ok: true };
 			},
 		}),
 		add({
@@ -458,6 +475,7 @@ export async function runDreamer(ctx, cdb, opts) {
 	const abort = new AbortController();
 	const timer = setTimeout(() => abort.abort(), timeoutMs);
 	let rounds = 0;
+	let settled = false;
 	try {
 		for (; rounds < maxRounds;) {
 			rounds += 1;
@@ -487,7 +505,10 @@ export async function runDreamer(ctx, cdb, opts) {
 			const blocks = assembler.blocks();
 			const calls = blocks.filter((block) => block.type === "tool-call");
 			messages.push(createAssistantMessage({ content: blocks, source: { provider, model } }));
-			if (calls.length === 0) break;
+			if (calls.length === 0) {
+				settled = true;
+				break;
+			}
 			for (const call of calls) {
 				const tool = byName.get(call.name);
 				if (tool === undefined) {
@@ -516,7 +537,10 @@ export async function runDreamer(ctx, cdb, opts) {
 				}));
 			}
 		}
-		return { skipped: false, rounds, actions, ...material };
+		if (settled && typeof cdb.markMemoriesVerified === "function") {
+			cdb.markMemoriesVerified(material.memories.map((memory) => memory.id), Date.now(), scopePath);
+		}
+		return { skipped: false, rounds, actions, settled, ...material };
 	} finally {
 		clearTimeout(timer);
 	}
