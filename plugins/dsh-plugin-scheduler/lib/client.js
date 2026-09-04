@@ -33,6 +33,11 @@ window.__ModuleLoader__.load({
 			"schd.prompt": "任务提示词（新会话的第一条消息）",
 			"schd.cwd": "工作目录（留空用默认）",
 			"schd.preset": "Agent 预设（留空用默认）",
+			"schd.provider": "模型 provider（留空用默认路由）",
+			"schd.model": "模型（留空用默认路由）",
+			"schd.modelHint": "provider 与 model 都填写时，任务会话覆盖部署默认模型；只填其一不生效",
+			"schd.modelDefault": "默认路由",
+			"schd.modelManual": "模型目录不可用，请手动输入",
 			"schd.kind": "触发方式",
 			"schd.interval": "固定间隔",
 			"schd.daily": "每天",
@@ -65,6 +70,11 @@ window.__ModuleLoader__.load({
 			"schd.prompt": "Prompt (first message of the new session)",
 			"schd.cwd": "Working directory (empty = default)",
 			"schd.preset": "Agent preset (empty = default)",
+			"schd.provider": "Model provider (empty = default route)",
+			"schd.model": "Model (empty = default route)",
+			"schd.modelHint": "When both provider and model are set, the task session overrides the deployment default; one alone does nothing",
+			"schd.modelDefault": "Default route",
+			"schd.modelManual": "Model catalog unavailable — type the values",
 			"schd.kind": "Trigger",
 			"schd.interval": "Fixed interval",
 			"schd.daily": "Daily",
@@ -92,10 +102,10 @@ window.__ModuleLoader__.load({
 
 		/** Row and panel styles (schd-* prefix, theme alias tokens only). */
 		const PLUGIN_CSS = [
-			".schd-entry{display:flex;align-items:center;gap:8px;width:100%;border:none;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;padding:8px 10px;border-radius:8px;font-size:13px;font-family:inherit;text-align:left}",
-			".schd-entry:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}",
+			".schd-entry{box-sizing:border-box;cursor:pointer;width:auto;min-width:0;height:42px;color:var(--dsw-alias-label-primary);background:0 0;border:none;border-radius:12px;flex:1;align-items:center;gap:8px;margin:0;padding:0 10px 0 8px;font-family:inherit;font-size:14px;line-height:22px;display:flex;overflow:hidden;text-align:left}",
+			".schd-entry:hover{background:var(--dsw-alias-interactive-bg-hover)}",
 			".schd-entryIcon{flex:none;display:inline-flex}",
-			".schd-collapsed{justify-content:center;padding:8px}",
+			".schd-collapsed{border-radius:50%;justify-content:center;gap:0;width:36px;height:36px;margin:0;padding:0;flex:none}",
 			".schd-panel{position:fixed;top:0;right:0;bottom:0;width:400px;max-width:100vw;z-index:80;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1);border-left:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.5;box-shadow:-12px 0 32px rgba(0,0,0,.25)}",
 			".schd-head{display:flex;align-items:center;gap:8px;padding:14px 16px;border-bottom:1px solid var(--dsw-alias-border-l2)}",
 			".schd-title{flex:1;font-size:14px;font-weight:500}",
@@ -135,12 +145,13 @@ window.__ModuleLoader__.load({
 				"aria-hidden": true,
 				children: jsx("svg", {
 					width: 16, height: 16, viewBox: "0 0 16 16", fill: "none",
-					stroke: "currentColor", "stroke-width": 1.4, "stroke-linecap": "round",
+					stroke: "currentColor", "stroke-linecap": "round",
 					children: [
 						jsx("circle", { cx: 8, cy: 8.5, r: 5.8 }),
 						jsx("path", { d: "M8 5.4v3.1l2.1 1.4" }),
 						jsx("path", { d: "M5.2 1.6h5.6" })
-					]
+					],
+					"stroke-width": 1.5
 				})
 			});
 		}
@@ -153,6 +164,8 @@ window.__ModuleLoader__.load({
 			prompt: "",
 			cwd: "",
 			agentPreset: "",
+			provider: "",
+			model: "",
 			enabled: true,
 			kind: "interval",
 			minutes: 60,
@@ -182,6 +195,8 @@ window.__ModuleLoader__.load({
 			const [draft, setDraft] = useState(null);
 			const [status, setStatus] = useState("");
 			const [busy, setBusy] = useState(false);
+			/* provider/model groups for the task form; null = manual entry */
+			const [catalog, setCatalog] = useState(null);
 
 			const load = useCallback(async () => {
 				try {
@@ -234,8 +249,20 @@ window.__ModuleLoader__.load({
 				}
 			}, [load]);
 
+			/* the model catalog comes from the magic-context settings bridge; any
+			 * failure degrades the form to manual provider/model entry */
+			const catalogGroups = catalog?.groups ?? null;
+			const providerModels = catalogGroups?.find((group) => group.id === draft?.provider)?.models ?? null;
+			const modelOptions = providerModels?.map((model) => (typeof model === "string" ? model : model.id)) ?? [];
 			useEffect(() => {
-				if (open) void load();
+				if (!open) return;
+				void load();
+				fetch("/magic-context/models/catalog")
+					.then((response) => (response.ok ? response.json() : null))
+					.then((payload) => {
+						setCatalog(payload?.ok === true && Array.isArray(payload.groups) && payload.groups.length > 0 ? payload : null);
+					})
+					.catch(() => setCatalog(null));
 			}, [open, load]);
 
 			const saveDraft = async () => {
@@ -311,6 +338,37 @@ window.__ModuleLoader__.load({
 						className: "schd-input", value: draft.agentPreset,
 						onChange: (e) => { setDraft({ ...draft, agentPreset: e.target.value }); }
 					}) }),
+					jsx(Field, { label: t("schd.provider"), children: catalogGroups
+						? jsx("select", {
+							className: "schd-select", value: draft.provider,
+							onChange: (e) => { setDraft({ ...draft, provider: e.target.value, model: "" }); },
+							children: [
+								jsx("option", { key: "", value: "", children: t("schd.modelDefault") }),
+								...catalogGroups.map((group) => jsx("option", { key: group.id, value: group.id, children: group.id }))
+							]
+						})
+						: jsx("input", {
+							className: "schd-input", value: draft.provider, placeholder: t("schd.modelManual"),
+							onChange: (e) => { setDraft({ ...draft, provider: e.target.value }); }
+						})
+					}),
+					jsx(Field, { label: t("schd.model"), children: !draft.provider
+						? jsx("input", { className: "schd-input", disabled: true, placeholder: t("schd.modelDefault") })
+						: catalogGroups && modelOptions.length > 0
+							? jsx("select", {
+								className: "schd-select", value: draft.model,
+								onChange: (e) => { setDraft({ ...draft, model: e.target.value }); },
+								children: [
+									jsx("option", { key: "", value: "", children: t("schd.modelDefault") }),
+									...modelOptions.map((id) => jsx("option", { key: id, value: id, children: id }))
+								]
+							})
+							: jsx("input", {
+								className: "schd-input", value: draft.model, placeholder: t("schd.modelManual"),
+								onChange: (e) => { setDraft({ ...draft, model: e.target.value }); }
+							})
+					}),
+					jsx("div", { className: "schd-meta", children: t("schd.modelHint") }),
 					jsx("label", { className: "schd-checkRow", children: [
 						jsx("input", {
 							type: "checkbox", checked: draft.enabled,
