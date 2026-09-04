@@ -35,6 +35,7 @@ plugins/
   dsh-plugin-mobile/          Phone-viewport ergonomics for the Web shell
   dsh-plugin-logo/            Custom Mon3tr brand mark and name
   dsh-plugin-image-model/     Image-generation endpoints as selectable models
+  dsh-plugin-scheduler/       Scheduled tasks that spawn a session per run
   dsh-header-rewrite/         Header rewrite for LLM provider requests
 
 profile/
@@ -53,6 +54,7 @@ tests/
   dsh-mobile-smoke.mjs        Mobile stylesheet, drawer scrim, and host anchor checks
   dsh-logo-smoke.mjs          Logo asset routes and brand-slot contract test
   dsh-image-model-smoke.mjs   Image adapter contract, prompt selection, admission limits
+  dsh-scheduler-smoke.mjs     Scheduler math, routes, run-now, and panel contract test
 ```
 
 ## Plugin Structure
@@ -210,6 +212,13 @@ Important context behavior:
 - `lib/client.js`: a "Header rewrite" section in the Settings sidebar with a YAML editor that loads/saves the config through the host route.
 - `package.json`: Web client injection and package exports.
 
+### `dsh-plugin-scheduler`
+
+- `lib/index.js`: durable scheduled tasks in `$DSH_HOME/scheduler/tasks.json`. Each task has a name, a prompt, an optional cwd / agent preset, and either a fixed interval (minutes ≥ 5) or a daily server-local `HH:MM`. The self-rearming timer fires due tasks through the host `sessionController` service: `create({cwd, agentPreset})` spawns a fresh session, then `prompt({sessionId, requestId, content})` submits the prompt, so every run is an ordinary session in the sidebar list. Routes: `GET/POST /scheduler/tasks` (validated full-document save, atomic write, re-arms the timer) and `POST /scheduler/run` (run one task now). An overdue interval task runs one catch-up when found overdue at boot or after a save; daily tasks wait for their next occurrence. Failures land on the task's `lastError` and surface in the panel.
+- `lib/client.js`: a "定时任务 / Scheduled tasks" entry occupying the `sidebar.footer.action` list slot — the seat renders directly above the Settings entry — toggling a fixed side panel (create/edit/delete, enable toggle, run-now, last run + session id + error). No icon package: the entry draws its own inline clock SVG.
+- `package.json`: Web client injection (locale, slots, sidebar) and package exports.
+- The scheduler deliberately does not use `dsh-schedule`: that host package delivers reminders into an existing conversation, while this plugin's contract is one fresh session per run.
+
 ## Profile Composition
 
 `profile/cordis.patch.example.yml` is an example overlay for the Web profile. It loads the auxiliary Node/client plugins and sets `context-compact` as the default preset for newly created Web sessions; the dsh-magic-context bundle supplies its own host settings row.
@@ -281,7 +290,7 @@ Other useful context tests:
 - `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
 - `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, or `dsh-image-model-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, `dsh-image-model-smoke.mjs`, or `dsh-scheduler-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one.
 
 ## Git and Editing Rules
 

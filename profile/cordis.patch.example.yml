@@ -12,6 +12,10 @@
       name: dsh-plugin-font
     - id: dsh-plugin-hide-session-titles
       name: dsh-plugin-hide-session-titles
+    # Scheduled tasks: each due task spawns a fresh session and submits its
+    # prompt; the entry sits in the sidebar footer action list, above Settings.
+    - id: dsh-plugin-scheduler
+      name: dsh-plugin-scheduler
     # The dsh-magic-context bundle supplies its `host: true` bare host shell.
     # That exact package-name row makes the browser half exist at Web boot;
     # the agent preset mounts dsh-magic-context/engine separately.

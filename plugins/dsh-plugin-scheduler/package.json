@@ -1,0 +1,24 @@
+{
+  "name": "dsh-plugin-scheduler",
+  "version": "0.1.0",
+  "description": "Scheduled tasks for the DSH web surface: each due task spawns a fresh session and submits its prompt; managed from a sidebar entry above Settings",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT"
+}
