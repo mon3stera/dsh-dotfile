@@ -35,6 +35,15 @@ export const CONTEXT_SETTINGS_DEFAULTS = {
 		CONVENTIONS: 30,
 		PREFERENCES: 14,
 	},
+	sessionFilter: {
+		organizer: true,
+		dreamer: true,
+		minSurfaceEvents: 0,
+		includeCwdGlobs: [],
+		excludeCwdGlobs: [],
+		excludeSessionIdPrefixes: [],
+		respectArchived: false,
+	},
 	embeddingPreset: "",
 	rerankPreset: "",
 	embeddingModel: "",
@@ -107,6 +116,18 @@ export const ContextSettingsSchema = z.object({
 	dreamerModel: z.string().default(""),
 	dreamerReasoningEffort: z.string().default(""),
 	dreamerMaxTokens: z.number().step(1).min(1024).max(262144).default(16384),
+	/* Sparse by design: no defaults here, so a settings file that does not
+	 * mention the filter cannot clobber the preset composition's values. The
+	 * engine normalizes absent keys. */
+	sessionFilter: z.object({
+		organizer: z.boolean(),
+		dreamer: z.boolean(),
+		minSurfaceEvents: z.number().step(1).min(0),
+		includeCwdGlobs: z.array(z.string().max(500)),
+		excludeCwdGlobs: z.array(z.string().max(500)),
+		excludeSessionIdPrefixes: z.array(z.string().max(200)),
+		respectArchived: z.boolean(),
+	}),
 });
 
 export function configPath() {
@@ -136,6 +157,18 @@ export function readContextSettings() {
 	}
 }
 
+/**
+ * The engine registers its composed sessionFilter here so GET /magic-context/config
+ * can show the effective values (preset composition under file overrides) instead
+ * of bare schema defaults — the panel would otherwise silently overwrite
+ * non-default preset filter values on save. Last engine construction wins.
+ */
+let sessionFilterSeed = undefined;
+
+export function setSessionFilterSeed(filter) {
+	sessionFilterSeed = filter !== null && typeof filter === "object" ? filter : undefined;
+}
+
 /** Merge file overrides over the preset composition before ContextEngine validates it. */
 export function mergeContextConfig(config) {
 	const overrides = readContextSettings();
@@ -145,6 +178,10 @@ export function mergeContextConfig(config) {
 		halfLives: {
 			...(config.halfLives ?? {}),
 			...(overrides.halfLives ?? {}),
+		},
+		sessionFilter: {
+			...(config.sessionFilter ?? {}),
+			...(overrides.sessionFilter ?? {}),
 		},
 	};
 }
@@ -169,7 +206,17 @@ async function readBody(req, maxBytes) {
 export async function handleContextConfig(req, res) {
 	if (req.method === "GET" || req.method === "HEAD") {
 		const overrides = readContextSettings();
-		json(res, 200, { ok: true, config: { ...CONTEXT_SETTINGS_DEFAULTS, ...overrides, halfLives: { ...CONTEXT_SETTINGS_DEFAULTS.halfLives, ...(overrides.halfLives ?? {}) } } });
+		json(res, 200, {
+			ok: true,
+			config: {
+				...CONTEXT_SETTINGS_DEFAULTS,
+				...overrides,
+				halfLives: { ...CONTEXT_SETTINGS_DEFAULTS.halfLives, ...(overrides.halfLives ?? {}) },
+				/* the engine's composed filter is the base so the panel edits the
+				 * effective values rather than resetting preset choices */
+				sessionFilter: { ...CONTEXT_SETTINGS_DEFAULTS.sessionFilter, ...(sessionFilterSeed ?? {}), ...(overrides.sessionFilter ?? {}) },
+			},
+		});
 		return;
 	}
 	if (req.method !== "POST") {

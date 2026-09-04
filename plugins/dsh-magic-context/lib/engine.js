@@ -36,7 +36,7 @@ import {
 } from "./retrieval.js";
 import { buildDreamerBrief, DEFAULT_DREAMER_MAX_TOKENS, runArchival, runDreamer, summarizeDreamerActions } from "./dreamer.js";
 import { recordActivity, settleActivity, startActivity } from "./notifications.js";
-import { mergeContextConfig } from "./settings.js";
+import { mergeContextConfig, setSessionFilterSeed } from "./settings.js";
 import { clearContextUsage, setContextUsage } from "./usage.js";
 import { describeAuxFailure } from "./aux-llm.js";
 import { sessionMemoryScope } from "./scope.js";
@@ -351,6 +351,8 @@ export class ContextEngine extends BasicCompactionEngine {
 			},
 			sessionFilter: normalizeSessionFilter(own.sessionFilter),
 		};
+		/* the settings panel edits the composed filter, not bare schema defaults */
+		setSessionFilterSeed(this.ownConfig.sessionFilter);
 		this.cdb = openDatabase(resolveDshHome(), { embeddingDim: embeddingPreset?.embeddingDim ?? own.embeddingDim });
 		/* the archived-session set powers respectArchived; unavailable registries
 		 * simply turn that check into a no-op */

@@ -52,6 +52,15 @@ window.__ModuleLoader__.load({
 			dreamerModel: "",
 			dreamerReasoningEffort: "",
 			dreamerMaxTokens: 16384,
+			sessionFilter: {
+				organizer: true,
+				dreamer: true,
+				minSurfaceEvents: 0,
+				includeCwdGlobs: [],
+				excludeCwdGlobs: [],
+				excludeSessionIdPrefixes: [],
+				respectArchived: false,
+			},
 		};
 
 		const GROUPS = [
@@ -112,6 +121,18 @@ window.__ModuleLoader__.load({
 					["dreamerMaxTokens", "number", 1024, 262144, 1024],
 				],
 			},
+			{
+				key: "sessionFilter",
+				fields: [
+					["sessionFilter.organizer", "boolean"],
+					["sessionFilter.dreamer", "boolean"],
+					["sessionFilter.minSurfaceEvents", "number", 0, 1000000, 1],
+					["sessionFilter.respectArchived", "boolean"],
+					["sessionFilter.includeCwdGlobs", "stringList"],
+					["sessionFilter.excludeCwdGlobs", "stringList"],
+					["sessionFilter.excludeSessionIdPrefixes", "stringList"],
+				],
+			},
 		];
 
 		const FIELD_LABELS = {
@@ -152,6 +173,13 @@ window.__ModuleLoader__.load({
 			compartmentBudgetTokens: ["compartment budget", "Dreamer 归档前允许保留的 summary token 总量"],
 			dreamer: ["Dreamer 模型", "后台记忆整理使用的模型；留空表示沿用当前 session route"],
 			dreamerMaxTokens: ["Dreamer 输出上限", "Dreamer 单轮输出预算；同样受模型上限收敛"],
+			"sessionFilter.organizer": ["organizer", "关闭后不再按阈值自动生成 compartment（手动 /compact 与溢出保护不受影响）"],
+			"sessionFilter.dreamer": ["dreamer", "关闭后不再有任何 Dreamer 维护"],
+			"sessionFilter.minSurfaceEvents": ["min surface events", "surface 节点少于此数的会话不参与 organizer 与 Dreamer；0 表示关闭该检查"],
+			"sessionFilter.respectArchived": ["respect archived", "已归档的会话退出后台维护"],
+			"sessionFilter.includeCwdGlobs": ["include cwd globs", "非空时只有匹配的工作区参与；每行一条，支持 ** * ?"],
+			"sessionFilter.excludeCwdGlobs": ["exclude cwd globs", "匹配原始 cwd 或解析后的 scope root 即排除；每行一条"],
+			"sessionFilter.excludeSessionIdPrefixes": ["exclude session id prefixes", "按会话 id 前缀排除；每行一条，定时任务会话使用 session-sched-"],
 		};
 
 		const en = {
@@ -162,6 +190,7 @@ window.__ModuleLoader__.load({
 			memory: "Project memory",
 			retrieval: "Retrieval",
 			dreamer: "Dreamer",
+			sessionFilter: "Session filter",
 			save: "Save",
 			reset: "Reset defaults",
 			saving: "Saving…",
@@ -201,6 +230,7 @@ window.__ModuleLoader__.load({
 			memory: "项目记忆",
 			retrieval: "检索",
 			dreamer: "Dreamer",
+			sessionFilter: "会话过滤",
 			save: "保存",
 			reset: "恢复默认",
 			saving: "保存中…",
@@ -419,6 +449,7 @@ window.__ModuleLoader__.load({
 			".dctx-subfield{display:flex;flex-direction:column;gap:4px;min-width:0;padding-top:2px}",
 			".dctx-label{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}",
 			".dctx-input{box-sizing:border-box;width:100%;height:32px;color:var(--dsw-alias-label-primary);background:var(--dsw-specific-input-major);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:0 8px;font-size:12px;font-family:inherit}",
+			".dctx-textarea{height:auto;min-height:64px;padding:6px 8px;resize:vertical;line-height:18px}",
 			".dctx-input:focus{outline:none;border-color:var(--dsw-alias-state-business-primary)}",
 			".dctx-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
 			".dctx-button{height:30px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:0 12px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover);cursor:pointer;font-size:12px}",
@@ -435,7 +466,7 @@ window.__ModuleLoader__.load({
 			for (const key of keys.slice(0, -1)) target = target[key] ?? (target[key] = {});
 			target[keys[keys.length - 1]] = value;
 		};
-		const merged = (config) => ({ ...clone(DEFAULTS), ...config, halfLives: { ...DEFAULTS.halfLives, ...(config?.halfLives ?? {}) } });
+		const merged = (config) => ({ ...clone(DEFAULTS), ...config, halfLives: { ...DEFAULTS.halfLives, ...(config?.halfLives ?? {}) }, sessionFilter: { ...DEFAULTS.sessionFilter, ...(config?.sessionFilter ?? {}) } });
 		const NUMBER_FIELDS = new Set(GROUPS.flatMap((group) => group.fields.filter((field) => field[1] === "number" || field[1] === "nullableNumber").map((field) => field[0])));
 
 		function createContextStore() {
@@ -583,6 +614,27 @@ window.__ModuleLoader__.load({
 			if (type === "modelTarget") return jsx(ModelTargetField, { prefix: path, state, t, edit });
 			const copy = FIELD_LABELS[path] ?? [path, ""];
 			const current = valueAt(state.draft, path);
+			if (type === "boolean") return jsx("label", { className: "dctx-field", children: [
+				jsx("span", { className: "dctx-label", children: copy[0] }),
+				jsx("input", {
+					className: "dctx-check",
+					type: "checkbox",
+					checked: current === true,
+					onChange: (event) => edit(path, event.target.checked),
+				}),
+				jsx("span", { className: "dctx-hint", children: copy[1] }),
+			] });
+			if (type === "stringList") return jsx("label", { className: "dctx-field", children: [
+				jsx("span", { className: "dctx-label", children: copy[0] }),
+				jsx("textarea", {
+					className: "dctx-input dctx-textarea",
+					rows: 3,
+					spellcheck: false,
+					value: Array.isArray(current) ? current.join("\n") : "",
+					onChange: (event) => edit(path, event.target.value.split("\n").map((line) => line.trim()).filter((line) => line.length > 0)),
+				}),
+				jsx("span", { className: "dctx-hint", children: copy[1] }),
+			] });
 			const presetOptions = path === "embeddingPreset"
 				? [["", "presetNone"], ["bge-m3", "presetEmbeddingBge"]]
 				: [["", "presetNone"], ["bge-reranker-v2-m3", "presetRerankBge"]];

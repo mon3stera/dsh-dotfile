@@ -13,7 +13,7 @@ const savedHome = process.env.DSH_HOME;
 process.env.DSH_HOME = home;
 try {
 	const settings = await import("/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/settings.js");
-	const { ContextSettingsSchema, CONTEXT_SETTINGS_DEFAULTS, buildModelCatalog, configPath, createModelCatalogHandler, handleContextConfig, handleContextModels, handleContextUsage, mergeContextConfig, apply } = settings;
+	const { ContextSettingsSchema, CONTEXT_SETTINGS_DEFAULTS, buildModelCatalog, configPath, createModelCatalogHandler, handleContextConfig, handleContextModels, handleContextUsage, mergeContextConfig, setSessionFilterSeed, apply } = settings;
 	// The catalog route rides an inner inject on the host llm registry, so the
 	// stub context must resolve nested injections the way cordis does.
 	const fakeHostContext = (services) => ({
@@ -139,6 +139,29 @@ try {
 	check("GET reads persisted model targets", after.config.summarizationModel === "gpt-5.6-luna" && after.config.summarizationReasoningEffort === "low" && after.config.dreamerModel === "claude-haiku-4-5");
 	check("engine merge uses UI override", merged.generateThreshold === 0.55 && merged.retainRounds === 8 && merged.vecMinScore === 0.6 && merged.embeddingPreset === "bge-m3" && merged.rerankPreset === "bge-reranker-v2-m3");
 	check("engine merge carries model targets", merged.summarizationProvider === "codelink" && merged.summarizationReasoningEffort === "low" && merged.dreamerProvider === "anthropic" && merged.dreamerReasoningEffort === "minimal");
+
+	// sessionFilter: sparse scalars, seeded GET, per-key engine merge
+	const emptyValidation = ContextSettingsSchema["~standard"].validate({});
+	check("schema keeps filter scalars sparse when absent", emptyValidation.issues === undefined && emptyValidation.value.sessionFilter.minSurfaceEvents === undefined && emptyValidation.value.sessionFilter.organizer === undefined);
+
+	rmSync(configPath(), { force: true });
+	const presetFilter = { organizer: true, dreamer: true, minSurfaceEvents: 4, includeCwdGlobs: [], excludeCwdGlobs: [], excludeSessionIdPrefixes: ["session-sched-"], respectArchived: false };
+	setSessionFilterSeed(presetFilter);
+	const seededResponse = response();
+	await handleContextConfig(request("GET"), seededResponse);
+	const seeded = JSON.parse(seededResponse.state.body);
+	check("GET merges the composed filter seed", seeded.config.sessionFilter.minSurfaceEvents === 4 && seeded.config.sessionFilter.excludeSessionIdPrefixes.join("|") === "session-sched-");
+
+	const filterPost = response();
+	await handleContextConfig(request("POST", { ...seeded.config, sessionFilter: { ...presetFilter, minSurfaceEvents: 6, dreamer: false } }), filterPost);
+	const filterPayload = JSON.parse(filterPost.state.body);
+	check("POST persists filter overrides", filterPost.state.status === 200 && filterPayload.config.sessionFilter.minSurfaceEvents === 6 && filterPayload.config.sessionFilter.dreamer === false && filterPayload.config.sessionFilter.organizer === true);
+
+	const presetMerge = mergeContextConfig({ sessionFilter: { ...presetFilter } });
+	check("file overrides the preset filter per key", presetMerge.sessionFilter.minSurfaceEvents === 6 && presetMerge.sessionFilter.dreamer === false && presetMerge.sessionFilter.excludeSessionIdPrefixes.join("|") === "session-sched-");
+	setSessionFilterSeed(undefined);
+
+
 
 	const invalidResponse = response();
 	await handleContextConfig(request("POST", { ...after.config, retainRounds: 0 }), invalidResponse);
