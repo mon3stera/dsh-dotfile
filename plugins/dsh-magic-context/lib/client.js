@@ -9,7 +9,7 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 		const react = require("react");
 		const { jsx } = require("react/jsx-runtime");
-		const { defineStore } = require("@deepseek-ai/dsh-client-runtime/client");
+		const { defineStore } = require("@deepseek-ai/dsh-client-store");
 		const name = "dsh-magic-context";
 		const inject = ["slots", "locale"];
 		const LOCALE_NS = "dsh-magic-context-settings";

@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
 		const jsx = require("react/jsx-runtime").jsx;
-		const { defineStore } = require("@deepseek-ai/dsh-client-runtime/client");
+		const { defineStore } = require("@deepseek-ai/dsh-client-store");
 
 		const name = "dsh-plugin-font";
 		const inject = ["slots", "locale"];

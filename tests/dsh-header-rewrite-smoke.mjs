@@ -383,7 +383,7 @@ check("GET config with no persisted file returns the seed YAML", async () => {
 
   const clientExports = entry.factory((spec) => {
     if (spec === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }) };
-    if (spec === "@deepseek-ai/dsh-client-runtime/client") {
+    if (spec === "@deepseek-ai/dsh-client-store") {
       return {
         defineStore: (config) => ({
           ...config,

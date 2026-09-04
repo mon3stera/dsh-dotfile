@@ -99,7 +99,7 @@ globalThis.window = { __ModuleLoader__: { load: (entry) => { capturedEntry = ent
 vm.runInThisContext(raw, { filename: "dsh-plugin-font/lib/client.js" });
 const clientExports = capturedEntry.factory((spec) => {
   if (spec === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }) };
-  if (spec === "@deepseek-ai/dsh-client-runtime/client") return { defineStore: defineStoreStub };
+  if (spec === "@deepseek-ai/dsh-client-store") return { defineStore: defineStoreStub };
   throw new Error("FAIL: unexpected require: " + spec);
 });
 if (clientExports.name !== "dsh-plugin-font") throw new Error("FAIL: name");

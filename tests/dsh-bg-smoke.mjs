@@ -49,7 +49,7 @@ if (!entry || entry.id !== "dsh-plugin-background") throw new Error("FAIL: __Mod
 
 const clientExports = entry.factory((spec) => {
   if (spec === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }) };
-  if (spec === "@deepseek-ai/dsh-client-runtime/client") return { defineStore: (config) => config };
+  if (spec === "@deepseek-ai/dsh-client-store") return { defineStore: (config) => config };
   throw new Error("FAIL: unexpected require: " + spec);
 });
 console.log("client exports:", Object.keys(clientExports));

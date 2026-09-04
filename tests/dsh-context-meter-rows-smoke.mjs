@@ -182,7 +182,7 @@ vm.runInThisContext(raw, { filename: "dsh-magic-context/lib/client.js" });
 const client = captured?.factory((spec) => {
 	if (spec === "react") return react;
 	if (spec === "react/jsx-runtime") return { jsx: (type, props, key) => ({ type, props, key }) };
-	if (spec === "@deepseek-ai/dsh-client-runtime/client") return { defineStore: (spec2) => spec2 };
+	if (spec === "@deepseek-ai/dsh-client-store") return { defineStore: (spec2) => spec2 };
 	throw new Error(`unexpected require: ${spec}`);
 });
 
