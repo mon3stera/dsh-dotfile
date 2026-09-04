@@ -12,6 +12,9 @@ import { ContextEngine } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic
 import { installParagraphInjector } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/paragraphs.js";
 import { getContextUsage } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/usage.js";
 
+/** The 0.1.2 host compaction balance cache reads session.eventAt(seq). */
+const eventAtFor = (events) => (seq) => (Array.isArray(events) ? events : Object.values(events)).find((event) => event.seq === seq);
+
 let failed = 0;
 const check = (label, ok) => {
 	console.log(`${ok ? "PASS" : "FAIL"} ${label}`);
@@ -398,6 +401,7 @@ const check = (label, ok) => {
 			surface: { nodes: [1, 2], replaceGeneration: 1 },
 		};
 		engine._registerUnownedCheckpoints({ session: legacySession });
+		legacySession.eventAt = eventAtFor(legacySession.events);
 		const registered = engine.cdb.allActiveCompartments();
 		check("legacy checkpoint registered", registered.length === 1 && registered[0].session_id === "legacy-s" && registered[0].landing_seq === 1);
 		check("legacy checkpoint summary kept", registered[0].summary === "<compacted-summary>old big block</compacted-summary>");
@@ -409,6 +413,7 @@ const check = (label, ok) => {
 			surface: { nodes: [1, 3], replaceGeneration: 2 },
 		};
 		engine._registerUnownedCheckpoints({ session: chained });
+		chained.eventAt = eventAtFor(chained.events);
 		const chained2 = engine.cdb.allActiveCompartments();
 		check("second legacy checkpoint registered", chained2.length === 2 && chained2[1].landing_seq === 3 && chained2[1].generation === 2);
 
@@ -422,6 +427,7 @@ const check = (label, ok) => {
 			id: "archived-checkpoint",
 			events: archivedEvents,
 			surface: { nodes: [0] },
+			eventAt: eventAtFor(archivedEvents),
 			append(type, data, extra = {}) {
 				const event = { type, seq: this.events.length, time: Date.now(), data, ...extra };
 				this.events.push(event);
@@ -468,6 +474,7 @@ const check = (label, ok) => {
 			header: { cwd: process.cwd() },
 			events: landingEvents,
 			surface: { nodes: [1, 3], replaceGeneration: 0 },
+			eventAt: eventAtFor(landingEvents),
 			append(type, data, extra = {}) {
 				const event = { type, seq: this.events.length, time: Date.now(), data, ...extra };
 				this.events.push(event);
@@ -524,6 +531,7 @@ const check = (label, ok) => {
 			surface: { nodes: [], replaceGeneration: 0 },
 			deriveEventMessage: () => null,
 		};
+		memorySession.eventAt = eventAtFor(memorySession.events);
 		engine.injection.set(memorySession, { text: "<project_memory>old</project_memory>", memoryCount: 1, memoryTokens: 1 });
 		installParagraphInjector(memorySession, engine.cdb, {
 			extraMessage: () => {
@@ -562,6 +570,7 @@ const check = (label, ok) => {
 			id: "long-turn-history",
 			events: longEvents,
 			surface: { nodes: [1, 3, 7, 9, 13, 15] },
+			eventAt: eventAtFor(longEvents),
 			requestHeader: () => ({ config: { provider: "p", model: "m" } }),
 		};
 		engine._maybeGenerate = ContextEngine.prototype._maybeGenerate;
@@ -581,6 +590,7 @@ const check = (label, ok) => {
 			},
 			surface: { nodes: [1, 3, 5] },
 		};
+		usageSession.eventAt = eventAtFor(usageSession.events);
 		engine.ctx.tokenMeter.measure = () => ({ nodes: [{ seq: 1, tokens: 100 }, { seq: 3, tokens: 77 }, { seq: 5, tokens: 200 }] });
 		engine.injection.set(usageSession, { text: "<project_memory>x</project_memory>", memoryCount: 6, memoryTokens: 456 });
 		engine._refreshContextUsage(usageSession);

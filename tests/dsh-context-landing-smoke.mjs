@@ -2,6 +2,9 @@
 import { selectCompartmentRange, selectManualCompartmentRange } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/range.js";
 import { estimateFramedSummaryTokens, landCompartment, frameCompartmentSummary } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/landing.js";
 
+/** The 0.1.2 host compaction balance cache reads session.eventAt(seq). */
+const eventAtFor = (events) => (seq) => (Array.isArray(events) ? events : Object.values(events)).find((event) => event.seq === seq);
+
 let failed = 0;
 const check = (label, ok) => {
 	console.log(`${ok ? "PASS" : "FAIL"} ${label}`);
@@ -28,7 +31,7 @@ const check = (label, ok) => {
 	turn(1); turn(2); turn(3);
 	// surface nodes: user1=1, asst1=3, user2=6, asst2=8, user3=11, asst3=13
 	const surface = { nodes: [1, 3, 6, 8, 11, 13], replaceGeneration: 0 };
-	const session = { events, surface };
+	const session = { events, surface, eventAt: eventAtFor(events) };
 	let r = selectCompartmentRange(session, { retainRounds: 1 });
 	check("retain 1 keeps one paragraph", r !== null && r.start === 1 && r.end === 11 && r.shadowedSeqs.join(",") === "1,3,6,8,11");
 	r = selectCompartmentRange(session, { retainRounds: 2 });
@@ -37,7 +40,7 @@ const check = (label, ok) => {
 	check("retain 3 keeps three paragraphs", r !== null && r.start === 1 && r.end === 6 && r.shadowedSeqs.join(",") === "1,3,6");
 	r = selectManualCompartmentRange(session, { retainRounds: 20 });
 	check("manual short history keeps one paragraph tail", r !== null && r.start === 1 && r.end === 1 && r.shadowedSeqs.join(",") === "1");
-	const oneTurn = { events: events.slice(0, 5), surface: { nodes: [1, 3], replaceGeneration: 0 } };
+	const oneTurn = { events: events.slice(0, 5), surface: { nodes: [1, 3], replaceGeneration: 0 }, eventAt: eventAtFor(events) };
 	check("manual short history leaves one paragraph", (() => { const one = selectManualCompartmentRange(oneTurn, { retainRounds: 20 }); return one !== null && one.start === 1 && one.end === 1; })());
 
 	// checkpointed surface: node 16 is a landed checkpoint (head), turns 4+5 follow.
@@ -52,7 +55,7 @@ const check = (label, ok) => {
 	events2.push({ type: "step/start", seq: 21, time: 0, data: { turn: 5, step: 1 } });
 	events2.push({ type: "assistant/message", seq: 22, time: 0, data: { turn: 5, step: 1, message: { content: [{ type: "text", text: "t5" }] } }, surfaceOp: "append" });
 	events2.push({ type: "turn/end", seq: 23, time: 0, data: { turn: 5, reason: { kind: "completed" } } });
-	const session2 = { events: events2, surface: { nodes: nodes2, replaceGeneration: 1 } };
+	const session2 = { events: events2, surface: { nodes: nodes2, replaceGeneration: 1 }, eventAt: eventAtFor(events2) };
 	// the checkpoint itself is never re-summarizable: only t4 stays compressible
 	r = selectCompartmentRange(session2, { retainRounds: 2 });
 	check("checkpointed retain 2 null", r === null);
@@ -72,7 +75,7 @@ const check = (label, ok) => {
 	events3.push({ type: "step/start", seq: 28, time: 0, data: { turn: 7, step: 1 } });
 	events3.push({ type: "assistant/message", seq: 29, time: 0, data: { turn: 7, step: 1, message: { content: [{ type: "text", text: "t7" }] } }, surfaceOp: "append" });
 	events3.push({ type: "turn/end", seq: 30, time: 0, data: { turn: 7, reason: { kind: "completed" } } });
-	const session3 = { events: events3, surface: { nodes: [16, 24, 26, 29], replaceGeneration: 2 } };
+	const session3 = { events: events3, surface: { nodes: [16, 24, 26, 29], replaceGeneration: 2 }, eventAt: eventAtFor(events3) };
 	r = selectCompartmentRange(session3, { retainRounds: 1 });
 	check("chain skips both checkpoints", r !== null && r.start === 26 && r.end === 26 && r.shadowedSeqs.join(",") === "26");
 	r = selectCompartmentRange(session3, { retainRounds: 0 });
@@ -93,6 +96,7 @@ const check = (label, ok) => {
 		id: "s1",
 		events,
 		surface: { nodes: [1, 3], replaceGeneration: 0 },
+		eventAt: eventAtFor(events),
 		append(type, data, extra = {}) {
 			const event = { type, seq: nextSeq++, time: Date.now(), data, ...extra };
 			this.events.push(event);
@@ -132,7 +136,7 @@ const check = (label, ok) => {
 	// manual landing with an open turn must fail busy
 	const busyEvents = [...seed];
 	const busy = await landCompartment(
-		{ session: { ...session, events: busyEvents, surface: { nodes: [1, 3], replaceGeneration: 0 } }, cdb, meter },
+		{ session: { ...session, events: busyEvents, surface: { nodes: [1, 3], replaceGeneration: 0 }, eventAt: eventAtFor(busyEvents) }, cdb, meter },
 		{ ...compartment, start_seq: 1, end_seq: 3 },
 		{ owner: null, signal: new AbortController().signal },
 	).then(() => null, (e) => e);
@@ -140,7 +144,7 @@ const check = (label, ok) => {
 
 	// span changed (start missing from surface) must fail with SurfaceChangedError
 	const changed = await landCompartment(
-		{ session: { ...session, events, surface: { nodes: [99], replaceGeneration: 2 } }, cdb, meter },
+		{ session: { ...session, events, surface: { nodes: [99], replaceGeneration: 2 }, eventAt: eventAtFor(events) }, cdb, meter },
 		compartment,
 		{ owner: "current-turn" },
 	).then(() => null, (e) => e);
@@ -148,7 +152,7 @@ const check = (label, ok) => {
 
 	// summary not smaller than shadowed content must fail
 	const fat = await landCompartment(
-		{ session: { ...session, events, surface: { nodes: [1, 3], replaceGeneration: 3 } }, cdb, meter: { ...meter, estimateMessage: () => 500 } },
+		{ session: { ...session, events, surface: { nodes: [1, 3], replaceGeneration: 3 }, eventAt: eventAtFor(events) }, cdb, meter: { ...meter, estimateMessage: () => 500 } },
 		compartment,
 		{ owner: "current-turn" },
 	).then(() => null, (e) => e);

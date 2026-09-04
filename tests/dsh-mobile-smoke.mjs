@@ -186,9 +186,13 @@ for (const [needle, source, why] of anchors) {
 	ok(source.includes(needle), `host still provides ${needle} - ${why}`);
 }
 // Every details open/close in the host goes through the shared service face,
-// which is what makes the wrapper a complete observer.
-eq((conversationSrc.match(/openDetails\(/g) || []).length, 1, "the conversation opens details only through the layout service");
-ok(/layout\.openDetails\(/.test(conversationSrc), "the conversation calls the service face, not a private store binding");
+// which is what makes the wrapper a complete observer. Since the 0.1.2 update
+// the details trigger lives in the chat package (the conversation no longer
+// opens details itself), so the anchor moved with it.
+const chatSrc = readFileSync(`${HOST_DIR}/dsh-client-ui-chat/lib/client.js`, "utf8");
+eq((chatSrc.match(/openDetails\(/g) || []).length, 1, "the chat package opens details only through the layout service");
+ok(/ctx\.layout\.openDetails\(/.test(chatSrc), "the chat package calls the service face, not a private store binding");
+ok(/ctx\.layout\.closeDetails\(/.test(chatSrc), "the chat package still closes details through the service face");
 
 // shell.overlay must remain a list slot: a single slot would make registration
 // an ownership fight with whatever else wants the overlay layer.

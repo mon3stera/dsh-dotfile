@@ -719,11 +719,14 @@ ok(llmIndex.includes("registerAdapter"), "registerAdapter is still the registrat
 ok(llmIndex.includes("export declare abstract class LlmAdapter"), "LlmAdapter is still exported");
 ok(!/outputModalities/.test(llmTypes), "still no output-modality concept, so an adapter remains the only seam");
 
-const runtime = readFileSync(`${HOST}/dsh-client-runtime/lib/client.js`, "utf8");
-ok(/case "image": return \{\s*kind: "image",\s*attachment: block\.attachment/.test(runtime), "the client still maps an image block to an assistant image node");
-const conversation = readFileSync(`${HOST}/dsh-client-ui-conversation/lib/client.js`, "utf8");
-ok(conversation.includes('blocks[chunk.index] = (0, _deepseek_ai_dsh_client_runtime_client.toAssistantBlock)(chunk.block)'), "block-end still projects through toAssistantBlock");
-ok(/case "image": \{\s*const start = i;/.test(conversation), "AssistantMarkdown still renders image blocks");
+// The projection stack moved since 0.1.2: block projection lives in the
+// trajectory package and assistant rendering in chat; both still map image
+// blocks to renderable nodes, which is what the adapter relies on.
+const trajectory = readFileSync(`${HOST}/dsh-client-ui-trajectory/lib/client.js`, "utf8");
+ok(/case "image": return \{\s*kind: "image",\s*attachment: block\.attachment/.test(trajectory), "the trajectory projection still maps an image block to an assistant image node");
+const chat = readFileSync(`${HOST}/dsh-client-ui-chat/lib/client.js`, "utf8");
+ok(chat.includes("function toAssistantBlocks(content)"), "assistant content still projects through toAssistantBlock");
+ok(/case "image": \{\s*const start = i;/.test(chat), "assistant markdown still renders image blocks");
 
 const attachmentTypes = readFileSync(`${HOST}/dsh-attachment/lib/types/index.d.ts`, "utf8");
 ok(attachmentTypes.includes("abstract saveImage"), "saveImage is still the commit seam");

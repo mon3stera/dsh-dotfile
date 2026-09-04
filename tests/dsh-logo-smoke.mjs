@@ -155,11 +155,15 @@ ok(sidebarSource.includes('renderSlot("sidebar.brand.mark", { size: 24 }'), "sid
 ok(/renderSlot\("conversation\.hero\.brand\.mark", \{\s*size: 34/.test(conversationSource), "hero still passes size 34 to the mark");
 
 // The shipped occupant must stay at the default priority, or -1 would no longer
-// shadow it (and an equal priority throws instead of winning).
+// shadow it (and an equal priority throws instead of winning). Since the DSH
+// update that moved hero rendering onto its declaring package's own fallback,
+// the official build registers nothing on the hero slot — which makes this
+// plugin the hero mark's only occupant instead of a shadowing competitor.
 const officialSource = readFileSync(`${HOST_PACKAGES}/dsh-client-ui-brand-official/lib/client.js`, "utf8");
-for (const slot of ["sidebar.brand.mark", "sidebar.brand.name", "conversation.hero.brand.mark"]) {
+for (const slot of ["sidebar.brand.mark", "sidebar.brand.name"]) {
   ok(officialSource.includes(`{ name: "${slot}" }`), `the shipped occupant registers ${slot} without a priority`);
 }
+ok(!officialSource.includes("conversation.hero.brand.mark"), "the official build registers nothing on the hero slot");
 ok(!officialSource.includes("priority"), "the shipped occupant sets no priority, so it stays at the default 0");
 
 // And the runtime rule this plugin relies on: a second registration at the same
@@ -174,7 +178,7 @@ ok(/priority\?\?0\)-\([a-zA-Z$_]+\.options\.priority\?\?0\)/.test(bundle), "entr
 // The wordmark viewBox that the old DOM-scanning implementation matched is now
 // conditional, which is exactly how that approach broke. Pin the shape so the
 // comment in the client stays true.
-ok(bundle.includes('viewBox:l?"0 0 182 24":"26 0 156 24"'), "BrandWordmark still swaps viewBox on includeMark");
+ok(/viewBox:[a-zA-Z_$][a-zA-Z0-9_$]*\?"0 0 182 24":"26 0 156 24"/.test(bundle), "BrandWordmark still swaps viewBox on includeMark");
 ok(officialSource.includes("includeMark: false"), "the shipped name occupant still renders the mark-less wordmark");
 
 console.log(`logo ok (${checks} checks)`);
