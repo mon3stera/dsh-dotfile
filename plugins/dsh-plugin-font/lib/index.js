@@ -14,17 +14,27 @@ import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 export const name = "dsh-plugin-font";
 
 /**
- * Durable font settings schema. Empty family = system default. Absent or null
- * size = follow the theme's own content font-size axis; the client omits the
- * keys in that state, so stored configs simply lack them.
+ * Durable font settings schema. `families`/`codeFamilies` are ordered fallback
+ * stacks (first entry wins). Empty family/stack = system default. Absent or
+ * null size = follow the theme's own content font-size axis; the client omits
+ * those keys in that state, so stored configs simply lack them. Weights are
+ * deltas (-200..200) relative to each theme token's own weight, omitted at 0.
+ * `family`/`codeFamily` are the legacy single-font fields, kept so old configs
+ * still validate; the client migrates them into the stacks on load.
  */
 export const FontSettingsSchema = z.object({
   family: z.string().max(200).default(""),
   codeFamily: z.string().max(200).default(""),
+  families: z.array(z.string().max(200)).default([]),
+  codeFamilies: z.array(z.string().max(200)).default([]),
   /** Desired markdown base size in px; null/absent follows the theme. */
   fontSize: z.union([z.number().min(8).max(32), z.const(null)]).default(null),
   /** Desired inline-code size in px; null/absent follows the theme. */
-  codeFontSize: z.union([z.number().min(8).max(32), z.const(null)]).default(null)
+  codeFontSize: z.union([z.number().min(8).max(32), z.const(null)]).default(null),
+  /** Body weight delta applied to every body-family token. */
+  fontWeight: z.union([z.number().min(-200).max(200), z.const(null)]).default(null),
+  /** Code weight delta applied to every code-family token. */
+  codeFontWeight: z.union([z.number().min(-200).max(200), z.const(null)]).default(null)
 });
 
 /** Absolute path of the plugin-owned font config file. */
