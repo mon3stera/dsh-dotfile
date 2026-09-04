@@ -8,7 +8,7 @@ import {
 	buildSummarizationInput,
 	summarizeCompartment,
 } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/summarizer.js";
-import { ContextEngine } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/engine.js";
+import { ContextEngine, matchGlob, normalizeSessionFilter } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/engine.js";
 import { installParagraphInjector } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/paragraphs.js";
 import { getContextUsage } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/usage.js";
 
@@ -330,7 +330,7 @@ const check = (label, ok) => {
 
 		// Dreamer runs once for an idle interaction round; plugin notices and
 		// other background events do not re-arm it until the next turn starts.
-		const idleHandler = stubs.find(([n, handler]) => n === "session/event" && String(handler).includes("_runDreamerForAgent"))?.[1];
+		const idleHandler = stubs.find(([n, handler]) => n === "session/event" && String(handler).includes("_fireIdleDream"))?.[1];
 		const dreamerSession = { id: "dreamer-idle" };
 		engine.agentBySession.set(dreamerSession, { session: dreamerSession });
 		engine.ownConfig.dreamerConfig.idleMinutes = 0.001;
@@ -606,6 +606,105 @@ const check = (label, ok) => {
 		usage = getContextUsage(usageSession.id);
 		check("empty memory selection reports no usage", usage.memories.count === 0 && usage.memories.tokens === 0 && usage.totalTokens === 77);
 		engine.cdb.close();
+	} finally {
+		if (savedHome === undefined) delete process.env.DSH_HOME;
+		else process.env.DSH_HOME = savedHome;
+		rmSync(tmpHome, { recursive: true, force: true });
+	}
+}
+
+// ── session participation filter ─────────────────────────────────────────────
+{
+	// glob matcher: ** crosses "/", * and ? stay in one segment
+	check("glob ** crosses separators", matchGlob("/tmp/**", "/tmp/a/b/c") && !matchGlob("/tmp/**", "/var/a"));
+	check("glob * stays in one segment", matchGlob("/tmp/*", "/tmp/a") && !matchGlob("/tmp/*", "/tmp/a/b"));
+	check("glob ? is one character", matchGlob("/tmp/a?", "/tmp/ab") && !matchGlob("/tmp/a?", "/tmp/a"));
+	check("glob escapes regex metacharacters", matchGlob("/a.b/c", "/a.b/c") && !matchGlob("/a.b/c", "/axb/c"));
+	check("empty pattern never matches", !matchGlob("", "/tmp/a"));
+
+	// normalization: defaults keep current behavior
+	const defaults = normalizeSessionFilter(undefined);
+	check("filter defaults keep both subsystems on", defaults.organizer === true && defaults.dreamer === true && defaults.minSurfaceEvents === 0 && defaults.respectArchived === false);
+	check("filter normalization drops junk entries", normalizeSessionFilter({ excludeCwdGlobs: ["ok", 42, ""], minSurfaceEvents: 2.9 }).excludeCwdGlobs.join("|") === "ok" && normalizeSessionFilter({ minSurfaceEvents: 2.9 }).minSurfaceEvents === 2);
+
+	const savedHome = process.env.DSH_HOME;
+	const tmpHome = mkdtempSync("/home/mon3tr/ctx-filter-");
+	process.env.DSH_HOME = tmpHome;
+	try {
+		const fakeCtx = {
+			effect: () => () => {},
+			logger: { warn: () => {} },
+			tokenMeter: { estimateMessage: () => 178, measure: () => ({ totalTokens: 0, nodes: [] }) },
+			on: () => {},
+			systemPrompt: { section: () => {} },
+			tools: { register: () => {} },
+			reflect: { provide: () => () => {} },
+		};
+		const session = (over = {}) => ({
+			id: "session-plain",
+			header: { cwd: process.cwd() },
+			surface: { nodes: [1, 2, 3, 4, 5, 6], replaceGeneration: 0 },
+			...over
+		});
+
+		const offDreamer = new ContextEngine(fakeCtx, { sessionFilter: { dreamer: false } });
+		check("dreamer switch excludes only the dreamer", !offDreamer._participates(session(), "dreamer") && offDreamer._participates(session(), "organizer"));
+		const offOrganizer = new ContextEngine(fakeCtx, { sessionFilter: { organizer: false } });
+		check("organizer switch excludes only the organizer", !offOrganizer._participates(session(), "organizer") && offOrganizer._participates(session(), "dreamer"));
+
+		const minEvents = new ContextEngine(fakeCtx, { sessionFilter: { minSurfaceEvents: 4 } });
+		check("size guard skips short sessions", !minEvents._participates(session({ surface: { nodes: [1, 2], replaceGeneration: 0 } }), "dreamer") && minEvents._participates(session(), "dreamer"));
+
+		const idFilter = new ContextEngine(fakeCtx, { sessionFilter: { excludeSessionIdPrefixes: ["session-sched-"] } });
+		check("id prefix excludes task spawns only", !idFilter._participates(session({ id: "session-sched-abc" }), "dreamer") && idFilter._participates(session(), "dreamer"));
+
+		const cwdFilter = new ContextEngine(fakeCtx, { sessionFilter: { excludeCwdGlobs: [`${process.cwd()}/**`] } });
+		check("cwd glob excludes matching workspaces", !cwdFilter._participates(session({ header: { cwd: `${process.cwd()}/plugins` } }), "dreamer") && cwdFilter._participates(session({ header: { cwd: "/elsewhere" } }), "dreamer"));
+		const includeFilter = new ContextEngine(fakeCtx, { sessionFilter: { includeCwdGlobs: ["/workspace/*"] } });
+		check("include list is a whitelist when non-empty", includeFilter._participates(session({ header: { cwd: "/workspace/x" } }), "dreamer") && !includeFilter._participates(session({ header: { cwd: "/elsewhere" } }), "dreamer"));
+
+		const archivedFilter = new ContextEngine(fakeCtx, { sessionFilter: { respectArchived: true } });
+		archivedFilter._workspaceRegistry = { archivedSessionIds: ["session-plain"] };
+		check("respectArchived excludes archived sessions", !archivedFilter._participates(session(), "dreamer") && archivedFilter._participates(session({ id: "session-other" }), "dreamer"));
+		const archiveAgnostic = new ContextEngine(fakeCtx, {});
+		archiveAgnostic._workspaceRegistry = { archivedSessionIds: ["session-plain"] };
+		check("archived sessions still participate by default", archiveAgnostic._participates(session(), "dreamer"));
+
+		const dreamerOff = new ContextEngine(fakeCtx, { sessionFilter: { dreamer: false } });
+		const quietSession = session({ id: "session-quiet" });
+		dreamerOff.agentBySession.set(quietSession, { session: quietSession });
+		let dreamerRuns = 0;
+		dreamerOff._runDreamerForAgent = async () => { dreamerRuns += 1; };
+		dreamerOff._dreamerRoundState(quietSession).interactionRound = 1;
+		await dreamerOff._fireIdleDream(quietSession, 1);
+		check("excluded dreamer consumes the round without running", dreamerRuns === 0 && dreamerOff._dreamerRoundState(quietSession).triggeredRound === 1);
+		const dreamerOn = new ContextEngine(fakeCtx, {});
+		const loudSession = session({ id: "session-loud" });
+		dreamerOn.agentBySession.set(loudSession, { session: loudSession });
+		dreamerOn._runDreamerForAgent = async () => { dreamerRuns += 1; };
+		dreamerOn._dreamerRoundState(loudSession).interactionRound = 1;
+		await dreamerOn._fireIdleDream(loudSession, 1);
+		check("included dreamer runs and marks the round", dreamerRuns === 1 && dreamerOn._dreamerRoundState(loudSession).triggeredRound === 1);
+		await dreamerOn._fireIdleDream(loudSession, 1);
+		check("a round never dreams twice", dreamerRuns === 1);
+
+		const organizerOff = new ContextEngine(fakeCtx, { generateThreshold: 0.7, retainRounds: 10, sessionFilter: { organizer: false } });
+		let generations = 0;
+		organizerOff._contextWindow = async () => 1000;
+		organizerOff.ctx.tokenMeter.measure = () => ({ totalTokens: 900, nodes: [{ seq: 1, tokens: 900 }] });
+		organizerOff._createAndSummarize = async () => { generations += 1; return 1; };
+		const busySession = session({ id: "session-busy", events: {} });
+		await organizerOff._maybeGenerate({ session: busySession });
+		check("excluded organizer never generates", generations === 0);
+		const organizerOn = new ContextEngine(fakeCtx, { generateThreshold: 0.7, retainRounds: 10 });
+		organizerOn._contextWindow = async () => 1000;
+		organizerOn.ctx.tokenMeter.measure = () => ({ totalTokens: 900, nodes: [{ seq: 1, tokens: 900 }] });
+		organizerOn._createAndSummarize = async () => { generations += 1; return 1; };
+		check("organizer gate sits before range selection", organizerOn._participates(busySession, "organizer") && !organizerOff._participates(busySession, "organizer"));
+
+		for (const engine of [offDreamer, offOrganizer, minEvents, idFilter, cwdFilter, includeFilter, archivedFilter, archiveAgnostic, dreamerOff, dreamerOn, organizerOff, organizerOn]) {
+			engine.cdb.close();
+		}
 	} finally {
 		if (savedHome === undefined) delete process.env.DSH_HOME;
 		else process.env.DSH_HOME = savedHome;

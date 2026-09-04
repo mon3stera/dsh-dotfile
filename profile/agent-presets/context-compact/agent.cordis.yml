@@ -162,6 +162,17 @@
         dreamerTimeoutMs: 600000
         verifyIntervalDays: 30
         compartmentBudgetTokens: 40000
+        # Session participation filter: gate the background organizer and
+        # Dreamer for sessions that should not feed the shared memory pool.
+        # Overflow-forced compaction always runs. Every key is optional;
+        # minSurfaceEvents 0 disables the size check.
+        sessionFilter:
+          minSurfaceEvents: 4
+          excludeSessionIdPrefixes:
+            - session-sched-
+          # excludeCwdGlobs: ["/tmp/**"]
+          # includeCwdGlobs: []
+          # respectArchived: true
 
     - id: command-compact
       name: '@deepseek-ai/dsh-command-compact'

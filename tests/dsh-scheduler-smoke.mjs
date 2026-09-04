@@ -63,7 +63,9 @@ scheduler.setDocument({ tasks: seed });
 await scheduler.fireDueTasks();
 const after = scheduler.getDocument().tasks;
 /* three calls: due (create+prompt) and fails (create throws, caught) */
-check("due task ran: create then prompt with its prompt text", calls.length === 3 && JSON.stringify(calls[0]) === JSON.stringify(["create", {}]) && JSON.stringify(calls[1]) === JSON.stringify(["prompt", { sessionId: "session-1", requestId: calls[1][1].requestId, content: [{ type: "text", text: "run me" }] }]));
+check("due task ran: create then prompt with its prompt text", calls.length === 3
+	&& calls[0][0] === "create" && calls[0][1].sessionId.startsWith("session-sched-")
+	&& JSON.stringify(calls[1]) === JSON.stringify(["prompt", { sessionId: "session-1", requestId: calls[1][1].requestId, content: [{ type: "text", text: "run me" }] }]));
 check("disabled task never fires", after.find((t) => t.id === "off").lastRunAt === now - 99 * MIN);
 check("later task untouched", after.find((t) => t.id === "later").lastRunAt === now);
 check("failing task records lastError", after.find((t) => t.id === "fails").lastError.includes("create refused"));

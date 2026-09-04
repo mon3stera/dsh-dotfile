@@ -96,7 +96,50 @@ const OWN_KEYS = new Set([
 	"dreamerReasoningEffort",
 	"summarizationMaxTokens",
 	"dreamerMaxTokens",
+	"sessionFilter",
 ]);
+
+/**
+ * Match a simple glob against a path: `**` crosses "/", while `*` and `?`
+ * stay within one path segment. Empty patterns never match.
+ */
+export function matchGlob(pattern, value) {
+	if (typeof pattern !== "string" || pattern.length === 0) return false;
+	if (typeof value !== "string" || value.length === 0) return false;
+	let source = "";
+	for (let i = 0; i < pattern.length; i += 1) {
+		const char = pattern[i];
+		if (char === "*") {
+			if (pattern[i + 1] === "*") {
+				source += ".*";
+				i += 1;
+			} else source += "[^/]*";
+		} else if (char === "?") source += "[^/]";
+		else source += char.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	}
+	return new RegExp(`^${source}$`).test(value);
+}
+
+function stringList(value) {
+	return Array.isArray(value) ? value.filter((entry) => typeof entry === "string" && entry.length > 0) : [];
+}
+
+/** Normalize the configured session participation filter to its final shape. */
+export function normalizeSessionFilter(raw) {
+	const source = raw !== null && typeof raw === "object" ? raw : {};
+	const minSurfaceEvents = typeof source.minSurfaceEvents === "number" && Number.isFinite(source.minSurfaceEvents) && source.minSurfaceEvents > 0
+		? Math.floor(source.minSurfaceEvents)
+		: 0;
+	return {
+		organizer: source.organizer !== false,
+		dreamer: source.dreamer !== false,
+		minSurfaceEvents,
+		includeCwdGlobs: stringList(source.includeCwdGlobs),
+		excludeCwdGlobs: stringList(source.excludeCwdGlobs),
+		excludeSessionIdPrefixes: stringList(source.excludeSessionIdPrefixes),
+		respectArchived: source.respectArchived === true,
+	};
+}
 
 /** Resolve the exact provider/model durably routed for the latest request. */
 function routedTarget(session) {
@@ -231,6 +274,7 @@ export class ContextEngine extends BasicCompactionEngine {
 
 	cdb;
 	ownConfig;
+	_workspaceRegistry;
 	agentBySession = new WeakMap();
 	inFlight = new Map(); // sessionId -> Promise
 	generateFailures = new Map(); // sessionId -> { failures, until }
@@ -305,8 +349,18 @@ export class ContextEngine extends BasicCompactionEngine {
 				reasoningEffort: own.dreamerReasoningEffort ?? "",
 				maxTokens: own.dreamerMaxTokens ?? DEFAULT_DREAMER_MAX_TOKENS,
 			},
+			sessionFilter: normalizeSessionFilter(own.sessionFilter),
 		};
 		this.cdb = openDatabase(resolveDshHome(), { embeddingDim: embeddingPreset?.embeddingDim ?? own.embeddingDim });
+		/* the archived-session set powers respectArchived; unavailable registries
+		 * simply turn that check into a no-op */
+		try {
+			ctx.inject?.(["workspaceRegistry"], (hostCtx) => {
+				this._workspaceRegistry = hostCtx.workspaceRegistry;
+			});
+		} catch {
+			this._workspaceRegistry = undefined;
+		}
 		ctx.effect(() => () => {
 			for (const timer of this.idleTimers.values()) clearTimeout(timer);
 			this.idleTimers.clear();
@@ -486,6 +540,51 @@ export class ContextEngine extends BasicCompactionEngine {
 		return state;
 	}
 
+	/**
+	 * Session participation gate for the background memory subsystems
+	 * ("organizer" and "dreamer"). Overflow-forced compaction deliberately
+	 * bypasses this: it is context management, not memory curation.
+	 */
+	_participates(session, subsystem) {
+		const filter = this.ownConfig.sessionFilter;
+		if (subsystem === "organizer" && !filter.organizer) return false;
+		if (subsystem === "dreamer" && !filter.dreamer) return false;
+		if (filter.minSurfaceEvents > 0 && (session?.surface?.nodes?.length ?? 0) < filter.minSurfaceEvents) return false;
+		const id = typeof session?.id === "string" ? session.id : "";
+		for (const prefix of filter.excludeSessionIdPrefixes) {
+			if (id.startsWith(prefix)) return false;
+		}
+		if (filter.respectArchived && this._workspaceRegistry?.archivedSessionIds?.includes(id)) return false;
+		if (filter.includeCwdGlobs.length > 0 || filter.excludeCwdGlobs.length > 0) {
+			const paths = new Set();
+			const cwd = session?.header?.cwd;
+			if (typeof cwd === "string" && cwd.length > 0) paths.add(cwd);
+			const scope = sessionMemoryScope(session);
+			if (typeof scope === "string" && scope.length > 0) paths.add(scope);
+			const matched = (globs) => globs.some((pattern) => {
+				for (const path of paths) {
+					if (matchGlob(pattern, path)) return true;
+				}
+				return false;
+			});
+			if (filter.includeCwdGlobs.length > 0 && !matched(filter.includeCwdGlobs)) return false;
+			if (matched(filter.excludeCwdGlobs)) return false;
+		}
+		return true;
+	}
+
+	/** Fire the idle dream for one interaction round; runs at most once per round. */
+	async _fireIdleDream(session, interactionRound) {
+		const current = this.dreamerRounds.get(session);
+		if (current === undefined || current.interactionRound !== interactionRound || current.triggeredRound >= interactionRound) return;
+		const agent = this.agentBySession.get(session);
+		if (agent === undefined) return;
+		current.triggeredRound = interactionRound;
+		/* an excluded session consumes its round without running */
+		if (!this._participates(session, "dreamer")) return;
+		await this._runDreamerForAgent(agent);
+	}
+
 	_registerTriggers(ctx) {
 		// 65%: kick off the background organizer at step/turn boundaries.
 		ctx.on("session/event", (session, event) => {
@@ -508,12 +607,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			const interactionRound = state.interactionRound;
 			const timer = setTimeout(() => {
 				this.idleTimers.delete(session);
-				const current = this.dreamerRounds.get(session);
-				if (current === undefined || current.interactionRound !== interactionRound || current.triggeredRound >= interactionRound) return;
-				const agent = this.agentBySession.get(session);
-				if (agent === undefined) return;
-				current.triggeredRound = interactionRound;
-				this._runDreamerForAgent(agent).catch((error) => {
+				void this._fireIdleDream(session, interactionRound).catch((error) => {
 					ctx.logger.warn(`dreamer run failed: ${error instanceof Error ? error.message : String(error)}`);
 				});
 			}, this.ownConfig.dreamerConfig.idleMinutes * 60 * 1000);
@@ -697,6 +791,9 @@ export class ContextEngine extends BasicCompactionEngine {
 	async _maybeGenerate(agent) {
 		const session = agent.session;
 		const id = session.id;
+		/* excluded sessions never feed the organizer (and thus the shared
+		 * memory pool); overflow-forced compaction is a separate path */
+		if (!this._participates(session, "organizer")) return;
 		this._registerUnownedCheckpoints(agent); // migrate legacy checkpoints once
 		if (this._readyCompartments(id).length > 0) return;
 		const cooldown = this.generateFailures.get(id);

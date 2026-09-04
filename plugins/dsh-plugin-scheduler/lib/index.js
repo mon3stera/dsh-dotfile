@@ -125,7 +125,10 @@ export function createScheduler() {
     runAborts.add(abort);
     try {
       if (runner === null) throw new Error("session controller unavailable");
+      /* the session-sched- prefix lets a ContextEngine sessionFilter exclude
+       * task runs from the shared memory pipeline */
       const created = await runner.create({
+        sessionId: `session-sched-${randomUUID()}`,
         ...(task.cwd ? { cwd: task.cwd } : {}),
         ...(task.agentPreset ? { agentPreset: task.agentPreset } : {})
       });
