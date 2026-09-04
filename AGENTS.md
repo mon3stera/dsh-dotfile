@@ -219,6 +219,7 @@ Important context behavior:
 - `lib/client.js`: a "定时任务 / Scheduled tasks" entry occupying the `sidebar.footer.action` list slot — the seat renders directly above the Settings entry — toggling a fixed side panel (create/edit/delete, enable toggle, run-now, last run + session id + error). No icon package: the entry draws its own inline clock SVG.
 - `package.json`: Web client injection (locale, slots, sidebar) and package exports.
 - The scheduler deliberately does not use `dsh-schedule`: that host package delivers reminders into an existing conversation, while this plugin's contract is one fresh session per run.
+- Per-task model: tasks may carry `provider`/`model`; when both are set the runner resolves the route through the host `llm.resolveCallConfig` and commits it with `controller.agents.selectForNextRequest(agent, selection)` before prompting. `sessionController.selectModel()` is deliberately avoided — beyond the session-local selection it also saves the deployment-global default model (`agentDefaultModel.saveSelection`), which a task must never hijack. A failed selection records `lastError` and skips the prompt instead of running on the wrong model.
 
 ## Profile Composition
 

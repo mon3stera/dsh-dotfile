@@ -31,6 +31,9 @@ export const TaskSchema = z.object({
   prompt: z.string().min(1).max(MAX_PROMPT_CHARS),
   cwd: z.string().max(1024).default(""),
   agentPreset: z.string().max(120).default(""),
+  /** Empty provider/model = the deployment default model route. */
+  provider: z.string().max(120).default(""),
+  model: z.string().max(200).default(""),
   enabled: z.boolean().default(true),
   /** "interval": every `minutes`; "daily": at `time` (server-local HH:MM). */
   kind: z.union([z.const("interval"), z.const("daily")]).default("interval"),
@@ -132,6 +135,17 @@ export function createScheduler() {
         ...(task.cwd ? { cwd: task.cwd } : {}),
         ...(task.agentPreset ? { agentPreset: task.agentPreset } : {})
       });
+      /* per-task model selection: resolveCallConfig validates the route, then
+       * selectForNextRequest commits a session-local model/selection event.
+       * The RPC selectModel() is deliberately avoided — it also saves the
+       * deployment-global default model, which a task must never hijack. A
+       * failed selection skips the prompt rather than running on the wrong
+       * model silently. */
+      if (task.provider && task.model) {
+        const agent = await runner.resolveAgent(created.sessionId);
+        const resolved = await runner.resolveCallConfig({ provider: task.provider, model: task.model });
+        await runner.selectModel(agent, resolved);
+      }
       await runner.prompt({
         sessionId: created.sessionId,
         requestId: randomUUID(),
@@ -298,11 +312,21 @@ export function apply(ctx) {
     httpCtx.effect(() => httpCtx.webServer.register({ kind: "exact", path: "/scheduler/run", handler: handleRun }), "dsh-plugin-scheduler: run route");
   });
 
-  ctx.inject(["sessionController"], (hostCtx) => {
+  ctx.inject(["sessionController", "llm"], (hostCtx) => {
     const controller = hostCtx.sessionController;
     scheduler.setRunner({
       create: (request) => controller.create(request),
-      prompt: (request, signal) => controller.prompt(request, signal)
+      prompt: (request, signal) => controller.prompt(request, signal),
+      resolveAgent: async (sessionId) => {
+        /* SessionController.resolveAgent returns the raw inner {agent} | {error} shape */
+        const found = await controller.resolveAgent(sessionId);
+        if (found !== null && typeof found === "object" && "error" in found) throw found.error;
+        return found !== null && typeof found === "object" && "agent" in found ? found.agent : found;
+      },
+      resolveCallConfig: (config) => hostCtx.llm.resolveCallConfig(config),
+      /* session-local selection only; never sessionController.selectModel,
+       * which also persists the deployment-global default model */
+      selectModel: (agent, selection) => controller.agents.selectForNextRequest(agent, selection)
     });
     /* overdue interval tasks catch up once at boot; daily tasks wait */
     hostCtx.effect(() => {

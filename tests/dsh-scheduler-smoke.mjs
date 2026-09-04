@@ -50,6 +50,18 @@ scheduler.setRunner({
 	},
 	prompt: async (request) => {
 		calls.push(["prompt", request]);
+	},
+	resolveAgent: async (sessionId) => {
+		calls.push(["resolveAgent", sessionId]);
+		return { session: {} };
+	},
+	resolveCallConfig: async (config) => {
+		calls.push(["resolve", config]);
+		if (config.provider === "bad") throw new Error("unknown provider");
+		return { ...config, effort: "low" };
+	},
+	selectModel: async (agent, selection) => {
+		calls.push(["select", selection]);
 	}
 });
 
@@ -57,20 +69,32 @@ const seed = [
 	task({ id: "due", name: "due now", prompt: "run me", minutes: 10, lastRunAt: now - 20 * MIN }),
 	task({ id: "later", name: "later", prompt: "not yet", minutes: 60, lastRunAt: now }),
 	task({ id: "off", name: "disabled", prompt: "skipped", minutes: 5, lastRunAt: now - 99 * MIN, enabled: false }),
-	task({ id: "fails", name: "failing", prompt: "boom", cwd: "boom://fail", minutes: 5, lastRunAt: now - 99 * MIN })
+	task({ id: "fails", name: "failing", prompt: "boom", cwd: "boom://fail", minutes: 5, lastRunAt: now - 99 * MIN }),
+	task({ id: "withmodel", name: "with model", prompt: "on m1", provider: "prov", model: "m1", minutes: 5, lastRunAt: now - 99 * MIN })
 ];
 scheduler.setDocument({ tasks: seed });
 await scheduler.fireDueTasks();
 const after = scheduler.getDocument().tasks;
-/* three calls: due (create+prompt) and fails (create throws, caught) */
-check("due task ran: create then prompt with its prompt text", calls.length === 3
+/* eight calls: due (create+prompt), fails (create throws), withmodel
+ * (create -> resolveAgent -> resolve -> select -> prompt) */
+check("due task ran: create then prompt with its prompt text", calls.length === 8
 	&& calls[0][0] === "create" && calls[0][1].sessionId.startsWith("session-sched-")
 	&& JSON.stringify(calls[1]) === JSON.stringify(["prompt", { sessionId: "session-1", requestId: calls[1][1].requestId, content: [{ type: "text", text: "run me" }] }]));
+check("model task resolves the route and selects before prompting", calls[4][0] === "resolveAgent" && calls[5][0] === "resolve" && calls[5][1].provider === "prov" && calls[5][1].model === "m1" && calls[6][0] === "select" && calls[6][1].provider === "prov" && calls[6][1].model === "m1" && calls[7][0] === "prompt" && calls[7][1].sessionId === "session-4");
+check("selected model carries the resolved effort", calls[6][1].effort === "low");
 check("disabled task never fires", after.find((t) => t.id === "off").lastRunAt === now - 99 * MIN);
 check("later task untouched", after.find((t) => t.id === "later").lastRunAt === now);
 check("failing task records lastError", after.find((t) => t.id === "fails").lastError.includes("create refused"));
 check("due task stamped lastRunAt + lastSessionId", after.find((t) => t.id === "due").lastSessionId === "session-1" && after.find((t) => t.id === "due").lastRunAt === now);
+check("model task stamped its session", after.find((t) => t.id === "withmodel").lastSessionId === "session-4");
 check("prompt request carries a fresh requestId", typeof calls[1][1].requestId === "string" && calls[1][1].requestId.length > 10);
+
+// a task whose model route cannot resolve skips the prompt entirely
+calls.length = 0;
+scheduler.setDocument({ tasks: [task({ id: "badmodel", name: "bad route", prompt: "x", provider: "bad", model: "m", minutes: 5, lastRunAt: now - 10 * MIN })] });
+await scheduler.fireDueTasks();
+const badTask = scheduler.getDocument().tasks[0];
+check("unresolvable model records lastError and never prompts", badTask.lastError.includes("unknown provider") && !calls.some(([kind]) => kind === "prompt"));
 console.log("scheduler core OK");
 
 // ---------- routes ----------
