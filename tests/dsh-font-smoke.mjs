@@ -1,6 +1,12 @@
 /**
  * Smoke test for dsh-plugin-font (client factory + host handlers with stubs).
  * Run: node tests/dsh-font-smoke.mjs (from the repo root)
+ *
+ * The stubbed theme mirrors DSH 0.1.2-rc.x: markdown font tokens are DERIVED
+ * (base = var(--dsh-content-font-size,14px), h1-h3 = calc(21px + delta),
+ * tables via a min/max secondary formula, code static 12/11/11), so the
+ * client must probe resolved computed longhands instead of parsing the
+ * custom-property token stream.
  */
 import { readFileSync, existsSync, mkdirSync, rmSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -30,7 +36,8 @@ const fakeBody = {
   style: {
     setProperty(k, v) { styleProps[k] = v; },
     removeProperty(k) { delete styleProps[k]; }
-  }
+  },
+  appendChild() { }
 };
 const styleTags = [];
 globalThis.document = {
@@ -40,18 +47,19 @@ globalThis.document = {
     appendChild(tag) { styleTags.push(tag); }
   },
   querySelectorAll() { return []; },
-  createElement(tag) { return { dataset: {}, textContent: "" }; },
+  createElement(tag) { return { dataset: {}, textContent: "", style: {}, remove() { } }; },
   getElementById() { return { value: "" }; }
 };
 const FONT_VARS = new Map();
 FONT_VARS.set("--dsw-font-family", "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif");
 FONT_VARS.set("--ds-font-family-code", "'SF Mono', 'JetBrains Mono', Consolas");
+/** Natural theme baselines (0.1.2-rc.x): resolved px the probe must read back. */
 const BASELINES = {
-  base: [16, 28, 400, "normal"], "base-italic": [16, 28, 400, "italic"], "base-strong": [16, 28, 600, "normal"], "base-strong-italic": [16, 28, 600, "italic"],
-  h1: [24, 34, 700, "normal"], h2: [22, 32, 700, "normal"], h3: [20, 30, 700, "normal"], h4: [16, 28, 600, "normal"],
-  table: [15, 25, 400, "normal"], "table-head": [15, 25, 500, "normal"],
-  small: [14, 24, 400, "normal"], "small-strong": [14, 24, 600, "normal"], "small-italic": [14, 24, 400, "italic"], "small-strong-italic": [14, 24, 600, "italic"],
-  code: [14, 22, 400, "normal"], "code-block": [13, 22, 400, "normal"], "code-block-small": [12, 18, 400, "normal"]
+  base: [14, 24, 400, "normal"], "base-italic": [14, 24, 400, "italic"], "base-strong": [14, 24, 600, "normal"], "base-strong-italic": [14, 24, 600, "italic"],
+  h1: [21, 30, 700, "normal"], h2: [19, 28, 700, "normal"], h3: [18, 26, 700, "normal"], h4: [14, 24, 600, "normal"],
+  table: [13, 22, 400, "normal"], "table-head": [13, 22, 500, "normal"],
+  small: [12, 20, 400, "normal"], "small-strong": [12, 20, 600, "normal"], "small-italic": [12, 20, 400, "italic"], "small-strong-italic": [12, 20, 600, "italic"],
+  code: [12, 19, 400, "normal"], "code-block": [11, 19, 400, "normal"], "code-block-small": [11, 16, 400, "normal"]
 };
 for (const [f, [size, lh, weight, style]] of Object.entries(BASELINES)) {
   FONT_VARS.set(`--dsw-font-markdown-${f}-font-size`, `${size}px`);
@@ -60,7 +68,31 @@ for (const [f, [size, lh, weight, style]] of Object.entries(BASELINES)) {
   FONT_VARS.set(`--dsw-font-markdown-${f}-font-style`, style);
   FONT_VARS.set(`--dsw-font-markdown-${f}-font-family`, f.startsWith("code") ? "'SF Mono', 'JetBrains Mono', Consolas" : "-apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif");
 }
-globalThis.getComputedStyle = () => ({ getPropertyValue: (v) => FONT_VARS.get(v) || "" });
+/**
+ * Probe-aware computed-style stub: when the element's inline font-size is the
+ * plugin's probe variable, resolve the family's longhands like a real engine
+ * would (this is the contract the client now relies on); otherwise serve the
+ * custom-property map for body/root reads.
+ */
+globalThis.getComputedStyle = (el) => {
+  const match = /var\(--dsw-font-markdown-([a-z0-9-]+)-font-size\)/.exec(el?.style?.fontSize || "");
+  if (match) {
+    const family = match[1];
+    const base = BASELINES[family];
+    if (!base) {
+      return { fontSize: "16px", lineHeight: "normal", fontWeight: "400", fontStyle: "normal", fontFamily: "serif", getPropertyValue: (v) => FONT_VARS.get(v) || "" };
+    }
+    return {
+      fontSize: `${base[0]}px`,
+      lineHeight: `${base[1]}px`,
+      fontWeight: String(base[2]),
+      fontStyle: base[3],
+      fontFamily: family.startsWith("code") ? "'SF Mono', 'JetBrains Mono', Consolas" : "-apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif",
+      getPropertyValue: (v) => FONT_VARS.get(v) || ""
+    };
+  }
+  return { getPropertyValue: (v) => FONT_VARS.get(v) || "" };
+};
 
 const postedConfigs = [];
 let configStore = null; // null => 404
@@ -127,8 +159,9 @@ if (!ctx._locales || !ctx._locales.zh["font.title"] || !ctx._locales.en["font.ti
 if (Object.keys(ctx._locales.zh).sort().join(",") !== Object.keys(ctx._locales.en).sort().join(",")) throw new Error("FAIL: locale key sets differ");
 console.log("apply OK: row registered, css + locales injected");
 
-// no config yet -> default, no inline var
+// no config yet -> follow the theme: no inline vars at all
 if (styleProps["--dsw-font-family"] !== undefined) throw new Error("FAIL: default should not set font var");
+if (styleProps["--dsw-font-markdown-base-font-size"] !== undefined) throw new Error("FAIL: default should not scale markdown");
 
 // simulate row mount: entry.inject(actions) pushes current state into the store
 const storeInstance = ctx._entry.store.create();
@@ -158,14 +191,14 @@ let row = renderRow();
 if (!row || row.props.className !== "dft-group") throw new Error("FAIL: row render");
 if (countTags(row, "select").length !== 2) throw new Error("FAIL: expected 2 font pickers");
 if (textInputs(row).length !== 0) throw new Error("FAIL: no custom input with defaults");
-if (countTags(row, "input[range]").length !== 0) throw new Error("unreachable");
 const stepButtons = countTags(row, "button").filter((b) => b.props.className === "dft-step");
 if (stepButtons.length !== 4) throw new Error("FAIL: expected 4 stepper buttons, got " + stepButtons.length);
 const previewEl = countTags(row, "div").find((d) => d.props.className === "dft-preview");
-if (!previewEl || previewEl.props.style.fontSize !== "16px") throw new Error("FAIL: body preview missing: " + JSON.stringify(previewEl?.props?.style));
+if (!previewEl || previewEl.props.style.fontSize !== "14px") throw new Error("FAIL: body preview should follow theme natural: " + JSON.stringify(previewEl?.props?.style));
 const previewCodeEl = countTags(row, "div").find((d) => d.props.className === "dft-preview dft-previewCode");
-if (!previewCodeEl || previewCodeEl.props.style.fontSize !== "14px") throw new Error("FAIL: code preview missing: " + JSON.stringify(previewCodeEl?.props?.style));
-console.log("row mount OK: 2 pickers, no custom inputs");
+if (!previewCodeEl || previewCodeEl.props.style.fontSize !== "12px") throw new Error("FAIL: code preview should follow theme natural: " + JSON.stringify(previewCodeEl?.props?.style));
+if (storeInstance.getSnapshot().natural.body !== 14 || storeInstance.getSnapshot().natural.code !== 12) throw new Error("FAIL: probed naturals not pushed: " + JSON.stringify(storeInstance.getSnapshot().natural));
+console.log("row mount OK: 2 pickers, naturals probed (body 14, code 12)");
 
 // catalog fetch resolved -> store fonts populated, pickers list installed fonts
 await new Promise((r) => setTimeout(r, 50));
@@ -190,39 +223,46 @@ const saved = postedConfigs.at(-1);
 if (saved.family !== "LXGW WenKai" || saved.codeFamily !== "JetBrains Mono") throw new Error("FAIL: persist: " + JSON.stringify(postedConfigs));
 console.log("set body/code OK:", styleProps["--dsw-font-family"], "|", styleProps["--ds-font-family-code"]);
 
-// font sizes: body and code scale independently (markdown vars on BODY)
-props.setFontSize(17);
-if (styleProps["--dsw-font-markdown-base-font-size"] !== "17px") throw new Error("FAIL: base size: " + styleProps["--dsw-font-markdown-base-font-size"]);
-if (styleProps["--dsw-font-markdown-base-line-height"] !== "29.8px") throw new Error("FAIL: base lh: " + styleProps["--dsw-font-markdown-base-line-height"]);
-if (styleProps["--dsw-font-markdown-base"] !== "17px/29.8px -apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif") throw new Error("FAIL: base composite: " + styleProps["--dsw-font-markdown-base"]);
-if (styleProps["--dsw-font-markdown-h1"] !== "700 25.5px/36.1px -apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif") throw new Error("FAIL: h1 composite: " + styleProps["--dsw-font-markdown-h1"]);
-// code size independent: body at 17px does NOT touch code families
+// font sizes: probe-resolved baselines (body 14, inline code 12); body and code scale independently
+props.setFontSize(15);
+if (styleProps["--dsw-font-markdown-base-font-size"] !== "15px") throw new Error("FAIL: base size: " + styleProps["--dsw-font-markdown-base-font-size"]);
+if (styleProps["--dsw-font-markdown-base-line-height"] !== "25.7px") throw new Error("FAIL: base lh: " + styleProps["--dsw-font-markdown-base-line-height"]);
+if (styleProps["--dsw-font-markdown-base"] !== "15px/25.7px -apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif") throw new Error("FAIL: base composite: " + styleProps["--dsw-font-markdown-base"]);
+// derived heading tokens now scale too (calc-based baselines resolved by the probe)
+if (styleProps["--dsw-font-markdown-h1"] !== "700 22.5px/32.1px -apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif") throw new Error("FAIL: h1 composite: " + styleProps["--dsw-font-markdown-h1"]);
+if (styleProps["--dsw-font-markdown-h3"] !== "700 19.3px/27.9px -apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif") throw new Error("FAIL: h3 composite: " + styleProps["--dsw-font-markdown-h3"]);
+// table tokens (min/max secondary formula) scale as well
+if (styleProps["--dsw-font-markdown-table"] !== "13.9px/23.6px -apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif") throw new Error("FAIL: table composite: " + styleProps["--dsw-font-markdown-table"]);
+if (styleProps["--dsw-font-markdown-table-head"] !== "500 13.9px/23.6px -apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif") throw new Error("FAIL: table-head composite: " + styleProps["--dsw-font-markdown-table-head"]);
+// code size independent: body at 15px does NOT touch code families
 if (styleProps["--dsw-font-markdown-code-block-font-size"] !== undefined) throw new Error("FAIL: body size should not scale code");
 props.setCodeFontSize(16);
-if (styleProps["--dsw-font-markdown-code-block-font-size"] !== "14.9px") throw new Error("FAIL: code-block size: " + styleProps["--dsw-font-markdown-code-block-font-size"]);
 if (styleProps["--dsw-font-markdown-code-font-size"] !== "16px") throw new Error("FAIL: inline code size: " + styleProps["--dsw-font-markdown-code-font-size"]);
-if (styleProps["--dsw-font-markdown-code-block"] !== "14.9px/25.1px 'SF Mono', 'JetBrains Mono', Consolas") throw new Error("FAIL: code-block composite: " + styleProps["--dsw-font-markdown-code-block"]);
-if (styleProps["--dsw-font-markdown-base-font-size"] !== "17px") throw new Error("FAIL: code size should not touch body");
+if (styleProps["--dsw-font-markdown-code-block-font-size"] !== "14.7px") throw new Error("FAIL: code-block size: " + styleProps["--dsw-font-markdown-code-block-font-size"]);
+if (styleProps["--dsw-font-markdown-code-block"] !== "14.7px/25.3px 'SF Mono', 'JetBrains Mono', Consolas") throw new Error("FAIL: code-block composite: " + styleProps["--dsw-font-markdown-code-block"]);
+if (styleProps["--dsw-font-markdown-base-font-size"] !== "15px") throw new Error("FAIL: code size should not touch body");
 props.setCodeFontSize(30);
-if (styleProps["--dsw-font-markdown-code-block-font-size"] !== "22.3px") throw new Error("FAIL: code clamp high: " + styleProps["--dsw-font-markdown-code-block-font-size"]);
+if (styleProps["--dsw-font-markdown-code-block-font-size"] !== "22px") throw new Error("FAIL: code clamp high: " + styleProps["--dsw-font-markdown-code-block-font-size"]);
 props.setCodeFontSize(10);
-if (styleProps["--dsw-font-markdown-code-block-font-size"] !== "11.1px") throw new Error("FAIL: code clamp low: " + styleProps["--dsw-font-markdown-code-block-font-size"]);
+if (styleProps["--dsw-font-markdown-code-block-font-size"] !== undefined) throw new Error("FAIL: clamp-to-natural 12 should clear code vars");
 props.setCodeFontSize(14);
-if (styleProps["--dsw-font-markdown-code-block-font-size"] !== undefined) throw new Error("FAIL: default 14 should clear code vars");
+if (styleProps["--dsw-font-markdown-code-block-font-size"] !== "12.8px") throw new Error("FAIL: code 14 over natural 12 should scale: " + styleProps["--dsw-font-markdown-code-block-font-size"]);
 props.setFontSize(16);
-if (styleProps["--dsw-font-markdown-base-font-size"] !== undefined) throw new Error("FAIL: default 16 should clear body vars");
-props.setFontSize(17);
+if (styleProps["--dsw-font-markdown-base-font-size"] !== "16px") throw new Error("FAIL: body 16 over natural 14 should scale: " + styleProps["--dsw-font-markdown-base-font-size"]);
+props.setFontSize(14);
+if (styleProps["--dsw-font-markdown-base-font-size"] !== undefined) throw new Error("FAIL: natural-equal 14 should clear body vars");
+props.setFontSize(15);
 props.setCodeFontSize(16);
 if (styleProps["zoom"] !== undefined) throw new Error("FAIL: no zoom property should ever be set");
 await new Promise((r) => setTimeout(r, 500));
 const savedWithSize = postedConfigs.at(-1);
-if (savedWithSize.fontSize !== 17 || savedWithSize.codeFontSize !== 16 || savedWithSize.scale !== undefined) throw new Error("FAIL: fontSize persist: " + JSON.stringify(savedWithSize));
+if (savedWithSize.fontSize !== 15 || savedWithSize.codeFontSize !== 16 || savedWithSize.scale !== undefined) throw new Error("FAIL: fontSize persist: " + JSON.stringify(savedWithSize));
 row = renderRow();
 const preview2 = countTags(row, "div").find((d) => d.props.className === "dft-preview");
-if (!preview2 || preview2.props.style.fontSize !== "17px") throw new Error("FAIL: body preview should follow: " + JSON.stringify(preview2?.props?.style));
+if (!preview2 || preview2.props.style.fontSize !== "15px") throw new Error("FAIL: body preview should follow: " + JSON.stringify(preview2?.props?.style));
 const previewCode2 = countTags(row, "div").find((d) => d.props.className === "dft-preview dft-previewCode");
 if (!previewCode2 || previewCode2.props.style.fontSize !== "16px") throw new Error("FAIL: code preview should follow: " + JSON.stringify(previewCode2?.props?.style));
-console.log("fontSizes OK: body/code independent px scaling, clamp/persist/previews");
+console.log("fontSizes OK: probe-based scaling incl. headings/tables, clamp/persist/previews");
 
 // non-preset body font -> custom input revealed in the picker
 props.setFamily("My Custom Font");
@@ -233,14 +273,14 @@ if (!customInputs.some((i) => i.props.defaultValue === "My Custom Font")) throw 
 if (!customInputs.some((i) => i.props.defaultValue === "JetBrains Mono")) throw new Error("FAIL: code custom input missing");
 console.log("custom picker inputs revealed OK (body+code)");
 
-// clear -> both vars removed + persisted
+// clear -> both vars removed + persisted (sizes stay explicit numbers)
 props.setFamily("");
 props.setCodeFamily("");
 if (styleProps["--dsw-font-family"] !== undefined || styleProps["--ds-font-family-code"] !== undefined) throw new Error("FAIL: clear should remove vars");
 await new Promise((r) => setTimeout(r, 500));
 const last = postedConfigs.at(-1);
-if (last.family !== "" || last.codeFamily !== "") throw new Error("FAIL: clear persist: " + JSON.stringify(last));
-console.log("clear OK: vars removed");
+if (last.family !== "" || last.codeFamily !== "" || last.fontSize !== 15 || last.codeFontSize !== 16) throw new Error("FAIL: clear persist: " + JSON.stringify(last));
+console.log("clear OK: vars removed, explicit sizes persisted");
 
 // restore from config: fresh factory with configStore set
 configStore = { family: "Noto Sans SC", codeFamily: "Fira Code", fontSize: 15, codeFontSize: 17 };
@@ -253,19 +293,32 @@ if (styleProps["--dsw-font-family"] !== "'Noto Sans SC', -apple-system, BlinkMac
 if (styleProps["--ds-font-family-code"] !== "'Fira Code', 'SF Mono', 'JetBrains Mono', Consolas") throw new Error("FAIL: restore code: " + styleProps["--ds-font-family-code"]);
 console.log("restore from config OK:", styleProps["--dsw-font-family"], "|", styleProps["--ds-font-family-code"]);
 if (styleProps["--dsw-font-markdown-base-font-size"] !== "15px") throw new Error("FAIL: restore fontSize: " + styleProps["--dsw-font-markdown-base-font-size"]);
-if (styleProps["--dsw-font-markdown-code-block-font-size"] !== "15.8px") throw new Error("FAIL: restore codeFontSize: " + styleProps["--dsw-font-markdown-code-block-font-size"]);
-// legacy config: percentage scale migrates to a px base
+if (styleProps["--dsw-font-markdown-code-font-size"] !== "17px") throw new Error("FAIL: restore codeFontSize: " + styleProps["--dsw-font-markdown-code-font-size"]);
+if (styleProps["--dsw-font-markdown-code-block-font-size"] !== "15.6px") throw new Error("FAIL: restore code-block size: " + styleProps["--dsw-font-markdown-code-block-font-size"]);
+// legacy config: percentage scale migrates to a px base (old 16px base)
 configStore = { family: "", codeFamily: "", scale: 1.25 };
 styleProps["--dsw-font-markdown-base-font-size"] = undefined;
 clientExports.apply(ctx);
 await new Promise((r) => setTimeout(r, 50));
 if (styleProps["--dsw-font-markdown-base-font-size"] !== "20px") throw new Error("FAIL: legacy scale migration: " + styleProps["--dsw-font-markdown-base-font-size"]);
-console.log("legacy scale migration OK (1.25 -> 20px)");
+// sizes absent from the config = follow the theme: code vars cleared, nothing persisted for them
+if (styleProps["--dsw-font-markdown-code-block-font-size"] !== undefined) throw new Error("FAIL: absent codeFontSize should follow theme: " + styleProps["--dsw-font-markdown-code-block-font-size"]);
+console.log("legacy scale migration OK (1.25 -> 20px), absent sizes follow theme");
 
-// sanitize quotes
+// sanitize quotes on the root var; follow-state payloads omit the size keys
 props.setFamily(`Bad'Name"`);
 if (!styleProps["--dsw-font-family"].startsWith("'BadName',")) throw new Error("FAIL: sanitize: " + styleProps["--dsw-font-family"]);
-console.log("sanitize OK");
+// a factory whose config carries no size info at all posts bare payloads
+configStore = { family: "", codeFamily: "" };
+clientExports.apply(ctx);
+await new Promise((r) => setTimeout(r, 50));
+const followStore = ctx._entry.store.create();
+const followProps = ctx._entry.inject(followStore.actions);
+followProps.setFamily(`Bad'Name"`);
+await new Promise((r) => setTimeout(r, 500));
+const sanitizedSave = postedConfigs.at(-1);
+if (sanitizedSave.family !== `Bad'Name"` || "fontSize" in sanitizedSave || "codeFontSize" in sanitizedSave) throw new Error("FAIL: follow-state payload should omit size keys: " + JSON.stringify(sanitizedSave));
+console.log("sanitize + null-key omission OK");
 
 console.log("CLIENT SMOKE OK");
 
@@ -304,6 +357,20 @@ await handleConfig(fakeReq("/font/config", null, {}, "GET"), res);
 const roundtrip = JSON.parse(res.out.body);
 if (roundtrip.family !== "LXGW WenKai" || roundtrip.codeFamily !== "JetBrains Mono" || roundtrip.fontSize !== 17 || roundtrip.codeFontSize !== 16) throw new Error("FAIL: roundtrip: " + res.out.body);
 
+// sizes optional: absent keys store without them (follow-the-theme state)
+res = fakeRes();
+await handleConfig(fakeReq("/font/config", JSON.stringify({ family: "X" }), { "content-type": "application/json" }, "POST"), res);
+if (res.out.status !== 200) throw new Error("FAIL: absent sizes should 200: " + res.out.status);
+let stored = JSON.parse(readFileSync(configPath(), "utf8"));
+if (stored.family !== "X" || "fontSize" in stored || "codeFontSize" in stored) throw new Error("FAIL: absent sizes should store bare: " + JSON.stringify(stored));
+
+// explicit null accepted and stored
+res = fakeRes();
+await handleConfig(fakeReq("/font/config", JSON.stringify({ family: "X", fontSize: null, codeFontSize: null }), { "content-type": "application/json" }, "POST"), res);
+if (res.out.status !== 200) throw new Error("FAIL: null sizes should 200: " + res.out.status);
+stored = JSON.parse(readFileSync(configPath(), "utf8"));
+if (stored.fontSize !== null || stored.codeFontSize !== null) throw new Error("FAIL: null sizes should persist: " + JSON.stringify(stored));
+
 // invalid -> 400
 res = fakeRes();
 await handleConfig(fakeReq("/font/config", JSON.stringify({ family: 42 }), { "content-type": "application/json" }, "POST"), res);
@@ -317,6 +384,9 @@ if (res.out.status !== 400) throw new Error("FAIL: non-string codeFamily should 
 res = fakeRes();
 await handleConfig(fakeReq("/font/config", JSON.stringify({ fontSize: "big" }), { "content-type": "application/json" }, "POST"), res);
 if (res.out.status !== 400) throw new Error("FAIL: non-number fontSize should 400");
+res = fakeRes();
+await handleConfig(fakeReq("/font/config", JSON.stringify({ fontSize: 33 }), { "content-type": "application/json" }, "POST"), res);
+if (res.out.status !== 400) throw new Error("FAIL: out-of-range fontSize should 400");
 res = fakeRes();
 await handleConfig(fakeReq("/font/config", JSON.stringify({ codeFontSize: "big" }), { "content-type": "application/json" }, "POST"), res);
 if (res.out.status !== 400) throw new Error("FAIL: non-number codeFontSize should 400");

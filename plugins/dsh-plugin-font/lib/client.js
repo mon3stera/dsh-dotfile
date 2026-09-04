@@ -7,8 +7,11 @@
  *  - two dropdown font pickers: body font (--dsw-font-family) and code font
  *    (--ds-font-family-code), each with presets plus a "custom…" free-text
  *    input for fonts outside the list; empty = system default,
- *  - persisted through the plugin-owned $DSH_HOME/font/config.json, so the
- *    choices survive restarts without depending on the Host settings
+ *  - body and code font-size steppers (absolute px). The theme baselines are
+ *    probed through the layout engine, so host-side derived tokens resolve
+ *    correctly; unadjusted sizes follow the theme's own content font-size
+ *    axis. Persisted through the plugin-owned $DSH_HOME/font/config.json, so
+ *    the choices survive restarts without depending on the Host settings
  *    document.
  */
 window.__ModuleLoader__.load({
@@ -44,14 +47,16 @@ window.__ModuleLoader__.load({
 		/** Code families scale with the code size setting; the rest follow the body size. */
 		const CODE_FONT_FAMILIES = new Set(["code", "code-block", "code-block-small"]);
 		const round1 = (value) => Math.round(value * 10) / 10;
-		const scaleFactor = (fontSize, baseSize) => (baseSize > 0 ? fontSize / baseSize : 1);
 
-		/** Font-size slider bounds (percent of the base UI size). */
+		/** Font-size slider bounds (absolute px of the markdown base / inline code). */
 		const FONT_SIZE_MIN = 12;
 		const FONT_SIZE_MAX = 24;
-		const BASE_FONT_SIZE = 16;
-		const CODE_BASE_FONT_SIZE = 14;
-		const clampFontSize = (value) => (typeof value === "number" && Number.isFinite(value) ? Math.round(Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, value))) : BASE_FONT_SIZE);
+		/** Pre-derived-theme base, kept only to migrate legacy percentage configs. */
+		const LEGACY_BASE_FONT_SIZE = 16;
+		/** Stepper display fallbacks while the theme baselines have not been probed. */
+		const FALLBACK_BODY_SIZE = 14;
+		const FALLBACK_CODE_SIZE = 12;
+		const clampFontSize = (value) => (typeof value === "number" && Number.isFinite(value) ? Math.round(Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, value))) : null);
 
 		/** Dropdown presets; empty selection = system default, CUSTOM = free text. */
 		const CUSTOM = "__custom__";
@@ -107,7 +112,7 @@ window.__ModuleLoader__.load({
 			"font.codeSize": "代码字号",
 			"font.preview": "字体预览 Aa 中文 123",
 			"font.previewCode": "代码预览 const x = 42",
-			"font.hint": "正文字号（基准 16px）与代码字号（基准 14px）分别设置，标题/表格按正文比例跟随，代码块/行内代码按代码比例跟随；仅影响文字（字号与行高），界面布局与图片不受影响。正文字体与代码字体也可分别选择，选择“系统默认”或清空自定义输入即恢复对应项"
+			"font.hint": "正文字号与代码字号分别设置，未手动调整时跟随主题的系统字号；标题/表格按正文比例跟随，代码块/行内代码按代码比例跟随；仅影响文字（字号与行高），界面布局与图片不受影响。正文字体与代码字体也可分别选择，选择“系统默认”或清空自定义输入即恢复对应项"
 		};
 		const en = {
 			"font.title": "UI fonts",
@@ -120,13 +125,13 @@ window.__ModuleLoader__.load({
 			"font.codeSize": "Code size",
 			"font.preview": "Preview Aa 中文 123",
 			"font.previewCode": "Code preview const x = 42",
-			"font.hint": "Body size (base 16px) and code size (base 14px) are independent: headings/tables follow the body ratio, code blocks/inline code follow the code ratio. Text only (font-size and line-height) — layout and images are untouched. Body and code fonts also apply independently; “System default” or an empty custom input restores that item"
+			"font.hint": "Body size and code size are independent and follow the theme's font-size setting until adjusted: headings/tables follow the body ratio, code blocks/inline code follow the code ratio. Text only (font-size and line-height) — layout and images are untouched. Body and code fonts also apply independently; “System default” or an empty custom input restores that item"
 		};
 
 		/** Mirror store for the settings row (the theme row pattern). */
 		function createFontRowStore() {
 			return defineStore({
-				init: () => ({ family: "", codeFamily: "", fontSize: BASE_FONT_SIZE, codeFontSize: CODE_BASE_FONT_SIZE, fonts: null, revision: -1 }),
+				init: () => ({ family: "", codeFamily: "", fontSize: null, codeFontSize: null, natural: { body: null, code: null }, fonts: null, revision: -1 }),
 				actions: {
 					sync: (d, family, codeFamily, fontSize, codeFontSize, revision) => {
 						if (revision <= d.revision) return;
@@ -135,6 +140,9 @@ window.__ModuleLoader__.load({
 						d.fontSize = fontSize;
 						d.codeFontSize = codeFontSize;
 						d.revision = revision;
+					},
+					setNatural: (d, body, code) => {
+						d.natural = { body, code };
 					},
 					setFonts: (d, fonts) => {
 						d.fonts = fonts;
@@ -185,8 +193,9 @@ window.__ModuleLoader__.load({
 			const s = useStore((st) => st);
 			const bodyOptions = s.fonts ? s.fonts.families : BODY_FONT_PRESETS;
 			const codeOptions = s.fonts ? (s.fonts.mono && s.fonts.mono.length ? s.fonts.mono : s.fonts.families) : CODE_FONT_PRESETS;
-			const size = clampFontSize(s.fontSize);
-			const codeSize = clampFontSize(s.codeFontSize);
+			/** null = follow the theme's content font-size axis (probed when ready). */
+			const size = s.fontSize ?? s.natural?.body ?? FALLBACK_BODY_SIZE;
+			const codeSize = s.codeFontSize ?? s.natural?.code ?? FALLBACK_CODE_SIZE;
 			const stepper = (labelKey, value, onStep) => jsx("div", {
 				className: "dft-sizeRow",
 				children: [
@@ -242,36 +251,78 @@ window.__ModuleLoader__.load({
 			const store = createFontRowStore();
 			let bound = null;
 			let saveTimer = null;
-			const state = { family: "", codeFamily: "", fontSize: BASE_FONT_SIZE, codeFontSize: CODE_BASE_FONT_SIZE, fonts: null, revision: -1 };
+			const state = { family: "", codeFamily: "", fontSize: null, codeFontSize: null, fonts: null, revision: -1 };
 			let originalStacks = null;
 
-						let markdownBaselines = null;
+			let markdownBaselines = null;
 			const markdownVar = (suffix) => `--dsw-font-markdown-${suffix}`;
 
-			/** Capture the base sheet's markdown size/weight/style once (families are re-read per apply). */
+			/**
+			 * Capture each markdown family's resolved size/line-height/weight/style
+			 * by probing with the theme's own variables: computed longhands come back
+			 * fully resolved, so any host-side derivation (calc(), var() chains, the
+			 * min/max table formula) is resolved by the layout engine instead of a
+			 * regex over the custom-property token stream. Families whose longhands
+			 * do not resolve to finite px stay theme-controlled.
+			 */
 			const captureMarkdownBaselines = () => {
-				const cs = getComputedStyle(document.body);
+				const probe = document.createElement("div");
+				probe.style.position = "absolute";
+				probe.style.visibility = "hidden";
+				probe.style.pointerEvents = "none";
+				document.body.appendChild(probe);
 				const baselines = {};
-				for (const family of MARKDOWN_FONT_FAMILIES) {
-					const readPx = (name) => {
-						const raw = cs.getPropertyValue(markdownVar(name)).trim();
-						const match = /^([0-9.]+)px$/.exec(raw);
-						return match ? Number(match[1]) : null;
-					};
-					baselines[family] = {
-						size: readPx(`${family}-font-size`),
-						lh: readPx(`${family}-line-height`),
-						weight: cs.getPropertyValue(markdownVar(`${family}-font-weight`)).trim() || "400",
-						style: cs.getPropertyValue(markdownVar(`${family}-font-style`)).trim() || "normal"
-					};
+				try {
+					for (const family of MARKDOWN_FONT_FAMILIES) {
+						const ps = probe.style;
+						ps.fontFamily = `var(${markdownVar(family)}-font-family)`;
+						ps.fontSize = `var(${markdownVar(family)}-font-size)`;
+						ps.lineHeight = `var(${markdownVar(family)}-line-height)`;
+						ps.fontWeight = `var(${markdownVar(family)}-font-weight)`;
+						ps.fontStyle = `var(${markdownVar(family)}-font-style)`;
+						const cs = getComputedStyle(probe);
+						const size = Number.parseFloat(cs.fontSize);
+						const lh = Number.parseFloat(cs.lineHeight);
+						if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(lh) || lh <= 0) continue;
+						baselines[family] = {
+							size,
+							lh,
+							weight: cs.fontWeight || "400",
+							style: cs.fontStyle || "normal"
+						};
+					}
+				} finally {
+					probe.remove();
 				}
 				return baselines;
 			};
 
+			/** Probe once, lazily; false while the document is not ready. */
+			const ensureBaselines = () => {
+				if (markdownBaselines !== null) return true;
+				try {
+					markdownBaselines = captureMarkdownBaselines();
+				} catch {
+					return false;
+				}
+				return markdownBaselines !== null;
+			};
+
+			/** Publish the theme's natural sizes so the steppers can display "follow". */
+			const pushNatural = () => {
+				if (bound && markdownBaselines) {
+					bound.setNatural(markdownBaselines.base ? markdownBaselines.base.size : null, markdownBaselines.code ? markdownBaselines.code.size : null);
+				}
+			};
+
+			/** Desired px over natural px; unset (null) or unprobed means follow the theme. */
+			const factorFor = (desired, base) => (typeof desired === "number" && base && base.size > 0 ? desired / base.size : 1);
+
 			/**
 			 * Text-only scale: restack the font tokens, then override the markdown
 			 * font variables with scaled size/line-height (layout untouched — no
-			 * zoom). Scale 1 removes the overrides.
+			 * zoom). Factor 1 removes the overrides so the theme (and its content
+			 * font-size axis) controls the family again.
 			 */
 			const applyTypography = () => {
 				const root = document.documentElement;
@@ -301,30 +352,25 @@ window.__ModuleLoader__.load({
 				};
 				restack(BODY_FONT_VAR, originalStacks.body, state.family);
 				restack(CODE_FONT_VAR, originalStacks.code, state.codeFamily);
-				if (!markdownBaselines) {
-					try {
-						markdownBaselines = captureMarkdownBaselines();
-					} catch {
-						return;
-					}
-				}
-				const baseSize = markdownBaselines.base?.size || BASE_FONT_SIZE;
-				const codeBaseSize = markdownBaselines.code?.size || CODE_BASE_FONT_SIZE;
-				const bodyFactor = scaleFactor(clampFontSize(state.fontSize), baseSize);
-				const codeFactor = scaleFactor(clampFontSize(state.codeFontSize), codeBaseSize);
+				if (!ensureBaselines()) return;
+				const bodyFactor = factorFor(state.fontSize, markdownBaselines.base);
+				const codeFactor = factorFor(state.codeFontSize, markdownBaselines.code);
 				const cs = getComputedStyle(body);
+				const clearFamily = (family) => {
+					body.style.removeProperty(markdownVar(family));
+					body.style.removeProperty(markdownVar(`${family}-font-size`));
+					body.style.removeProperty(markdownVar(`${family}-line-height`));
+				};
 				for (const family of MARKDOWN_FONT_FAMILIES) {
 					const factor = CODE_FONT_FAMILIES.has(family) ? codeFactor : bodyFactor;
-					if (factor === 1) {
-						body.style.removeProperty(markdownVar(family));
-						body.style.removeProperty(markdownVar(`${family}-font-size`));
-						body.style.removeProperty(markdownVar(`${family}-line-height`));
+					const base = markdownBaselines[family];
+					if (factor === 1 || !base) {
+						clearFamily(family);
 						continue;
 					}
-				const base = markdownBaselines[family];
-					if (!base || base.size === null || base.lh === null) continue;
 					const size = round1(base.size * factor);
 					const lh = round1(base.lh * factor);
+					/* families re-read per apply so a restacked --dsw-font-family lands */
 					const currentFamily = cs.getPropertyValue(markdownVar(`${family}-font-family`)).trim();
 					const style = base.style === "normal" ? "" : base.style + " ";
 					const weight = base.weight === "400" ? "" : base.weight + " ";
@@ -344,7 +390,10 @@ window.__ModuleLoader__.load({
 				if (saveTimer) clearTimeout(saveTimer);
 				saveTimer = setTimeout(() => {
 					saveTimer = null;
-					const payload = { family: state.family, codeFamily: state.codeFamily, fontSize: state.fontSize, codeFontSize: state.codeFontSize };
+					/* null sizes are omitted: absent keys mean "follow the theme" */
+					const payload = { family: state.family, codeFamily: state.codeFamily };
+					if (state.fontSize !== null) payload.fontSize = state.fontSize;
+					if (state.codeFontSize !== null) payload.codeFontSize = state.codeFontSize;
 					fetch("/font/config", {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
@@ -365,14 +414,14 @@ window.__ModuleLoader__.load({
 					changed = true;
 				}
 				if (patch.fontSize !== undefined) {
-					const value = clampFontSize(patch.fontSize);
+					const value = patch.fontSize === null ? null : clampFontSize(patch.fontSize);
 					if (value !== state.fontSize) {
 						state.fontSize = value;
 						changed = true;
 					}
 				}
 				if (patch.codeFontSize !== undefined) {
-					const value = clampFontSize(patch.codeFontSize);
+					const value = patch.codeFontSize === null ? null : clampFontSize(patch.codeFontSize);
 					if (value !== state.codeFontSize) {
 						state.codeFontSize = value;
 						changed = true;
@@ -403,26 +452,18 @@ window.__ModuleLoader__.load({
 							state.codeFamily = config.codeFamily;
 							changed = true;
 						}
-						if (typeof config.fontSize === "number") {
-							const value = clampFontSize(config.fontSize);
-							if (value !== state.fontSize) {
-								state.fontSize = value;
-								changed = true;
-							}
-						} else if (typeof config.scale === "number") {
-							/* legacy configs stored a percentage scale */
-							const value = clampFontSize(Math.round(BASE_FONT_SIZE * config.scale));
-							if (value !== state.fontSize) {
-								state.fontSize = value;
-								changed = true;
-							}
+						/* null/absent = follow the theme's own content font-size axis */
+						const desiredSize = typeof config.fontSize === "number"
+							? clampFontSize(config.fontSize)
+							: (typeof config.scale === "number" ? clampFontSize(Math.round(LEGACY_BASE_FONT_SIZE * config.scale)) : null);
+						if (desiredSize !== state.fontSize) {
+							state.fontSize = desiredSize;
+							changed = true;
 						}
-						if (typeof config.codeFontSize === "number") {
-							const value = clampFontSize(config.codeFontSize);
-							if (value !== state.codeFontSize) {
-								state.codeFontSize = value;
-								changed = true;
-							}
+						const desiredCodeSize = typeof config.codeFontSize === "number" ? clampFontSize(config.codeFontSize) : null;
+						if (desiredCodeSize !== state.codeFontSize) {
+							state.codeFontSize = desiredCodeSize;
+							changed = true;
 						}
 						if (!changed) return;
 						state.revision += 1;
@@ -448,6 +489,8 @@ window.__ModuleLoader__.load({
 			const injected = (actions) => {
 				bound = actions;
 				syncStore();
+				ensureBaselines();
+				pushNatural();
 				if (state.fonts) bound.setFonts(state.fonts);
 				return {
 					setFamily: (value) => { commit({ family: value }); },
@@ -459,14 +502,19 @@ window.__ModuleLoader__.load({
 
 			ctx.effect(() => ctx.locale.register(SETTINGS_LOCALE_NS, { zh, en }), "dsh-plugin-font: row dictionaries");
 			ctx.effect(() => injectFontCss(), "dsh-plugin-font: row styles");
+			ctx.effect(() => {
+				ensureBaselines();
+				pushNatural();
+			}, "dsh-plugin-font: theme baselines");
 			ctx.effect(() => () => {
 				if (saveTimer) clearTimeout(saveTimer);
 				document.documentElement.style.removeProperty(BODY_FONT_VAR);
 				document.documentElement.style.removeProperty(CODE_FONT_VAR);
+				const body = document.body;
 				for (const family of MARKDOWN_FONT_FAMILIES) {
-					document.documentElement.style.removeProperty(markdownVar(family));
-					document.documentElement.style.removeProperty(markdownVar(`${family}-font-size`));
-					document.documentElement.style.removeProperty(markdownVar(`${family}-line-height`));
+					body.style.removeProperty(markdownVar(family));
+					body.style.removeProperty(markdownVar(`${family}-font-size`));
+					body.style.removeProperty(markdownVar(`${family}-line-height`));
 				}
 			}, "dsh-plugin-font: teardown");
 			loadConfig();

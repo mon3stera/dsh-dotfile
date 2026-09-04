@@ -13,14 +13,18 @@ import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 
 export const name = "dsh-plugin-font";
 
-/** Durable font settings schema (empty family = system default). */
+/**
+ * Durable font settings schema. Empty family = system default. Absent or null
+ * size = follow the theme's own content font-size axis; the client omits the
+ * keys in that state, so stored configs simply lack them.
+ */
 export const FontSettingsSchema = z.object({
   family: z.string().max(200).default(""),
   codeFamily: z.string().max(200).default(""),
-  /** Base markdown font size in px (16 = default). */
-  fontSize: z.number().min(8).max(32).default(16),
-  /** Base code font size in px (14 = default). */
-  codeFontSize: z.number().min(8).max(32).default(14)
+  /** Desired markdown base size in px; null/absent follows the theme. */
+  fontSize: z.union([z.number().min(8).max(32), z.const(null)]).default(null),
+  /** Desired inline-code size in px; null/absent follows the theme. */
+  codeFontSize: z.union([z.number().min(8).max(32), z.const(null)]).default(null)
 });
 
 /** Absolute path of the plugin-owned font config file. */
