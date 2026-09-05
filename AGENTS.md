@@ -133,6 +133,7 @@ Important context behavior:
 
 - `lib/index.js`: `/font/config` route, validated font settings, `fc-list` discovery, and persistence under `$DSH_HOME/font/config.json`.
 - `lib/client.js`: browser settings row and font application.
+- Sizes drive the theme's own content-size axis (`--dsh-content-font-size` inline on body) in addition to the markdown overrides, so the user-message bubble (which sizes off that axis in the chat package) and the assistant content scale together. The theme presenter rewrites the axis on every theme apply, so a MutationObserver on the body style attribute re-asserts the explicit value; the follow state (no configured size) never touches the axis. The weight delta stays scoped to the markdown composites — the bubble inherits the body weight.
 - `package.json`: Web client injection and package exports.
 
 ### `dsh-plugin-hide-session-titles`

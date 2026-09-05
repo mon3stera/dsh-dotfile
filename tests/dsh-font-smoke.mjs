@@ -32,13 +32,20 @@ const docEl = {
     removeProperty(k) { delete styleProps[k]; }
   }
 };
+const styleGuards = [];
 const fakeBody = {
   dataset: {},
   style: {
     setProperty(k, v) { styleProps[k] = v; },
-    removeProperty(k) { delete styleProps[k]; }
+    removeProperty(k) { delete styleProps[k]; },
+    getPropertyValue(k) { return styleProps[k] ?? ""; }
   },
   appendChild() { }
+};
+globalThis.MutationObserver = class {
+  constructor(cb) { styleGuards.push(cb); }
+  observe() { }
+  disconnect() { }
 };
 const styleTags = [];
 globalThis.document = {
@@ -236,6 +243,7 @@ console.log("custom picker entry OK");
 
 // sizes (weight still 0): probe-resolved baselines; body and code scale independently
 props.setFontSize(15);
+if (styleProps["--dsh-content-font-size"] !== "15px") throw new Error("FAIL: content axis should follow the body size: " + styleProps["--dsh-content-font-size"]);
 if (styleProps["--dsw-font-markdown-base-font-size"] !== "15px") throw new Error("FAIL: base size: " + styleProps["--dsw-font-markdown-base-font-size"]);
 if (styleProps["--dsw-font-markdown-base-line-height"] !== "25.7px") throw new Error("FAIL: base lh: " + styleProps["--dsw-font-markdown-base-line-height"]);
 if (styleProps["--dsw-font-markdown-base"] !== "15px/25.7px -apple-system, BlinkMacSystemfont, 'Segoe UI', sans-serif") throw new Error("FAIL: base composite: " + styleProps["--dsw-font-markdown-base"]);
@@ -265,6 +273,10 @@ props.setFontWeight(0);
 if (styleProps["--dsw-font-markdown-base-font-size"] !== undefined) throw new Error("FAIL: zero delta with natural size should clear overrides");
 props.setFontSize(15);
 props.setCodeFontWeight(0);
+/* the explicit size keeps driving the axis even when the theme presenter rewrites it */
+styleProps["--dsh-content-font-size"] = "14px";
+styleGuards[0]();
+if (styleProps["--dsh-content-font-size"] !== "15px") throw new Error("FAIL: guard should re-assert the explicit size: " + styleProps["--dsh-content-font-size"]);
 if (styleProps["--dsw-font-markdown-code-block"] !== "14.7px/25.3px 'SF Mono', 'JetBrains Mono', Consolas") throw new Error("FAIL: zero code weight drops the prefix: " + styleProps["--dsw-font-markdown-code-block"]);
 if (styleProps["zoom"] !== undefined) throw new Error("FAIL: no zoom property should ever be set");
 await new Promise((r) => setTimeout(r, 500));

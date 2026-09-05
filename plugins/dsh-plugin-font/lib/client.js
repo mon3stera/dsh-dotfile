@@ -55,6 +55,9 @@ window.__ModuleLoader__.load({
 		const FONT_SIZE_MAX = 24;
 		/** Pre-derived-theme base, kept only to migrate legacy percentage configs. */
 		const LEGACY_BASE_FONT_SIZE = 16;
+		/** The theme's content-size axis: the user-message bubble and much of the
+		 * conversation chrome size off it (the native font-size setting writes it). */
+		const CONTENT_SIZE_VAR = "--dsh-content-font-size";
 		/** Stepper display fallbacks while the theme baselines have not been probed. */
 		const FALLBACK_BODY_SIZE = 14;
 		const FALLBACK_CODE_SIZE = 12;
@@ -135,7 +138,7 @@ window.__ModuleLoader__.load({
 			"font.weightNormal": "正常",
 			"font.preview": "字体预览 Aa 中文 123",
 			"font.previewCode": "代码预览 const x = 42",
-			"font.hint": "正文字体与代码字体可按优先级添加多个（排在前面的优先），字重在主题基础上整体偏移；字号未调整时跟随主题的系统字号，标题/表格按正文比例跟随，代码块/行内代码按代码比例跟随；仅影响文字（字体、字号、行高与字重），界面布局与图片不受影响"
+			"font.hint": "正文字体与代码字体可按优先级添加多个（排在前面的优先），字重在主题基础上整体偏移；正文字号同时作用于双方的消息气泡，标题/表格按正文比例跟随，代码块/行内代码按代码比例跟随；字号未调整时跟随主题的系统字号。仅影响文字（字体、字号、行高与字重），界面布局与图片不受影响"
 		};
 		const en = {
 			"font.title": "UI fonts",
@@ -152,7 +155,7 @@ window.__ModuleLoader__.load({
 			"font.weightNormal": "Normal",
 			"font.preview": "Preview Aa 中文 123",
 			"font.previewCode": "Code preview const x = 42",
-			"font.hint": "Body and code fonts accept several entries in priority order (earlier wins); weight shifts every token relative to the theme. Sizes follow the theme's font-size setting until adjusted: headings/tables follow the body ratio, code blocks/inline code follow the code ratio. Text only (family, size, line-height and weight) — layout and images are untouched"
+			"font.hint": "Body and code fonts accept several entries in priority order (earlier wins); weight shifts every token relative to the theme. The body size scales both message bubbles; headings/tables follow the body ratio, code blocks/inline code the code ratio. Sizes follow the theme font-size setting until adjusted. Text only (family, size, line-height and weight) — layout and images are untouched"
 		};
 
 		/** Mirror store for the settings row (the theme row pattern). */
@@ -464,6 +467,12 @@ window.__ModuleLoader__.load({
 				};
 				restack(BODY_FONT_VAR, originalStacks.body, state.families);
 				restack(CODE_FONT_VAR, originalStacks.code, state.codeFamilies);
+				/* the user-message bubble and the conversation chrome size off the
+				 * theme's own content-font-size axis (the native setting writes it
+				 * through the theme presenter) — drive the same axis so both sides
+				 * of the conversation scale together */
+				if (state.fontSize !== null) body.style.setProperty(CONTENT_SIZE_VAR, `${state.fontSize}px`);
+				else body.style.removeProperty(CONTENT_SIZE_VAR);
 				if (!ensureBaselines()) return;
 				const bodyFactor = factorFor(state.fontSize, markdownBaselines.base);
 				const codeFactor = factorFor(state.codeFontSize, markdownBaselines.code);
@@ -666,12 +675,28 @@ window.__ModuleLoader__.load({
 				document.documentElement.style.removeProperty(BODY_FONT_VAR);
 				document.documentElement.style.removeProperty(CODE_FONT_VAR);
 				const body = document.body;
+				body.style.removeProperty(CONTENT_SIZE_VAR);
 				for (const family of MARKDOWN_FONT_FAMILIES) {
 					body.style.removeProperty(markdownVar(family));
 					body.style.removeProperty(markdownVar(`${family}-font-size`));
 					body.style.removeProperty(markdownVar(`${family}-line-height`));
 				}
 			}, "dsh-plugin-font: teardown");
+			/* the theme presenter rewrites the content-size axis on every theme
+			 * apply; re-assert the explicit size whenever it gets clobbered */
+			if (typeof MutationObserver !== "undefined") {
+				const sizeGuard = new MutationObserver(() => {
+					if (state.fontSize === null) return;
+					const desired = `${state.fontSize}px`;
+					if (document.body.style.getPropertyValue(CONTENT_SIZE_VAR) !== desired) {
+						document.body.style.setProperty(CONTENT_SIZE_VAR, desired);
+					}
+				});
+				ctx.effect(() => {
+					sizeGuard.observe(document.body, { attributes: true, attributeFilter: ["style"] });
+					return () => sizeGuard.disconnect();
+				}, "dsh-plugin-font: content size guard");
+			}
 			loadConfig();
 			fetchCatalog();
 			ctx.slots.inject("settings.general.item", () => ctx.slots.register({
