@@ -8,9 +8,29 @@ window.__ModuleLoader__.load({
 
     const react = require("react");
     const { jsx, jsxs } = require("react/jsx-runtime");
-    const primitives = require("@deepseek-ai/dsh-client-ui-primitives");
     const NS = "dsh-plugin-outline";
     const inject = ["slots", "locale"];
+
+    /* Inline icons: the host primitives package was removed in 0.1.2 and its
+     * dangling inject resolved to an empty module whose undefined components
+     * killed this plugin's header entry at render time. */
+    const OutlineIcon = () => jsxs("svg", {
+      width: 16, height: 16, viewBox: "0 0 16 16", fill: "none",
+      stroke: "currentColor", "stroke-width": 1.5, "stroke-linecap": "round", "aria-hidden": true,
+      children: [
+        jsx("path", { d: "M5.2 4.4h8" }),
+        jsx("path", { d: "M5.2 8h8" }),
+        jsx("path", { d: "M5.2 11.6h4.6" }),
+        jsx("path", { d: "M2.6 4.4h.01" }),
+        jsx("path", { d: "M2.6 8h.01" }),
+        jsx("path", { d: "M2.6 11.6h.01" })
+      ]
+    });
+    const CloseIcon = () => jsxs("svg", {
+      width: 16, height: 16, viewBox: "0 0 16 16", fill: "none",
+      stroke: "currentColor", "stroke-width": 1.5, "stroke-linecap": "round", "aria-hidden": true,
+      children: [jsx("path", { d: "M4 4l8 8" }), jsx("path", { d: "M12 4l-8 8" })]
+    });
 
     const zh = {
       title: "会话目录",
@@ -142,7 +162,7 @@ window.__ModuleLoader__.load({
             "aria-expanded": open,
             title: t("toggle"),
             onClick: () => setOpen((value) => !value),
-            children: [jsx(primitives.IconListPenOutline16, { size: 16 }), open ? null : jsx("span", { children: t("title") })],
+            children: [jsx(OutlineIcon, {}), open ? null : jsx("span", { children: t("title") })],
           }),
           open && jsxs("aside", {
             className: "dsh-outline-panel",
@@ -160,7 +180,7 @@ window.__ModuleLoader__.load({
                     "aria-label": t("close"),
                     title: t("close"),
                     onClick: () => setOpen(false),
-                    children: jsx(primitives.IconCloseOutline16, { size: 16 }),
+                    children: jsx(CloseIcon, {}),
                   }),
                 ],
               }),

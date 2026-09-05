@@ -145,7 +145,7 @@ Important context behavior:
 
 - `lib/index.js`: no-op Node entry; the browser half does the work.
 - `lib/client.js`: right-side outline panel for jumping between user messages in long sessions.
-- `package.json`: Web conversation/primitives client injection and package exports.
+- `package.json`: Web locale/conversation client injection and package exports. The 0.1.2 primitives removal is why the trigger and close icons are inline SVGs: the removed package resolved to an empty module whose undefined components killed the header entry at render time.
 
 ### `dsh-plugin-diff-viewer`
 

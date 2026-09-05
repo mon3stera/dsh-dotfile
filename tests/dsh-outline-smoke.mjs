@@ -40,17 +40,14 @@ const react = {
 	useRef(value) { return { current: value }; },
 	useEffect() {},
 };
-const icon = (props) => ({ type: "icon", props });
 const client = capturedEntry?.factory((spec) => {
 	if (spec === "react") return react;
 	if (spec === "react/jsx-runtime") return {
 		jsx: (type, props, key) => ({ type, props, key }),
 		jsxs: (type, props, key) => ({ type, props, key }),
 	};
-	if (spec === "@deepseek-ai/dsh-client-ui-primitives") return {
-		IconListPenOutline16: icon,
-		IconCloseOutline16: icon,
-	};
+	/* the 0.1.2 primitives removal means requiring that package here is a
+	 * failure: the client must not reference it at all */
 	throw new Error(`unexpected require: ${spec}`);
 });
 if (!client || client.name !== "dsh-plugin-outline") throw new Error(`outline client failed to load: captured=${Boolean(capturedEntry)} id=${capturedEntry?.id} keys=${client ? Object.keys(client).join(",") : "none"}`);
