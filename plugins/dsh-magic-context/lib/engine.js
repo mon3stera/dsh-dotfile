@@ -40,6 +40,7 @@ import { mergeContextConfig, setSessionFilterSeed } from "./settings.js";
 import { clearContextUsage, setContextUsage } from "./usage.js";
 import { describeAuxFailure } from "./aux-llm.js";
 import { sessionMemoryScope } from "./scope.js";
+import { sessionEventAt, sessionEvents } from "./session-compat.js";
 import { installContextCommands } from "./commands.js";
 
 const DEFAULT_GENERATE_THRESHOLD = 0.65;
@@ -400,7 +401,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			const session = agent.session;
 			if (wrapped.has(session)) return;
 			wrapped.add(session);
-			for (const event of session.events) assignParagraph(session, event);
+			for (const event of sessionEvents(session)) assignParagraph(session, event);
 			// Resumed sessions are re-selected too: the block is a persistent
 			// prefix, so a resumed conversation must not run without memories.
 			this.refreshInjection(session);
@@ -468,7 +469,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		let compartmentCount = 0;
 		let compartmentTokens = 0;
 		for (const [index, seq] of session.surface.nodes.entries()) {
-			const event = session.events[seq];
+			const event = sessionEventAt(session, seq);
 			if (event?.type !== "user/message" || event.data?.source === undefined || !isCompactCheckpointSource(event.data.source)) continue;
 			compartmentCount += 1;
 			compartmentTokens += tokensBySeq.get(seq) ?? measurement.nodes?.[index]?.tokens ?? 0;
@@ -825,7 +826,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		const nodes = session.surface.nodes;
 		let seq = 0;
 		for (const node of nodes) {
-			const event = session.events[node];
+			const event = sessionEventAt(session, node);
 			if (event?.type !== "user/message" || event.data?.source === undefined || !isCompactCheckpointSource(event.data.source)) break;
 			seq = node;
 			if (this.cdb.compartmentByLandingSeq(session.id, seq) !== undefined) continue;
@@ -908,7 +909,7 @@ export class ContextEngine extends BasicCompactionEngine {
 				this.cdb.markCompartmentRemoved(compartment.id);
 				continue;
 			}
-			const event = session.events[seq];
+			const event = sessionEventAt(session, seq);
 			const tokenCount = event?.data?.content === undefined ? 0 : estimateTokens(JSON.stringify(event.data.content));
 			session.append("compaction/prune", {
 				shadowedRange: { start: seq, end: seq },

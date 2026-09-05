@@ -1,4 +1,5 @@
 // Bounded, read-only projections of original session records for Dreamer.
+import { sessionEvents } from "./session-compat.js";
 // The source session remains the durable authority; this module only formats a
 // capped slice for an auxiliary model call.
 
@@ -11,8 +12,8 @@ function integerOr(value, fallback) {
 
 /** Capture the current turn as provenance for a direct ctx_memory write. */
 export function currentSessionSource(session) {
-	const events = session?.events;
-	if (!Array.isArray(events) || typeof session?.id !== "string" || session.id.length === 0) return {};
+	const events = sessionEvents(session);
+	if (events.length === 0 || typeof session?.id !== "string" || session.id.length === 0) return {};
 	const last = events.at(-1);
 	const endSeq = last?.seq;
 	if (!Number.isSafeInteger(endSeq)) return { sourceSessionId: session.id };
@@ -45,8 +46,8 @@ function projectEvent(session, event) {
 
 /** Return a capped, model-readable event slice from one live session. */
 export function readSessionContext(session, { startSeq, endSeq, maxEvents = DEFAULT_SESSION_CONTEXT_MAX_EVENTS, maxChars = DEFAULT_SESSION_CONTEXT_MAX_CHARS } = {}) {
-	const events = session?.events;
-	if (!Array.isArray(events)) throw new Error("session has no readable event log");
+	const events = sessionEvents(session);
+	if (events.length === 0) throw new Error("session has no readable event log");
 	const lastSeq = events.at(-1)?.seq ?? -1;
 	const first = integerOr(startSeq, 0);
 	const last = integerOr(endSeq, lastSeq);

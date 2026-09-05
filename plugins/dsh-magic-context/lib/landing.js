@@ -7,6 +7,7 @@
 // priced — new content appended after generation does not invalidate the
 // landing. This is what lets the summary run asynchronously at 65% and land at
 // 80% without a whole-surface freeze.
+import { sessionEvents } from "./session-compat.js";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -122,7 +123,7 @@ export async function landCompartment(deps, compartment, opts) {
 	} catch (error) {
 		throw new SurfaceChangedError("landing: the stored span is no longer a valid replacement target", { cause: error });
 	}
-	const entryState = inspectEntryState(session.events);
+	const entryState = inspectEntryState(sessionEvents(session));
 	assertInactive(entryState.unmatchedCompactionStart, entryState.latestEndSeedSeq);
 	let ownerTurn;
 	if (owner === null) {

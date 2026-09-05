@@ -6,6 +6,7 @@
 // fallback keeps detached range tests and older sessions usable when a number
 // has not been assigned yet. The landing later replaces exactly this span.
 import { isCompactCheckpointSource, toolPairingBalancedAfter, toolPairingBalancedBefore } from "@deepseek-ai/dsh-compaction";
+import { sessionEventAt } from "./session-compat.js";
 
 const SKIPPED_TOOL_NAMES = new Set(["ctx_reduce", "ctx_expand"]);
 
@@ -14,7 +15,7 @@ function isSkippedToolResult(session, event) {
 	const callId = event.data?.message?.source?.callId ?? event.data?.callId;
 	if (callId === undefined) return false;
 	for (let index = event.seq - 1; index >= 0; index -= 1) {
-		const earlier = session.events[index];
+		const earlier = sessionEventAt(session, index);
 		if (earlier?.type === "tool/call" && earlier.data?.callId === callId) return SKIPPED_TOOL_NAMES.has(earlier.data.name);
 	}
 	return false;
@@ -22,13 +23,13 @@ function isSkippedToolResult(session, event) {
 
 /** True when one surface event is a compaction checkpoint node (any engine). */
 function isCheckpointNode(session, seq) {
-	const event = session.events[seq];
+	const event = sessionEventAt(session, seq);
 	return event?.type === "user/message" && event.data?.source !== undefined && isCompactCheckpointSource(event.data.source);
 }
 
 /** Count one model-visible paragraph when no durable DB number is available. */
 function fallbackParagraph(session, seq) {
-	const event = session.events[seq];
+	const event = sessionEventAt(session, seq);
 	if (event?.type === "user/message") return event.data?.content?.length > 0 ? 1 : undefined;
 	if (event?.type === "assistant/message") {
 		const content = event.data?.message?.content;

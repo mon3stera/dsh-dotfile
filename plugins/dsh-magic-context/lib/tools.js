@@ -1,5 +1,6 @@
 // Conversation paragraph tools: ctx_reduce marks paragraphs as skippable and
 // ctx_expand retrieves original paragraph content from the session log.
+import { sessionEventAt } from "./session-compat.js";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
 const RANGE_RE = /^\d+(-\d+)?$/;
@@ -80,7 +81,7 @@ export function createExpandTool(cdb) {
 			const session = exec.agent?.session;
 			if (session === undefined) return { found: false, paragraph, content: "No active session." };
 			const seq = cdb.seqForParagraph(session.id, paragraph);
-			const event = seq === undefined ? undefined : session.events?.[seq];
+			const event = seq === undefined ? undefined : sessionEventAt(session, seq);
 			const message = event === undefined || typeof session.deriveEventMessage !== "function"
 				? undefined
 				: session.deriveEventMessage(event);

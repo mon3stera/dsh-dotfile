@@ -11,6 +11,7 @@
 // never sees these calls, so provider failures are retried here through
 // `streamAux`; and because the whole range is re-sent on every attempt, a pure
 // escaping mistake is repaired locally before spending another model call.
+import { sessionEventAt } from "./session-compat.js";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { isCompactCheckpointSource } from "@deepseek-ai/dsh-compaction";
 import { buildOrganizerRepairInstruction, sanitizeOrganizerOutput, validateOrganizerOutput } from "./organizer-xml.js";
@@ -283,7 +284,7 @@ function toolResultId(message) {
  */
 function projectToolSafeMessages(session, range, skipSeqs) {
 	const entries = range.shadowedSeqs.map((seq) => {
-		const event = session.events[seq];
+		const event = sessionEventAt(session, seq);
 		// Never re-summarize a prior checkpoint (chain design).
 		const checkpoint = event?.type === "user/message"
 			&& event.data?.source !== undefined

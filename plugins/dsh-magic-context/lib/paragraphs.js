@@ -9,6 +9,7 @@
 // main request. Auxiliary LLM calls (summarization, titles) never call
 // `deriveMessages`, so they neither consume nor show numbers. `ctx_reduce` and
 // `ctx_expand` tool calls themselves are excluded from numbering (design §3.2).
+import { sessionEventAt, sessionEventCount } from "./session-compat.js";
 import { isSurfaceEvent } from "@deepseek-ai/dsh-session/surface";
 
 /** Tool names whose own call/result nodes are excluded from numbering. */
@@ -101,7 +102,7 @@ export function installParagraphInjector(session, cdb, opts = {}) {
 			cacheGen = gen;
 		}
 		for (const seq of nodes.slice(cacheNodes)) {
-			const msg = session.deriveEventMessage(session.events[seq]);
+			const msg = session.deriveEventMessage(sessionEventAt(session, seq));
 			if (!msg) continue;
 			const no = cdb.paragraphFor(session.id, seq);
 			if (no === undefined) {
@@ -145,8 +146,8 @@ export function createParagraphAssigner(cdb, { skipToolNames = SKIP_TOOL_NAMES }
 	const findCallName = (session, callId) => {
 		const remembered = callNames.get(session)?.get(callId);
 		if (remembered !== undefined) return remembered;
-		for (let index = session.events.length - 1; index >= 0; index -= 1) {
-			const event = session.events[index];
+		for (let index = sessionEventCount(session) - 1; index >= 0; index -= 1) {
+			const event = sessionEventAt(session, index);
 			if (event.type === "tool/call" && event.data.callId === callId) {
 				rememberCall(session, callId, event.data.name);
 				return event.data.name;
