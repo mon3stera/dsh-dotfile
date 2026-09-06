@@ -42,8 +42,12 @@ service only exposed it.
 
 Streaming-chunk runs are stored as packed `text-chunks` / `reasoning-chunks` /
 `tool-call-chunks` rows carrying `seq0` (expanding to `data.texts.length` /
-`data.args.length` events); repairs shift `seq`, `seq0`, and the
-`sourceEventSeqs` provenance references inside the log. History loss is
+`data.args.length` events); repairs shift `seq`, `seq0`, and every stored
+reference into the event numbering: the `sourceEventSeqs` provenance list and
+the replacement range of a landed `surfaceOp` marker (`{op: "replace", start,
+end}`, written by checkpoint landing). A marker whose range stops tracking the
+surface makes restore fail with "surface replace: end seq ... not found in
+surface" even though the contiguity scan passes. History loss is
 limited to the three synthetic events; the real tool result (with its actual
 content) survives.
 

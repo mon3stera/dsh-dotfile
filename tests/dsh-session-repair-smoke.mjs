@@ -29,7 +29,7 @@ const DSH_LIB = "/home/mon3tr/.local/lib/node_modules/@deepseek-ai/dsh/node_modu
 
 const repoRepair = await import(`${PLUGIN_DIR}/lib/repair.js`);
 const host = await import(`${INSTALLED_PLUGIN_DIR}/lib/index.js`);
-const { decodeStorageRecord } = await import(`${DSH_LIB}/dsh-session/lib/index.js`);
+const { decodeStorageRecord, foldSurface, decodeSeqRanges } = await import(`${DSH_LIB}/dsh-session/lib/index.js`);
 
 let failures = 0;
 function check(label, condition) {
@@ -136,6 +136,40 @@ function caseBShiftLines() {
   return lines;
 }
 
+/**
+ * Build Case C: Case A plus two checkpoint-landing replacement markers in the
+ * late tail. The first replaces the opening surface range; the second replaces
+ * the first marker itself. Both carry `surfaceOp` start/end refs into the
+ * renumbered region, so the repair must shift them together with the seqs -
+ * otherwise restore fails with "surface replace: end seq not found in surface"
+ * even though the contiguity scan passes (observed on a real log, 2026-09-06).
+ */
+function caseCMarkerLines() {
+  // Surface rows must carry the append marker the real writer always stores.
+  const lines = caseABatchLines().map((line) => {
+    const obj = JSON.parse(line);
+    if ((obj.type === "user/message" || obj.type === "assistant/message" || obj.type === "tool/result") && obj.surfaceOp === undefined) {
+      obj.surfaceOp = "append";
+    }
+    return JSON.stringify(obj);
+  });
+  // Landing marker 1: replaces surface seqs 0..3 (stored refs are pre-repair).
+  lines.push(JSON.stringify({
+    type: "user/message", seq: 12, time: 1120,
+    data: { content: [{ type: "text", text: "[checkpoint]" }], role: "user", id: "cp1" },
+    surfaceOp: { op: "replace", start: 0, end: 3 },
+    sourceEventSeqs: [0, 3]
+  }));
+  // Landing marker 2: replaces marker 1 by its pre-repair seq.
+  lines.push(JSON.stringify({
+    type: "user/message", seq: 13, time: 1130,
+    data: { content: [{ type: "text", text: "[checkpoint 2]" }], role: "user", id: "cp2" },
+    surfaceOp: { op: "replace", start: 12, end: 12 },
+    sourceEventSeqs: [12]
+  }));
+  return lines;
+}
+
 // ---------- core repair: Case A (delete-batch then shift-tail) ----------
 console.log("case A: synthetic interrupt batch");
 {
@@ -179,6 +213,47 @@ console.log("case B: late prompt splice without synthetic batch");
 
   const real = scanWithRealDecoder(repoRepair.serializeLog(parsed));
   check("real DSH decoder accepts the repaired log", real.ok && real.events === 7);
+}
+
+// ---------- core repair: Case C (replace markers ride the renumber) ----------
+console.log("case C: landing replace markers in the shifted tail");
+{
+  const parsed = repoRepair.parseLog(caseCMarkerLines().join("\n") + "\n");
+  const before = repoRepair.scanRows(parsed.rows);
+  check("scan detects the gap", !before.ok && before.gap.expected === 11 && before.gap.got === 5);
+
+  const repaired = repoRepair.repairRows(parsed);
+  check("repair converges in two passes", repaired.ok && repaired.passes.length === 2 && repaired.passes[1].mode === "shift-tail");
+
+  const objs = parsed.rows.map((r) => r.obj);
+  const marker1 = objs.find((o) => o.data?.id === "cp1");
+  const marker2 = objs.find((o) => o.data?.id === "cp2");
+  check("marker 1 renumbered to 15", marker1?.seq === 15);
+  check("marker 1 range tracks the shifted surface", marker1.surfaceOp.start === 0 && marker1.surfaceOp.end === 3);
+  check("marker 1 provenance still cites unmoved seqs", JSON.stringify(marker1.sourceEventSeqs) === "[0,3]");
+  check("marker 2 renumbered to 16", marker2?.seq === 16);
+  check("marker 2 range rides the marker 1 renumber", marker2.surfaceOp.start === 15 && marker2.surfaceOp.end === 15);
+  check("marker 2 provenance rides the marker 1 renumber", JSON.stringify(marker2.sourceEventSeqs) === "[15]");
+
+  const real = scanWithRealDecoder(repoRepair.serializeLog(parsed));
+  check("real DSH decoder accepts the repaired log", real.ok && real.events === 17);
+
+  // Fold the repaired events exactly as the restore path does: chunk rows
+  // expand to assistant/chunk events, stored provenance ranges decode first.
+  const events = [];
+  for (const obj of objs) {
+    const span = repoRepair.rowSpan(obj);
+    if (span && !(span.len === 1 && typeof obj.seq === "number")) {
+      for (let k = 0; k < span.len; k++) {
+        events.push({ type: "assistant/chunk", seq: span.start + k, time: obj.time0 ?? 0, data: { turn: 0, step: 0, chunk: { index: 0, type: "text-delta", text: "" } } });
+      }
+      continue;
+    }
+    events.push(Array.isArray(obj.sourceEventSeqs) ? { ...obj, sourceEventSeqs: decodeSeqRanges(obj.sourceEventSeqs) } : obj);
+  }
+  let foldError = null;
+  try { foldSurface(events); } catch (error) { foldError = error.message; }
+  check("restore surface fold accepts the repaired log", foldError === null);
 }
 
 // ---------- project key encoding matches the deployed layout ----------

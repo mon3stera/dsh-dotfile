@@ -14,8 +14,12 @@
  * `reasoning-chunks` / `tool-call-chunks` rows that carry `seq0` and expand to
  * `data.texts.length` / `data.args.length` events. Every other row carries one
  * explicit `seq` and occupies exactly one event slot. Repairs must therefore
- * shift both `seq` and `seq0`, plus the provenance references in
- * `sourceEventSeqs`.
+ * shift both `seq` and `seq0`, plus every stored reference into the event
+ * numbering: the provenance list in `sourceEventSeqs` and the replacement
+ * range in a landed `surfaceOp` (`{op: "replace", start, end}`, written by
+ * checkpoint landing). A marker whose range stops tracking the surface makes
+ * restore fail with "surface replace: end seq ... not found in surface" even
+ * though the contiguity scan passes.
  *
  * Fixed repair pattern (history loss is acceptable by design):
  *
@@ -110,6 +114,11 @@ function shiftRow(obj, threshold, delta) {
     if (typeof obj.seq0 === "number" && obj.seq0 >= threshold) obj.seq0 += delta;
     if (Array.isArray(obj.sourceEventSeqs)) {
       obj.sourceEventSeqs = obj.sourceEventSeqs.map((seq) => (seq >= threshold ? seq + delta : seq));
+    }
+    if (obj.surfaceOp !== null && typeof obj.surfaceOp === "object" && !Array.isArray(obj.surfaceOp)) {
+      const op = obj.surfaceOp;
+      if (typeof op.start === "number" && op.start >= threshold) op.start += delta;
+      if (typeof op.end === "number" && op.end >= threshold) op.end += delta;
     }
   }
 }
