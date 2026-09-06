@@ -30,6 +30,11 @@
 //   * The served viewport meta carries no `interactive-widget` key. Android
 //     Chrome's default `resizes-visual` overlays the virtual keyboard on the
 //     layout viewport, which hides a bottom-anchored composer while typing.
+//   * The collapsed sidebar survives as a 56px rail that a phone never has
+//     room for (`computeColumns` keeps `sidebar: 56` for a closed preference).
+//     On a phone the rail is hidden entirely - the same track collapse the
+//     drawer uses, keyed on the opposite attribute - and a floating button
+//     opens it as the drawer instead.
 //
 // Three further phone defects were expected here and measured away instead,
 // which is why no rule addresses them. Reading a bundle is not evidence:
@@ -61,7 +66,7 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
-		const { jsx } = require("react/jsx-runtime");
+		const { jsx, jsxs } = require("react/jsx-runtime");
 
 		const NS = "dsh-plugin-mobile";
 		const inject = ["slots", "locale", "layout"];
@@ -96,8 +101,26 @@ window.__ModuleLoader__.load({
 		// cannot drive the overlay on a phone.
 		const DETAILS_OPEN = `[data-dsh-plugin-mobile-details="open"]`;
 
-		const zh = { dismiss: "关闭导航" };
-		const en = { dismiss: "Close navigation" };
+		const zh = { dismiss: "关闭导航", open: "打开导航", addImages: "添加图片" };
+		const en = { dismiss: "Close navigation", open: "Open navigation", addImages: "Add images" };
+
+		// Inline photo icon: rounded frame, sun, mountain ridge.
+		const IMAGE_ICON = jsxs("svg", {
+			viewBox: "0 0 24 24",
+			width: 18,
+			height: 18,
+			fill: "none",
+			stroke: "currentColor",
+			strokeWidth: 1.8,
+			strokeLinecap: "round",
+			strokeLinejoin: "round",
+			"aria-hidden": true,
+			children: [
+				jsx("rect", { x: 3, y: 3, width: 18, height: 18, rx: 3 }),
+				jsx("circle", { cx: 8.5, cy: 8.5, r: 1.5 }),
+				jsx("path", { d: "m21 15-4.5-4.5L6 21" }),
+			],
+		});
 
 		const CSS = [
 			`@media (max-width:${PHONE_MAX}px){`,
@@ -143,6 +166,43 @@ window.__ModuleLoader__.load({
 				+ `transition:opacity var(--ds-transition-duration-slow,.2s) ease}`,
 			`${FRAME}:not([data-sidebar-collapsed]) .${NS}-scrim{opacity:1;pointer-events:auto}`,
 
+			// 3b. Hide the collapsed rail entirely. `computeColumns` answers a
+			// closed sidebar preference with a 56px rail track on every width,
+			// which a phone has no room for. The same track collapse the drawer
+			// uses, keyed on the opposite attribute: the track drops to zero and
+			// the rail's own `min-width:0;overflow:hidden` clips its content away,
+			// so no per-build class or inline width is fought here. The column
+			// stays in grid flow for the same measured reason as above.
+			// `visibility:hidden` additionally removes the rail's border line and
+			// its buttons from hit-testing and the tab order; the FAB below is
+			// the opening path.
+			`${FRAME}[data-sidebar-collapsed]{grid-template-columns:0 minmax(0,1fr) 0!important}`,
+			`${FRAME}[data-sidebar-collapsed]>:first-child{visibility:hidden}`,
+
+			// 3c. The floating button that opens the drawer. Rendered in the same
+			// overlay layer as the scrim, shown only on a phone while the sidebar
+			// is collapsed. The base rule lives outside both media blocks so the
+			// button is inert on every wide viewport, and the phone block only
+			// un-hides it under the collapsed attribute - which is absent while
+			// the drawer is open, exactly when the scrim takes over dismissal.
+			//
+			// The bottom edge is anchored to the composer's live top edge, not a
+			// constant: the composer card grows with its content and the system
+			// font scale, so fixed offsets measured correct on one device and
+			// embedded the button in the input box on another (96px and 148px
+			// each failed on a real phone). trackFabAnchor() publishes the
+			// frame-to-composer-seat distance as a custom property; 148px is
+			// only the fallback for engines without a ResizeObserver.
+			`.${NS}-fab{position:absolute;right:16px;`
+				+ `bottom:var(--dsh-plugin-mobile-fab-bottom,148px);`
+				+ `width:44px;height:44px;display:none;align-items:center;justify-content:center;`
+				+ `padding:0;border:.5px solid var(--dsw-alias-border-l3,rgb(128 128 128/.4));`
+				+ `border-radius:50%;background:var(--dsw-alias-bg-layer-1,#202024);`
+				+ `color:var(--dsw-alias-label-primary,#fff);`
+				+ `box-shadow:0 6px 20px rgb(0 0 0/.4);pointer-events:auto;cursor:pointer;`
+				+ `z-index:1;-webkit-tap-highlight-color:transparent}`,
+			`${FRAME}[data-sidebar-collapsed] .${NS}-fab{display:flex}`,
+
 			// 4. Wide markdown tables scroll within themselves. The transcript
 			// scrollport clips at `overflow:hidden`, so without this a table wider
 			// than the column loses its right-hand columns for good. `display:
@@ -173,6 +233,50 @@ window.__ModuleLoader__.load({
 				+ `flex-direction:row;overflow-x:auto}`,
 			`[data-slot="sidebar.settings"] [role="dialog"]>nav+div{min-height:0}`,
 
+			// 5b. Hide the header's utility band. Session log download, the
+			// outline trigger, and the diff-viewer trigger all register into the
+			// declared `conversation.session.header.utilities` list slot, and at
+			// phone width they crowd the title row until the preset label, the
+			// session-id chip, and the buttons overlap (measured on a real
+			// session at 390px). A phone starts tasks and reads answers; all
+			// three utilities are inspectable on a desktop, so the whole band is
+			// hidden through the renderer's stable `data-slot` outlet attribute
+			// - the same hook the settings rule above keys on. The outlets carry
+			// `display:contents` as an INLINE style, so only `!important`
+			// outranks it.
+			`[data-slot="conversation.session.header.utilities"]{display:none!important}`,
+
+			// 6. Compact the model trigger. The host button renders the full			// "GLM-5.3-Flash High" label inline; with the command, permission,
+			// context-meter, and send controls the tool row totals ~358px at
+			// 390px, so a 360px device (or any system font scaling) wraps the
+			// model, context meter, and send onto a second row. The label and
+			// effort spans are addressed structurally (button > span) inside
+			// the declared model outlet and replaced by a fixed short label;
+			// the button's own aria-label still names the current model and
+			// level for assistive tech. Tapping still opens the host's own
+			// floating picker menu (role=menu, ~248px wide, fits a phone) -
+			// model plus reasoning level in one surface, which is exactly the
+			// floating-panel flow, so no second picker is built here. The picker
+			// menu renders INSIDE the outlet, so the rule must not match its
+			// items: the trigger is the only button carrying `aria-haspopup`,
+			// which is the precise hook.
+			`[data-slot="conversation.input.model"] button[aria-haspopup="menu"] span{display:none}`,
+			`[data-slot="conversation.input.model"] button[aria-haspopup="menu"]::before{content:"模型"}`,
+
+			// 7. The phone image button. The host admits draft images through
+			// paste and document drop on desktop, neither of which exists as a
+			// gesture on a phone; this button opens the platform file picker
+			// and routes the files into the stock intake (see
+			// intakeImageFiles). The phone rule outranks the inert base with an
+			// element selector (`button.` = 0,1,1 over 0,1,0): the base sits at
+			// the stylesheet tail, so a same-specificity rule here would lose
+			// to it - unlike the FAB, whose show rule carries attribute
+			// selectors. 28px matches the tool row's other icon controls.
+			`button.${NS}-image{display:inline-flex;align-items:center;justify-content:center;`
+				+ `width:28px;height:28px;padding:0;border:none;background:none;`
+				+ `color:var(--dsw-alias-label-secondary,#999);cursor:pointer;`
+				+ `-webkit-tap-highlight-color:transparent}`,
+
 			`}`,
 
 			// 6. Details overlay below the host's inline-layout bound. When the
@@ -186,6 +290,14 @@ window.__ModuleLoader__.load({
 				+ `position:absolute;top:0;bottom:0;right:0;width:min(360px,100vw);`
 				+ `z-index:25;box-shadow:-12px 0 40px rgb(0 0 0/.45)}`,
 			`}`,
+
+			// 7. The FAB's inert base, outside every media block: on a wide
+			// viewport the button must not render at all, so `display:none` is
+			// its only out-of-phone rule and the phone block owns the un-hide.
+			`.${NS}-fab{display:none}`,
+
+			// 8. The image button's inert base, same reasoning as the FAB.
+			`.${NS}-image{display:none}`,
 		].join("\n");
 
 		/**
@@ -205,6 +317,97 @@ window.__ModuleLoader__.load({
 				tabIndex: -1,
 				"aria-label": t("dismiss"),
 				onClick: dismiss,
+			});
+		}
+
+		/**
+		 * The floating button that opens the drawer on a phone.
+		 *
+		 * Unlike the scrim this is a real control, so it stays in the tab
+		 * order and carries its own label. Visibility is pure CSS: hidden
+		 * everywhere, un-hidden on a phone only while `data-sidebar-collapsed`
+		 * is present - i.e. exactly while the drawer is closed.
+		 *
+		 * @param props - composed slot props.
+		 * @returns the FAB element.
+		 */
+		function MobileFab({ open, t }) {
+			return jsx("button", {
+				type: "button",
+				className: `${NS}-fab`,
+				"aria-label": t("open"),
+				onClick: open,
+				children: jsx("svg", {
+					viewBox: "0 0 24 24",
+					width: 22,
+					height: 22,
+					fill: "none",
+					stroke: "currentColor",
+					strokeWidth: 2,
+					strokeLinecap: "round",
+					"aria-hidden": true,
+					children: jsx("path", { d: "M4 6h16M4 12h16M4 18h16" }),
+				}),
+			});
+		}
+
+		/**
+		 * Hand files to the stock draft-image intake.
+		 *
+		 * The attachment presentation owns the only file-admission path: it
+		 * listens for document-level `drop` events carrying Files and forwards
+		 * them to the composer's validation (`onAddImages`), so limits, the
+		 * draft rail, and removal all stay the host's. A synthetic drop
+		 * dispatched on `document` therefore rides the exact desktop path - a
+		 * real drop needs no trust flag, and every guard (busy phase, size,
+		 * dimensions, per-message count) applies unchanged.
+		 *
+		 * @param files - picked image files.
+		 */
+		function intakeImageFiles(files) {
+			if (files.length === 0 || typeof DataTransfer === "undefined" || typeof DragEvent === "undefined") return;
+			const transfer = new DataTransfer();
+			for (const file of files) transfer.items.add(file);
+			document.dispatchEvent(new DragEvent("drop", {
+				dataTransfer: transfer,
+				bubbles: true,
+				cancelable: true,
+			}));
+		}
+
+		/**
+		 * The phone image button.
+		 *
+		 * The host admits images through paste and document drop on desktop -
+		 * neither gesture exists on a phone, so images were unreachable there.
+		 * This opens a file picker and routes the result through
+		 * {@link intakeImageFiles}. Hidden everywhere by CSS; the phone block
+		 * is the only scope that shows it.
+		 *
+		 * @param props - composed slot props.
+		 * @returns the picker button element.
+		 */
+		function MobileImagePicker({ t }) {
+			return jsx("button", {
+				type: "button",
+				className: `${NS}-image`,
+				"aria-label": t("addImages"),
+				onClick: () => {
+					const input = document.createElement("input");
+					input.type = "file";
+					input.accept = "image/*";
+					input.multiple = true;
+					input.style.display = "none";
+					const gone = () => input.remove();
+					input.addEventListener("change", () => {
+						gone();
+						intakeImageFiles([...(input.files ?? [])]);
+					});
+					input.addEventListener("cancel", gone);
+					document.body.appendChild(input);
+					input.click();
+				},
+				children: IMAGE_ICON,
 			});
 		}
 
@@ -266,14 +469,85 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * Publish the FAB's bottom offset as a custom property on <html>.
+		 *
+		 * The composer is not a sibling below the transcript: it renders inside
+		 * the scroll container as the sticky `[data-composer-seat]` (measured:
+		 * the scrollport's own bottom equals the frame bottom, so the
+		 * scrollport is useless as an anchor). The seat's TOP edge is the
+		 * composer's live top, whatever height the card currently is, and the
+		 * attribute is a declared host hook. The offset is that edge minus a
+		 * 12px gap, measured from the frame bottom (the overlay outlet is
+		 * `inset:0`, so its bottom is the frame's).
+		 *
+		 * Re-measured by a ResizeObserver on the seat (composer growth),
+		 * window resizes, capture-phase scroll (sticky transitions, session
+		 * switches, streaming), and a bounded rAF retry while the app is still
+		 * mounting - the first frames see neither the frame nor the seat.
+		 *
+		 * @returns a disposer uninstalling the observers and the property.
+		 */
+		function trackFabAnchor() {
+			const VAR = "--dsh-plugin-mobile-fab-bottom";
+			if (typeof ResizeObserver === "undefined" || typeof requestAnimationFrame === "undefined") {
+				return () => {};
+			}
+
+			const GAP = 12;
+			const SEAT = "[data-composer-seat]";
+			const MAX_MOUNT_TICKS = 600;
+			let observedSeat = null;
+			let wired = false;
+			let ticks = 0;
+
+			const sync = () => {
+				const frame = document.querySelector(FRAME);
+				const seat = document.querySelector(SEAT);
+				if (!frame || !seat) return;
+				if (seat !== observedSeat) {
+					if (observedSeat) observer.unobserve(observedSeat);
+					observer.observe(seat);
+					observedSeat = seat;
+				}
+				const bottom = frame.getBoundingClientRect().bottom
+					- seat.getBoundingClientRect().top + GAP;
+				document.documentElement.style.setProperty(VAR, `${Math.max(0, Math.round(bottom))}px`);
+				wired = true;
+			};
+
+			const observer = new ResizeObserver(sync);
+
+			const tick = () => {
+				ticks += 1;
+				sync();
+				if (!wired && ticks < MAX_MOUNT_TICKS) requestAnimationFrame(tick);
+			};
+
+			tick();
+			window.addEventListener("resize", sync);
+			// Passive and capture: never blocks a scroll, and sees the
+			// transcript's own scroller wherever it is in the tree.
+			document.addEventListener("scroll", sync, { passive: true, capture: true });
+
+			return () => {
+				wired = true;
+				observer.disconnect();
+				window.removeEventListener("resize", sync);
+				document.removeEventListener("scroll", sync, { capture: true });
+				document.documentElement.style.removeProperty(VAR);
+			};
+		}
+
+		/**
 		 * Install the phone stylesheet, the keyboard viewport fix, the details
-		 * tracking, and the drawer scrim.
+		 * tracking, the drawer scrim and FAB, and the FAB's composer anchor.
 		 *
 		 * @param ctx - client plugin context.
 		 */
 		function apply(ctx) {
 			applyKeyboardViewport();
 			trackDetails(ctx);
+			ctx.effect(trackFabAnchor, `${NS}: fab anchor`);
 
 			const style = document.createElement("style");
 			style.dataset.plugin = NS;
@@ -284,9 +558,10 @@ window.__ModuleLoader__.load({
 			ctx.effect(() => ctx.locale.register(NS, { zh, en }), `${NS}: locale`);
 
 			// `toggleSidebar` throws while the root entry has not attached its
-			// store actions. A scrim tap must never surface as an unhandled error,
-			// and the drawer is still closable from its own toggle.
-			const dismiss = () => {
+			// store actions. Neither overlay tap - scrim or FAB - must surface
+			// that as an unhandled error, and the drawer stays closable from
+			// its own toggle either way.
+			const toggleDrawer = () => {
 				try {
 					ctx.layout.toggleSidebar();
 				} catch (_panelsNotWired) {
@@ -294,12 +569,30 @@ window.__ModuleLoader__.load({
 				}
 			};
 
-			ctx.slots.inject("shell.overlay", () => ctx.slots.register({
-				name: "shell.overlay",
-				id: "mobile-scrim",
+			ctx.slots.inject("shell.overlay", () => {
+				ctx.slots.register({
+					name: "shell.overlay",
+					id: "mobile-scrim",
+					locale: NS,
+					inject: () => ({ dismiss: toggleDrawer }),
+				}, MobileScrim);
+
+				ctx.slots.register({
+					name: "shell.overlay",
+					id: "mobile-fab",
+					locale: NS,
+					inject: () => ({ open: toggleDrawer }),
+				}, MobileFab);
+			});
+
+			// The composer tool row's left list slot: the phone-only image
+			// picker. A list slot, so no priority is involved and the host's
+			// own occupants are untouched.
+			ctx.slots.inject("conversation.input.left", () => ctx.slots.register({
+				name: "conversation.input.left",
+				id: "mobile-image",
 				locale: NS,
-				inject: () => ({ dismiss }),
-			}, MobileScrim));
+			}, MobileImagePicker));
 		}
 
 		exports.name = NS;
@@ -312,8 +605,12 @@ window.__ModuleLoader__.load({
 		exports.DETAILS_COL = DETAILS_COL;
 		exports.DETAILS_OPEN = DETAILS_OPEN;
 		exports.MobileScrim = MobileScrim;
+		exports.MobileFab = MobileFab;
+		exports.MobileImagePicker = MobileImagePicker;
+		exports.intakeImageFiles = intakeImageFiles;
 		exports.applyKeyboardViewport = applyKeyboardViewport;
 		exports.trackDetails = trackDetails;
+		exports.trackFabAnchor = trackFabAnchor;
 		return module.exports;
 	},
 });

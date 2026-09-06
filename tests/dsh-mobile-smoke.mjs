@@ -37,19 +37,74 @@ ok(
 	manifest.dsh.client.inject.includes("@deepseek-ai/dsh-client-ui-layout"),
 	"manifest injects the layout client package that declares shell.overlay",
 );
+ok(
+	manifest.dsh.client.inject.includes("@deepseek-ai/dsh-client-ui-conversation"),
+	"manifest injects the conversation client package that declares conversation.input.left",
+);
 
 // ---------------------------------------------------------------- client half
 const raw = readFileSync(new URL("../plugins/dsh-plugin-mobile/lib/client.js", import.meta.url), "utf8");
 let captured;
-globalThis.window = { __ModuleLoader__: { load: (entry) => { captured = entry; } } };
+globalThis.window = {
+	__ModuleLoader__: { load: (entry) => { captured = entry; } },
+	listeners: {},
+	addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); },
+	removeEventListener(type, fn) { this.listeners[type] = (this.listeners[type] || []).filter((f) => f !== fn); },
+};
 const styleTags = [];
 const metaStub = { content: "width=device-width, initial-scale=1" };
-const rootStub = { attrs: new Map(), setAttribute(k, v) { this.attrs.set(k, v); }, removeAttribute(k) { this.attrs.delete(k); } };
+const rootStub = {
+	attrs: new Map(),
+	setAttribute(k, v) { this.attrs.set(k, v); },
+	removeAttribute(k) { this.attrs.delete(k); },
+	style: {
+		props: new Map(),
+		setProperty(k, v) { this.props.set(k, v); },
+		removeProperty(k) { this.props.delete(k); },
+	},
+};
+// Stand-in geometry for the FAB anchor: frame bottom 844, composer seat top
+// 713 - the measured real-session numbers on an 844px viewport.
+let frameSel = null;
+const frameStub = { getBoundingClientRect: () => ({ bottom: 844 }) };
+let seatStub = { getBoundingClientRect: () => ({ top: 713 }) };
+const docListeners = { map: new Map() };
+const createdInputs = [];
+const appendedToBody = [];
+const dispatchedEvents = [];
 globalThis.document = {
 	head: { appendChild: (tag) => styleTags.push(tag) },
-	createElement: () => ({ dataset: {}, textContent: "", remove() {} }),
-	querySelector: (sel) => (sel === 'meta[name="viewport"]' ? metaStub : null),
+	createElement: (tag) => {
+		const el = {
+			tagName: tag, dataset: {}, textContent: "", style: {},
+			type: undefined, accept: undefined, multiple: undefined,
+			files: [], listeners: {}, clicked: false,
+			addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); },
+			remove() {}, click() { this.clicked = true; },
+		};
+		if (tag === "input") createdInputs.push(el);
+		return el;
+	},
+	body: { appendChild: (el) => appendedToBody.push(el) },
+	dispatchEvent: (event) => { dispatchedEvents.push(event); },
+	querySelector: (sel) => {
+		if (sel === 'meta[name="viewport"]') return metaStub;
+		if (sel === "[data-composer-seat]") return seatStub;
+		if (frameSel !== null && sel === frameSel) return frameStub;
+		return null;
+	},
+	addEventListener(type, fn, opts) { docListeners.map.set(`${type}:${Boolean(opts?.capture)}`, fn); },
+	removeEventListener(type, fn, opts) {
+		if (docListeners.map.get(`${type}:${Boolean(opts?.capture)}`) === fn) docListeners.map.delete(`${type}:${Boolean(opts?.capture)}`);
+	},
 	documentElement: rootStub,
+};
+// The intake rides DOM drop construction; Node has neither constructor.
+globalThis.DataTransfer = class {
+	constructor() { this.files = []; this.items = { add: (file) => this.files.push(file) }; }
+};
+globalThis.DragEvent = class {
+	constructor(type, opts = {}) { this.type = type; this.dataTransfer = opts.dataTransfer; this.bubbles = opts.bubbles; }
 };
 vm.runInThisContext(raw, { filename: "dsh-plugin-mobile/lib/client.js" });
 eq(captured?.id, "dsh-plugin-mobile", "client module id");
@@ -66,6 +121,28 @@ eq(
 	JSON.stringify(["slots", "locale", "layout"]),
 	"client injects slots, locale, and the layout service it drives",
 );
+
+// ---------------------------------------------------------- FAB anchor rig
+// Installed before any apply() so trackFabAnchor runs its full path.
+frameSel = client.FRAME;
+class ROStub {
+	constructor(cb) { this.cb = cb; ROStub.all.push(this); this.observed = []; this.disconnected = false; }
+	observe(el) { this.observed.push(el); }
+	unobserve(el) { this.observed = this.observed.filter((e) => e !== el); }
+	disconnect() { this.disconnected = true; }
+}
+ROStub.all = [];
+globalThis.ResizeObserver = ROStub;
+// Queueing rAF: trackFabAnchor retries per frame while the app mounts, so an
+// immediately-executing stub would recurse without bound when a target is
+// absent. Tests drive the queue by hand with flushRaf().
+let rafQueue = [];
+globalThis.requestAnimationFrame = (fn) => { rafQueue.push(fn); return rafQueue.length; };
+const flushRaf = () => {
+	const batch = rafQueue;
+	rafQueue = [];
+	for (const fn of batch) fn();
+};
 
 // -------------------------------------------------------------- the breakpoint
 const HOST_DIR = "/home/mon3tr/.local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai";
@@ -143,6 +220,94 @@ ok(settingsSrc.includes('role: "dialog"'), "the settings panel still carries rol
 ok(settingsSrc.includes("width:188px"), "the settings nav is still the 188px column the fix overrides");
 ok(settingsSrc.includes("100vh - 48px"), "the settings panel height still derives from 100vh, which 100dvh replaces on Android");
 
+// Collapsed rail: hidden on a phone with the same track collapse the drawer
+// uses, keyed on the opposite attribute. `computeColumns` answers a closed
+// preference with `sidebar: 56` on every width, and the sidebar column's own
+// `min-width:0;overflow:hidden` clips the rail once the track is zero, so no
+// hashed class or inline width is fought.
+ok(layoutSrc.includes("sidebar === 0 ? 56 :"), "the host still keeps a 56px rail track for a closed sidebar");
+ok(
+	phoneBlock.includes(`${client.FRAME}[data-sidebar-collapsed]{grid-template-columns:0 minmax(0,1fr) 0!important}`),
+	"the collapsed rail track collapses to zero inside the phone block",
+);
+ok(
+	phoneBlock.includes(`${client.FRAME}[data-sidebar-collapsed]>:first-child{visibility:hidden}`),
+	"the rail drops out of hit-testing and the tab order while collapsed",
+);
+
+// FAB: an inert base rule outside every media block, and inside the phone
+// block a full style plus an un-hide keyed on the collapsed attribute - which
+// is absent exactly while the drawer is open, when the scrim dismisses.
+ok(CSS.includes(`.${"dsh-plugin-mobile"}-fab{display:none}`), "the FAB base rule sits outside every media block");
+ok(CSS.endsWith(`.${"dsh-plugin-mobile"}-image{display:none}`), "the image button's inert base rule closes the stylesheet");
+ok(phoneBlock.includes(`.${"dsh-plugin-mobile"}-fab{position:absolute`), "the FAB is styled inside the phone block only");
+ok(
+	phoneBlock.includes(`${client.FRAME}[data-sidebar-collapsed] .${"dsh-plugin-mobile"}-fab{display:flex}`),
+	"the FAB appears only on a phone while the sidebar is collapsed",
+);
+ok(
+	phoneBlock.includes("bottom:var(--dsh-plugin-mobile-fab-bottom,148px)"),
+	"the FAB bottom is the live anchor property with the measured 148px fallback",
+);
+
+// Header utility band: session log download, outline, and the diff-viewer
+// trigger all register into the declared utilities list slot, so hiding that
+// one outlet hides all three. Anchored on the slot name in the conversation
+// bundle and the renderer's data-slot emission contract - the same mechanism
+// the settings-dialog rule already depends on.
+ok(
+	phoneBlock.includes('[data-slot="conversation.session.header.utilities"]{display:none!important}'),
+	"the header utility band is hidden inside the phone block (outlets carry inline display:contents, so !important is required)",
+);
+ok(
+	conversationSrc.includes("conversation.session.header.utilities"),
+	"host still declares the header.utilities slot outlet",
+);
+const rendererSrc = readFileSync(`${HOST_DIR}/dsh-client-ui-renderer/lib/client.js`, "utf8");
+ok(
+	rendererSrc.includes('data-slot": slotKey') || rendererSrc.includes('data-slot": "root"'),
+	"the renderer still emits data-slot on outlets, which the rule keys on",
+);
+
+// Model trigger: the full label spans are hidden and a short label takes
+// their place, so the tool row keeps one line at phone widths. The host's
+// own picker menu stays the selection surface - and renders INSIDE the
+// outlet, so the rules are keyed on the trigger's aria-haspopup to leave the
+// menu items' own labels alone. Anchored on the outlet name in the
+// conversation bundle.
+ok(
+	phoneBlock.includes('[data-slot="conversation.input.model"] button[aria-haspopup="menu"] span{display:none}'),
+	"the model trigger's full label is hidden inside the phone block, keyed on the trigger's aria-haspopup",
+);
+ok(
+	phoneBlock.includes('[data-slot="conversation.input.model"] button[aria-haspopup="menu"]::before{content:"模型"}'),
+	"the model trigger shows a short label instead",
+);
+ok(
+	conversationSrc.includes("conversation.input.model"),
+	"host still declares the conversation.input.model slot outlet",
+);
+
+// Image picker CSS: styled and shown only inside the phone block; the inert
+// base rule sits outside every media block like the FAB's.
+ok(
+	phoneBlock.includes(`button.${"dsh-plugin-mobile"}-image{display:inline-flex`),
+	"the image button is styled and shown inside the phone block only",
+);
+ok(
+	phoneBlock.includes(`button.${"dsh-plugin-mobile"}-image{display:inline-flex`) && phoneBlock.includes("width:28px;height:28px"),
+	"the image button is styled inside the phone block at the tool row's 28px icon size",
+);
+
+// The intake depends on the attachment occupant's document-level drop
+// listener - the host contract the synthetic drop rides. Anchored on the
+// exact registration string in the attachment bundle.
+const attachmentSrc = readFileSync(`${HOST_DIR}/dsh-client-ui-attachment/lib/client.js`, "utf8");
+ok(
+	attachmentSrc.includes('document.addEventListener("drop", onDrop)'),
+	"the attachment occupant still admits document drops, which the phone picker routes through",
+);
+
 // Details overlay: keyed on the wrapper's html attribute, positioned absolute.
 // Absolute is safe here (and only here) because the details column is the LAST
 // in-flow grid item - the overlay outlet after it is position:absolute and the
@@ -214,8 +379,8 @@ ok(
 // --------------------------------------------------------------- registration
 let toggles = 0;
 const ctx = {
-	entry: null,
-	slotName: null,
+	entries: [],
+	injectedSlots: [],
 	locales: null,
 	effects: 0,
 	effect(callback) { ctx.effects += 1; callback(); },
@@ -226,20 +391,80 @@ const ctx = {
 		closeDetails() { ctx.closed = (ctx.closed || 0) + 1; },
 	},
 	slots: {
-		inject(name, callback) { ctx.slotName = name; callback(); },
-		register(options, component) { ctx.entry = { ...options, component }; return () => {}; },
+		inject(name, callback) { ctx.injectedSlots.push(name); callback(); },
+		register(options, component) { ctx.entries.push({ ...options, component }); return () => {}; },
 	},
 };
 client.apply(ctx);
-eq(ctx.slotName, "shell.overlay", "injects the declared overlay slot before registering");
-eq(ctx.entry.name, "shell.overlay", "registers into the same slot it injects");
-eq(ctx.entry.id, "mobile-scrim", "stable slot entry id");
-eq(ctx.entry.order, undefined, "a list slot needs no order for a single occupant");
-eq(ctx.entry.locale, "dsh-plugin-mobile", "slot entry carries the plugin locale namespace");
+eq(
+	JSON.stringify(ctx.injectedSlots),
+	JSON.stringify(["shell.overlay", "conversation.input.left"]),
+	"injects both declared slots before registering into them",
+);
+eq(ctx.entries.length, 3, "registers the scrim, the FAB, and the image picker");
+for (const entry of ctx.entries) {
+	eq(entry.locale, "dsh-plugin-mobile", `entry ${entry.id} carries the plugin locale namespace`);
+	eq(entry.order, undefined, `entry ${entry.id} needs no order in a list slot`);
+}
+const [scrimEntry, fabEntry, imageEntry] = ctx.entries;
+eq(scrimEntry.name, "shell.overlay", "the scrim and FAB register into the overlay slot");
+eq(fabEntry.name, "shell.overlay", "the scrim and FAB register into the overlay slot");
+eq(imageEntry.name, "conversation.input.left", "the image picker registers into the tool row's left list slot");
+eq(scrimEntry.id, "mobile-scrim", "stable scrim entry id");
+eq(fabEntry.id, "mobile-fab", "stable FAB entry id");
+eq(imageEntry.id, "mobile-image", "stable image picker entry id");
 eq(styleTags.length, 1, "injects exactly one style tag");
 eq(styleTags[0].dataset.plugin, "dsh-plugin-mobile", "style tag is attributed to the plugin");
 eq(styleTags[0].textContent, CSS, "the injected stylesheet is the exported one");
 ok(ctx.locales.zh.dismiss.length > 0 && ctx.locales.en.dismiss.length > 0, "both locales name the dismiss action");
+ok(ctx.locales.zh.open.length > 0 && ctx.locales.en.open.length > 0, "both locales name the open action");
+ok(ctx.locales.zh.addImages.length > 0 && ctx.locales.en.addImages.length > 0, "both locales name the image picker");
+
+// The FAB anchor publishes the frame-to-composer-seat distance on <html>:
+// 844 - 713 + 12(gap) = 143px. A fixed offset cannot work - the composer is a
+// sticky element INSIDE the scroll container (its bottom equals the frame
+// bottom, measured), and it grows with content and the system font scale,
+// which is exactly how the 96px and 148px constants ended up in the input box.
+flushRaf();
+eq(
+	rootStub.style.props.get("--dsh-plugin-mobile-fab-bottom"),
+	"143px",
+	"apply publishes the live FAB anchor from the frame and seat geometry",
+);
+const anchorRo = ROStub.all.at(-1);
+ok(anchorRo.observed.includes(seatStub), "the anchor observes the composer seat for card growth");
+ok(window.listeners.resize?.includes(anchorRo.cb) === true, "the anchor re-syncs on viewport resize");
+ok(docListeners.map.get("scroll:true") !== undefined, "the anchor re-syncs on capture-phase scroll");
+
+// The disposer uninstalls everything, leaving no property behind. The direct
+// call creates its own observer instance, which is the one it must tear down.
+const disposeFab = client.trackFabAnchor();
+const freshRo = ROStub.all.at(-1);
+flushRaf();
+eq(rootStub.style.props.get("--dsh-plugin-mobile-fab-bottom"), "143px", "a fresh anchor republishes the property");
+disposeFab();
+eq(rootStub.style.props.has("--dsh-plugin-mobile-fab-bottom"), false, "the disposer removes the property");
+eq(freshRo.disconnected, true, "the disposer disconnects its own observer");
+eq(window.listeners.resize.includes(freshRo.cb), false, "the disposer removes its own resize listener");
+
+// Mount retry: before the app mounts neither target exists, and the per-frame
+// retry must stay bounded instead of spinning forever on a hero-only screen.
+const seatHeld = seatStub;
+seatStub = null;
+const retry = client.trackFabAnchor();
+flushRaf();
+eq(rootStub.style.props.has("--dsh-plugin-mobile-fab-bottom"), false, "no property while the targets are absent");
+for (let i = 0; i < 700 && rafQueue.length > 0; i += 1) flushRaf();
+eq(rafQueue.length, 0, "the mount retry stops at its tick cap");
+// Once mounted, the already-installed scroll listener re-syncs and wires.
+seatStub = seatHeld;
+docListeners.map.get("scroll:true")();
+eq(
+	rootStub.style.props.get("--dsh-plugin-mobile-fab-bottom"),
+	"143px",
+	"a capture scroll re-syncs the anchor after a late mount",
+);
+retry();
 
 // The details wrapper flips the html attribute around the original actions.
 ctx.layout.openDetails();
@@ -250,9 +475,8 @@ eq(rootStub.attrs.has("data-dsh-plugin-mobile-details"), false, "closing details
 eq(ctx.closed, 1, "the original close action still runs");
 
 // -------------------------------------------------------------- rendered scrim
-const injected = ctx.entry.inject();
 const t = (key) => `t:${key}`;
-const node = ctx.entry.component({ ...injected, t });
+const node = scrimEntry.component({ ...scrimEntry.inject(), t });
 eq(node.type, "button", "the scrim is a real button, not a bare div");
 eq(node.props.className, "dsh-plugin-mobile-scrim", "the scrim carries the class the stylesheet drives");
 eq(node.props.tabIndex, -1, "the scrim stays out of the tab order; the sidebar toggle is the keyboard path");
@@ -260,14 +484,65 @@ eq(node.props["aria-label"], "t:dismiss", "the scrim is labelled from the locale
 node.props.onClick();
 eq(toggles, 1, "tapping the scrim closes the drawer through the layout service");
 
+// ------------------------------------------------------------- rendered FAB
+const fab = fabEntry.component({ ...fabEntry.inject(), t });
+eq(fab.type, "button", "the FAB is a real button");
+eq(fab.props.className, "dsh-plugin-mobile-fab", "the FAB carries the class the stylesheet drives");
+eq(fab.props["aria-label"], "t:open", "the FAB is labelled from the locale");
+eq(fab.props.tabIndex, undefined, "the FAB is a real control and stays in the tab order");
+eq(fab.props.children.type, "svg", "the FAB draws its own inline menu icon");
+eq(fab.props.children.props["aria-hidden"], true, "the icon is decorative");
+fab.props.onClick();
+eq(toggles, 2, "tapping the FAB opens the drawer through the same guarded toggle");
+eq(scrimEntry.inject().dismiss, fabEntry.inject().open, "both overlay entries drive one shared toggle");
+
+// ------------------------------------------------------- rendered image picker
+const imageNode = imageEntry.component({ t });
+eq(imageNode.type, "button", "the image picker is a real button");
+eq(imageNode.props.className, "dsh-plugin-mobile-image", "the image picker carries the class the stylesheet drives");
+eq(imageNode.props["aria-label"], "t:addImages", "the image picker is labelled from the locale");
+eq(imageNode.props.children.type, "svg", "the image picker draws its own inline icon");
+
+// Tapping opens a hidden multi-image file input through the platform picker.
+imageNode.props.onClick();
+eq(createdInputs.length, 1, "one file input is created");
+const picker = createdInputs[0];
+eq(picker.type, "file", "the input picks files");
+eq(picker.accept, "image/*", "the input accepts images only");
+eq(picker.multiple, true, "the input accepts a batch");
+eq(appendedToBody.includes(picker), true, "the input is attached for the picker gesture");
+eq(picker.clicked, true, "the picker gesture fires");
+
+// A chosen batch is handed to the stock intake as one synthetic document
+// drop - the attachment occupant's own document listener is the only
+// file-admission path, so limits, the draft rail, and removal stay the host's.
+const fileA = { name: "a.png" };
+const fileB = { name: "b.jpg" };
+picker.files = [fileA, fileB];
+picker.listeners.change[0]();
+eq(dispatchedEvents.length, 1, "one drop event reaches the document");
+const drop = dispatchedEvents[0];
+eq(drop.type, "drop", "the event is a drop");
+eq(drop.dataTransfer.files.length, 2, "the drop carries every picked file");
+eq(drop.dataTransfer.files[0].name, "a.png", "the drop preserves file order");
+eq(createdInputs.length, 1, "no second input was created");
+
+// An empty chooser must not dispatch, and the intake refuses no-file calls.
+picker.files = [];
+picker.listeners.change[0]();
+eq(dispatchedEvents.length, 1, "no drop without picked files");
+client.intakeImageFiles([]);
+eq(dispatchedEvents.length, 1, "the intake refuses an empty batch");
+
 // A tap before the frame wired its store actions must not throw at the user.
 const throwing = { ...ctx, layout: { toggleSidebar() { throw new Error("layout: panel actions not wired"); } } };
+throwing.entries = [];
 throwing.slots = {
 	inject(name, callback) { callback(); },
-	register(options, component) { throwing.entry = { ...options, component }; return () => {}; },
+	register(options, component) { throwing.entries.push({ ...options, component }); return () => {}; },
 };
 client.apply(throwing);
-const earlyNode = throwing.entry.component({ ...throwing.entry.inject(), t });
+const earlyNode = throwing.entries[0].component({ ...throwing.entries[0].inject(), t });
 let threw = false;
 try {
 	earlyNode.props.onClick();
