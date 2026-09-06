@@ -1,0 +1,13 @@
+{
+  "name": "dsh-plugin-tool-gate",
+  "version": "0.1.0",
+  "description": "Progressive tool loading for DSH: gate heavy tools behind a summary catalog and a tool_expand loader",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "private": true
+}

@@ -27,6 +27,7 @@ docs/
   session-repair.md           Session repair plugin behavior and companion data rules
   session-seq-corruption-report.md  Upstream Discussion draft for the seq-collision corruption
   usage-dashboard.md          Usage dashboard: exact accounting, composition estimate, routes
+  tool-gate.md                Progressive tool loading: restriction, catalog, expand
 
 plugins/
   dsh-magic-context/         Compaction, memories, retrieval, provenance, Dreamer
@@ -37,6 +38,7 @@ plugins/
   dsh-plugin-diff-viewer/     Read-only git diff and file browser panel
   dsh-plugin-session-id/      Session id label in the session header
   dsh-plugin-usage/           Token-usage dashboard: per-request accounting and composition
+  dsh-plugin-tool-gate/       Progressive tool loading: gate heavy tools behind tool_expand
   dsh-plugin-mobile/          Phone-viewport ergonomics for the Web shell
   dsh-plugin-logo/            Custom Mon3tr brand mark and name
   dsh-plugin-image-model/     Image-generation endpoints as selectable models
@@ -65,6 +67,7 @@ tests/
   dsh-computer-use-smoke.mjs  Desktop tools: wire encoding, key mapping, tree render, live handshakes
   dsh-session-repair-smoke.mjs Session repair: core repair passes, real decoder cross-check, host routes
   dsh-usage-smoke.mjs         Usage dashboard: collector exactness, host routes, client contract
+  dsh-tool-gate-smoke.mjs     Tool gate: visible-deny math, expand transitions, lifecycle wiring
 ```
 
 ## Plugin Structure
@@ -182,6 +185,17 @@ Important context behavior:
 - `package.json`: Web runtime/locale/conversation/primitives client injection and package exports.
 - `jsx(Component)` without a second argument crashes the jsx runtime with `Cannot read properties of undefined (reading 'key')` and the slot host marks the entry abdicated — always pass `{}`.
 - See `docs/usage-dashboard.md`.
+
+### `dsh-plugin-tool-gate`
+
+- Progressive tool loading: hides heavy tools from each session's request so the fixed tool prefix stays small (~2-3k instead of ~10k on this deployment). Gating is real registry restriction, not prompt suggestion: `agent.ctx.tools.restrict({ deny })` removes names from that agent's `view(scope).visible`, which the request assembler reads through `wireSchemas`. Gated tools stay registered and executable; a model call to one is denied as `UNKNOWN_TOOL`, the same failure an absent definition produces.
+- `lib/gate.js` (pure): `DEFAULT_HIDDEN` (desktop five, context7 pair, workflow, ralph, the subagent family, the goal trio, the jobs trio), `normalizeHidden`, `firstSentence` (fallback summary from the tool's own description), `visibleDeny` (pre-filters the configured names against `restrictableNames` — the registry throws on unknown names, so config drift degrades to "fewer tools gated" instead of a broken session), `expandTransition`, and `catalogText`.
+- `lib/summaries.js`: curated one-line English summaries for the default hidden set. English on purpose (~3.8 chars/token vs ~0.85 tokens/char for CJK); the catalog rides every request.
+- `lib/index.js` (host plane, inject: `tools`, `systemPrompt`): three idempotent lifecycle hooks converge on `gate(sessionId, agentHint)` — `agent/session-start` is primary (the agent-loop emits it with the agent object on fresh start AND resume, before the first request assembly), `session/created` primes fresh sessions, `session/event` on `turn/start`/`user/message` is the fallback. A resumed session gets a NEW agent object, so `gate()` compares agent identity, disposes the stale disposer, and re-gates. Every seam fails open: if the `agents` service is unreachable the session keeps all tools. The catalog section's text is a function of gate state — empty until the first gate fills it, then stable.
+- `tool_expand({tools})` re-restricts the caller's agent without the requested names (dispose old restriction, apply the reduced deny; empty deny is not re-applied). Expansion is per-agent by construction through `exec.agent.ctx` and takes effect on the next step of the same turn. Calls that free nothing do not touch the restriction — no cache churn without a change. The ctx_* tools stay resident on purpose: the model uses them constantly and `context-tool-guidance` would be dead weight otherwise.
+- Two deliberate cache rewrite points: the first request of a session (smaller prefix) and each expand call (the tool block changes). The catalog tells the model to batch expansions for exactly this reason.
+- Config: `enabled`, `hidden`, `sectionOrder` (1615), `expandToolName`. Mounted as a plain host patch row in the profile patch, not a preset row — per-agent restriction must happen when the agent exists, which the lifecycle hooks provide.
+- Verified end to end on an isolated instance: request 1 carried 17 tools (was 36) with the catalog in the system prompt; a real model turn called `tool_expand(["workflow", "subagent"])` and the next request (reason `change`) carried 19 with those present and the rest still gated. See `docs/tool-gate.md`.
 
 ### `dsh-plugin-mobile`
 
@@ -328,7 +342,7 @@ Other useful context tests:
 - `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
 - `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-usage-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, `dsh-image-model-smoke.mjs`, `dsh-scheduler-smoke.mjs`, or `dsh-computer-use-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one. `dsh-computer-use-smoke.mjs` includes two live checks that skip cleanly when their socket is absent: a raw Wayland handshake against the real compositor and an AT-SPI dump against the session bus.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-usage-smoke.mjs`, `dsh-tool-gate-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, `dsh-image-model-smoke.mjs`, `dsh-scheduler-smoke.mjs`, or `dsh-computer-use-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one. `dsh-computer-use-smoke.mjs` includes two live checks that skip cleanly when their socket is absent: a raw Wayland handshake against the real compositor and an AT-SPI dump against the session bus.
 
 ## Git and Editing Rules
 

@@ -32,6 +32,13 @@
     # context. See docs/usage-dashboard.md.
     - id: dsh-plugin-usage
       name: dsh-plugin-usage
+    # Progressive tool loading: hides heavy tools (desktop control, context7,
+    # workflow, delegation, goals, jobs) from each session's tool list through
+    # a per-agent tools.restrict({deny}); a catalog section lists them with
+    # one-line summaries and a tool_expand tool loads requested tools back for
+    # the rest of the session. The ctx_* tools stay resident on purpose.
+    - id: dsh-plugin-tool-gate
+      name: dsh-plugin-tool-gate
     # Phone-viewport ergonomics, active only below 640px (a strict subset of the
     # host's own 1024px narrow mode). An expanded sidebar becomes a drawer over
     # the conversation instead of squeezing it: the host keeps all three columns
