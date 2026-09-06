@@ -80,6 +80,13 @@
               path: /v1/messages
             headers:
               User-Agent: claude-cli/1.0.0 (external, cli)
+    # Offline repair for session logs corrupted by a backward seq gap (a turn
+    # interrupted with a pending tool call, whose result later commits through
+    # the stale pre-interrupt session object). Mounted with no config: the
+    # "Session repair" settings section owns the scan / repair / restore
+    # routes, and every repair backs the original log up first.
+    - id: dsh-plugin-session-repair
+      name: dsh-plugin-session-repair
 
 # Make Context Compact the default for newly created Web sessions.
 - id: agent-presets
