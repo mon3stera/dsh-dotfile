@@ -1,0 +1,13 @@
+{
+  "name": "dsh-plugin-computer-use",
+  "version": "0.1.0",
+  "description": "Computer-use tools for DSH: niri/Wayland screenshots, AT-SPI widget tree, and pointer/keyboard input",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "private": true
+}

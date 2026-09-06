@@ -23,6 +23,9 @@ docs/
   image-model.md              Image-generation adapter, prompt selection, storage limits
   session-outline.md          Outline plugin behavior notes
   diff-viewer.md              Diff viewer routes, confinement, and baseline choice
+  computer-use.md             Desktop tools: coordinate systems, pointer client, deployment
+  session-repair.md           Session repair plugin behavior and companion data rules
+  session-seq-corruption-report.md  Upstream Discussion draft for the seq-collision corruption
 
 plugins/
   dsh-magic-context/         Compaction, memories, retrieval, provenance, Dreamer
@@ -36,7 +39,9 @@ plugins/
   dsh-plugin-logo/            Custom Mon3tr brand mark and name
   dsh-plugin-image-model/     Image-generation endpoints as selectable models
   dsh-plugin-scheduler/       Scheduled tasks that spawn a session per run
+  dsh-plugin-computer-use/    Computer-use tools for the niri/Wayland desktop
   dsh-header-rewrite/         Header rewrite for LLM provider requests
+  dsh-plugin-session-repair/  Offline repair for backward-seq-corrupted session logs
 
 profile/
   cordis.patch.example.yml    Example Web profile loader patch
@@ -55,6 +60,8 @@ tests/
   dsh-logo-smoke.mjs          Logo asset routes and brand-slot contract test
   dsh-image-model-smoke.mjs   Image adapter contract, prompt selection, admission limits
   dsh-scheduler-smoke.mjs     Scheduler math, routes, run-now, and panel contract test
+  dsh-computer-use-smoke.mjs  Desktop tools: wire encoding, key mapping, tree render, live handshakes
+  dsh-session-repair-smoke.mjs Session repair: core repair passes, real decoder cross-check, host routes
 ```
 
 ## Plugin Structure
@@ -214,6 +221,14 @@ Important context behavior:
 - `lib/client.js`: a "Header rewrite" section in the Settings sidebar with a YAML editor that loads/saves the config through the host route.
 - `package.json`: Web client injection and package exports.
 
+### `dsh-plugin-session-repair`
+
+- `lib/repair.js`: pure core. Rows are parsed from the decompressed JSONL; the exact contiguity scan mirrors the persistence reader's invariant, with packed chunk rows (`text-chunks` / `reasoning-chunks` / `tool-call-chunks` carrying `seq0`) expanded to `data.texts.length` / `data.args.length` events. The fixed repair pattern locates the first backward seq transition, deletes the synthetic `interrupted-tool-result` batch when present (renumbering the remaining committed rows down by three) and lets the rescanned gap shift the late tail up by one uniform delta; `seq`, `seq0`, and `sourceEventSeqs` all shift. Also ports `projectKey` / `encodeSegment` from the persistence backend for path resolution.
+- `lib/index.js`: `GET /session-repair/scan`, `POST /session-repair/repair` (`dryRun` supported; atomic write with a `.bak-<ts>` backup and post-write re-verification), and `POST /session-repair/restore` (newest backup back). zstd through the CLI because DSH writes many concatenated frames per log, which the one-shot zlib zstd functions do not decode.
+- `lib/client.js`: a "会话修复 / Session repair" settings section — workspace path (localStorage; empty scans every project directory), scan, per-session dry run / repair / restore.
+- The plugin is generic and does not touch `dsh-magic-context`'s database; after a real repair its seq references must be shifted by the same rule (see `docs/session-repair.md`).
+- See `docs/session-repair.md` and `docs/session-seq-corruption-report.md` (upstream Discussion draft).
+
 ### `dsh-plugin-scheduler`
 
 - `lib/index.js`: durable scheduled tasks in `$DSH_HOME/scheduler/tasks.json`. Each task has a name, a prompt, an optional cwd / agent preset, and either a fixed interval (minutes ≥ 5) or a daily server-local `HH:MM`. The self-rearming timer fires due tasks through the host `sessionController` service: `create({cwd, agentPreset})` spawns a fresh session, then `prompt({sessionId, requestId, content})` submits the prompt, so every run is an ordinary session in the sidebar list. Routes: `GET/POST /scheduler/tasks` (validated full-document save, atomic write, re-arms the timer) and `POST /scheduler/run` (run one task now). An overdue interval task runs one catch-up when found overdue at boot or after a save; daily tasks wait for their next occurrence. Failures land on the task's `lastError` and surface in the panel.
@@ -221,6 +236,14 @@ Important context behavior:
 - `package.json`: Web client injection (locale, slots, sidebar) and package exports.
 - The scheduler deliberately does not use `dsh-schedule`: that host package delivers reminders into an existing conversation, while this plugin's contract is one fresh session per run.
 - Per-task model: tasks may carry `provider`/`model`; when both are set the runner resolves the route through the host `llm.resolveCallConfig` and commits it with `controller.agents.selectForNextRequest(agent, selection)` before prompting. `sessionController.selectModel()` is deliberately avoided — beyond the session-local selection it also saves the deployment-global default model (`agentDefaultModel.saveSelection`), which a task must never hijack. A failed selection records `lastError` and skips the prompt instead of running on the wrong model.
+
+### `dsh-plugin-computer-use`
+
+- Five agent tools over the niri/Wayland desktop the DSH process runs in: `desktop_windows` (niri IPC list/focus/close/fullscreen), `desktop_tree` (AT-SPI2 accessibility tree with desktop-global pixel extents, via the spawned `lib/atspi-tree.py` helper over `gi.repository.Atspi` — the `python-atspi` package is not needed), `desktop_screenshot` (grim; window capture tries `niri msg action screenshot-window` and falls back to focus + full-screen grim), `desktop_mouse` (absolute move/click/drag over a dependency-free raw Wayland `zwlr_virtual_pointer_v1` client in `lib/wayland-pointer.js`; wheel via ydotool), and `desktop_key` (wtype text/keysyms with a ydotool keycode fallback).
+- `lib/wayland-pointer.js` exists because ydotool 1.0.4's daemon creates a relative-only uinput device (`capabilities/abs: 0`), so `mousemove -a` cannot target pixels; niri implements `wlr-virtual-pointer-unstable-v1` natively and the needed subset (registry walk, bind, create, `motion_absolute`, `button`, `frame`, destroy) fits a small wire-protocol client. Wheel axis is deliberately absent — REL_WHEEL detents through ydotool are unambiguous.
+- `niri msg action screenshot-window` has been observed to return success while producing no file and no clipboard image on this build; the screenshot tool polls `screenshotDir` for a new image and falls back to focus + grim, stating the fallback in its result.
+- All coordinates are desktop-global logical pixels: the tree reports them directly, and the screenshot result states the scale mapping (grim downscales to fit the 2000 px attachment limit). Multi-monitor bounding boxes with negative origins are normalized via `niri msg --json outputs`.
+- A pure tool registrar (inject: `tools`, `systemPrompt`) mounted as a plain preset row with no isolate realm. The preset is deployed as a copy under `~/.dsh/.agent-presets/context-compact/` — unlike plugins, which live under `profiles/node_modules/`. The tools execute real desktop input with no permission surface; mount only in trusted presets. See `docs/computer-use.md`.
 
 ## Profile Composition
 
@@ -293,7 +316,7 @@ Other useful context tests:
 - `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
 - `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, `dsh-image-model-smoke.mjs`, or `dsh-scheduler-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, `dsh-image-model-smoke.mjs`, `dsh-scheduler-smoke.mjs`, or `dsh-computer-use-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one. `dsh-computer-use-smoke.mjs` includes two live checks that skip cleanly when their socket is absent: a raw Wayland handshake against the real compositor and an AT-SPI dump against the session bus.
 
 ## Git and Editing Rules
 

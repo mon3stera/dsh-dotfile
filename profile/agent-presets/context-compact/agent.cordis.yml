@@ -279,3 +279,13 @@
   config:
     fetch: false
     searchTimeoutMs: 60000
+
+# ── computer use ────────────────────────────────────────────────────────────
+
+# A pure tool registrar like the rows above: it registers five desktop tools
+# (windows, a11y tree, screenshot, mouse, keyboard) into the host `tools`
+# registry and provides nothing, so it needs no realm. The tools drive the
+# niri/Wayland session the DSH process lives in and execute without a
+# permission surface — see plugins/dsh-plugin-computer-use.
+- id: tool-computer-use
+  name: dsh-plugin-computer-use
