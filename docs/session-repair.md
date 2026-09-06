@@ -65,11 +65,20 @@ content) survives.
 The zstd codec is the `zstd` CLI: DSH writes many concatenated frames per
 log, which the one-shot zlib zstd functions do not decode.
 
-## Settings UI
+## Client UI
 
 A "会话修复 / Session repair" section in the Settings sidebar: workspace path
 (persisted in localStorage; empty scans everything), scan, per-session dry
 run / repair / restore.
+
+Plus a "修复 / Repair" trigger in the session header's utilities band. It
+targets exactly the session it is mounted on (`cwd` comes from the sessions
+list store) and shows a small anchored panel: the dry run doubles as the
+status probe — HTTP 200 means the log is damaged and the response carries the
+repair preview, HTTP 409 means the contiguity scan is clean — then the panel
+offers repair, and afterwards restore-from-backup. The sidebar row menu
+(rename/fork/archive) is hardcoded in the host workspace bundle with no
+extension slot, which is why the entry lives in the header band.
 
 ## Companion data: magic-context seq references
 

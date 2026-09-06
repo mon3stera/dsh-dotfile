@@ -346,6 +346,21 @@ console.log("host routes");
   check("repair 404s unknown sessions", missing.status === 404);
 }
 
+// ---------- client contract ----------
+console.log("client contract");
+{
+  const clientText = readFileSync(`${PLUGIN_DIR}/lib/client.js`, "utf8");
+  check("registers the settings section", clientText.includes('ctx.slots.inject("settings.section"'));
+  check("registers the session-header utility", clientText.includes('ctx.slots.inject("conversation.session.header.utilities"'));
+  check("header entry keeps a distinct order in the utilities band", /id: "session-repair",\s*\n\s*order: 74/.test(clientText));
+  check("trigger reads cwd from the sessions list store", clientText.includes("useSessions"));
+  check("dry run doubles as the status probe", clientText.includes("dryRun: true") && clientText.includes("error.status === 409"));
+  check("zh and en dictionaries both carry the trigger keys", ["trigger", "panelTitle", "damagedMsg", "repairedMsg"].every((key) =>
+    (clientText.match(new RegExp(`"${key}":`, "g")) ?? []).length === 2
+  ));
+  check("panel paints a menu surface token, not the wallpaper-transparent base", clientText.includes("var(--dsw-specific-menu)") && !/\.dsr-hpanel\{[^}]*bg-base/.test(clientText));
+}
+
 rmSync(TEST_HOME, { recursive: true, force: true });
 
 if (failures > 0) {

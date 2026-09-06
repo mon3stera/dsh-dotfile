@@ -15,7 +15,8 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
-    const jsx = require("react/jsx-runtime").jsx;
+    const react = require("react");
+    const { jsx, jsxs } = require("react/jsx-runtime");
     const { defineStore } = require("@deepseek-ai/dsh-client-store");
 
     const name = "dsh-plugin-session-repair";
@@ -38,7 +39,19 @@ window.__ModuleLoader__.load({
       ".dsr-table{width:100%;border-collapse:collapse;font-size:12px;color:var(--dsw-alias-label-primary)}",
       ".dsr-table th{text-align:left;font-weight:500;color:var(--dsw-alias-label-tertiary);border-bottom:1px solid var(--dsw-alias-border-l2);padding:6px 8px}",
       ".dsr-table td{border-bottom:1px solid var(--dsw-alias-border-l2);padding:6px 8px;vertical-align:top}",
-      ".dsr-code{font-family:var(--ds-font-family-code);font-size:11.5px}"
+      ".dsr-code{font-family:var(--ds-font-family-code);font-size:11.5px}",
+      // Session-header trigger and its per-session panel.
+      ".dsr-htrigger{height:32px;min-width:32px;color:var(--dsw-alias-label-secondary);background:transparent;border:1px solid transparent;border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:0 8px;font:var(--dsw-font-xs-13)}",
+      ".dsr-htrigger:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}",
+      ".dsr-hroot{display:inline-flex;position:relative}",
+      ".dsr-hpanel{position:absolute;z-index:100;top:calc(100% + 8px);right:0;box-sizing:border-box;width:min(460px,calc(100vw - 24px));color:var(--dsw-alias-label-primary);background:var(--dsw-specific-menu);border:0;border-radius:12px;box-shadow:var(--dsw-elevation-prominent);padding:12px;font-size:12px;line-height:20px}",
+      ".dsr-hhead{display:flex;align-items:center;gap:6px}",
+      ".dsr-htitle{font-weight:500;font-size:13px}",
+      ".dsr-hclose{margin-left:auto;width:24px;height:24px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;display:grid;place-items:center}",
+      ".dsr-hmeta{color:var(--dsw-alias-label-tertiary);font-family:var(--ds-font-family-code);font-size:11px;margin-top:2px;word-break:break-all}",
+      ".dsr-hhint{color:var(--dsw-alias-label-secondary);margin-top:8px}",
+      ".dsr-hrow{display:flex;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap}",
+      ".dsr-hmsg{margin-top:8px;font-size:12px;line-height:18px;white-space:pre-wrap}"
     ].join("\n");
 
     /** Locale dictionaries for the settings section. */
@@ -62,7 +75,17 @@ window.__ModuleLoader__.load({
       "colSession": "会话",
       "colGap": "损坏点",
       "colInfo": "信息",
-      "colActions": "操作"
+      "colActions": "操作",
+      "trigger": "修复",
+      "panelTitle": "会话修复",
+      "panelHint": "检查当前会话日志的 seq 倒退损坏；修复前自动备份原文件。",
+      "check": "检查",
+      "checking": "检查中…",
+      "cleanMsg": "未检测到 seq 损坏。若会话仍无法加载，请使用设置页的会话修复面板查看详情。",
+      "damagedMsg": "检测到损坏：{gap}。预览：删除 {d} 条合成事件，修复后共 {e} 条事件。",
+      "repairedMsg": "修复完成：共 {e} 条事件，末尾 seq {l}。已备份原文件。刷新后重新打开此会话。",
+      "restoreDone": "已从备份恢复。",
+      "close": "关闭"
     };
     const en = {
       "nav": "Session repair",
@@ -84,7 +107,17 @@ window.__ModuleLoader__.load({
       "colSession": "Session",
       "colGap": "Corruption",
       "colInfo": "Info",
-      "colActions": "Actions"
+      "colActions": "Actions",
+      "trigger": "Repair",
+      "panelTitle": "Session repair",
+      "panelHint": "Checks this session's log for the backward-seq corruption; the original file is backed up before any repair.",
+      "check": "Check",
+      "checking": "Checking…",
+      "cleanMsg": "No seq corruption detected. If the session still fails to load, use the Session repair section in Settings for details.",
+      "damagedMsg": "Corruption detected: {gap}. Preview: would drop {d} synthetic events, {e} events after repair.",
+      "repairedMsg": "Repaired: {e} events, last seq {l}. Original backed up. Refresh and reopen this session.",
+      "restoreDone": "Restored from backup.",
+      "close": "Close"
     };
 
     /** Mirror store for the section state. */
@@ -106,8 +139,129 @@ window.__ModuleLoader__.load({
       return `expected ${gap.expected}, got ${gap.got}`;
     }
 
-    /** Settings > sidebar section: cwd input + scan + corrupted-session table. */
-    function SessionRepairSection({ t, useStore, scan, repair, restore, setCwd }) {
+    /** Inline wrench icon for the header trigger. */
+    const WRENCH_ICON = jsx("svg", {
+      viewBox: "0 0 24 24", width: 16, height: 16, fill: "none", stroke: "currentColor",
+      strokeWidth: 1.8, strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": true,
+      children: jsx("path", { d: "M14.5 6.5a3.5 3.5 0 0 0-4.9 4.2L4 16.3V20h3.7l5.6-5.6a3.5 3.5 0 0 0 4.2-4.9l-2.6 2.6-2.4-2.4 2.6-2.6z" })
+    });
+
+    /** Format the stored gap for a message template. */
+    function gapLabel(session) {
+      const gap = session?.gap;
+      if (gap === null || gap === undefined) return "unknown";
+      if (gap.got === null) return `unparsable row at ${gap.row}`;
+      return `expected ${gap.expected}, got ${gap.got}`;
+    }
+
+    /**
+     * Session-header utility: checks and repairs THIS session's log in place.
+     * The dry run doubles as the status probe: 200 = damaged (with a preview),
+     * 409 = clean. A real repair is only offered after a damaged dry run.
+     *
+     * @param {{sessionId: string, useSessions: Function, t: Function}} props -
+     *   session scope from the slot host; cwd comes from the sessions list
+     *   store and may be undefined while the list has not loaded.
+     */
+    function RepairTrigger({ sessionId, useSessions, t }) {
+      const [open, setOpen] = react.useState(false);
+      const [busy, setBusy] = react.useState(false);
+      const [result, setResult] = react.useState(null);
+      const cwd = useSessions((state) => {
+        const entry = state?.byId?.[sessionId];
+        return typeof entry?.cwd === "string" && entry.cwd !== "" ? entry.cwd : undefined;
+      });
+
+      const post = (path, body) => fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId, cwd, ...body })
+      }).then(async (response) => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.ok !== true) {
+          const error = new Error(data.error ?? "request failed");
+          error.status = response.status;
+          throw error;
+        }
+        return data;
+      });
+
+      const check = () => {
+        setBusy(true);
+        setResult(null);
+        post("/session-repair/repair", { dryRun: true })
+          .then((data) => setResult({
+            kind: "damaged",
+            data,
+            text: t("damagedMsg").replace("{gap}", gapLabel(data)).replace("{d}", data.passes.reduce((n, p) => n + p.dropped, 0)).replace("{e}", data.eventsAfter)
+          }))
+          .catch((error) => setResult(error.status === 409 ? { kind: "clean" } : { kind: "error", text: String(error?.message ?? error) }))
+          .finally(() => setBusy(false));
+      };
+
+      const repair = () => {
+        setBusy(true);
+        post("/session-repair/repair", { dryRun: false })
+          .then((data) => setResult({ kind: "repaired", data, text: t("repairedMsg").replace("{e}", data.eventsAfter).replace("{l}", data.lastSeq) }))
+          .catch((error) => setResult({ kind: "error", text: String(error?.message ?? error) }))
+          .finally(() => setBusy(false));
+      };
+
+      const restore = () => {
+        setBusy(true);
+        post("/session-repair/restore", {})
+          .then(() => setResult({ kind: "restored", text: t("restoreDone") }))
+          .catch((error) => setResult({ kind: "error", text: String(error?.message ?? error) }))
+          .finally(() => setBusy(false));
+      };
+
+      return jsxs("span", {
+        className: "dsr-hroot",
+        "data-dsh-session-repair": sessionId,
+        children: [
+          jsx("button", {
+            type: "button",
+            className: "dsr-htrigger",
+            "aria-label": t("trigger"),
+            "aria-expanded": open,
+            title: t("trigger"),
+            onClick: () => { setResult(null); setOpen((v) => !v); },
+            children: [WRENCH_ICON, open ? null : jsx("span", { children: t("trigger") })]
+          }),
+          open && jsxs("div", {
+            className: "dsr-hpanel",
+            role: "dialog",
+            "aria-label": t("panelTitle"),
+            children: [
+              jsxs("div", { className: "dsr-hhead", children: [
+                jsx("span", { className: "dsr-htitle", children: t("panelTitle") }),
+                jsx("button", {
+                  type: "button", className: "dsr-hclose", "aria-label": t("close"),
+                  onClick: () => setOpen(false), children: "×"
+                })
+              ] }),
+              jsx("div", { className: "dsr-hmeta", children: `${sessionId}${cwd === undefined ? "" : ` · ${cwd}`}` }),
+              jsx("div", { className: "dsr-hhint", children: t("panelHint") }),
+              result === null ? jsx("div", { className: "dsr-hrow", children: jsx("button", {
+                type: "button", className: "dsr-btn dsr-btn-secondary", disabled: busy || cwd === undefined,
+                onClick: check, children: busy ? t("checking") : t("check")
+              }) }) : null,
+              result?.kind === "damaged" ? jsx("div", { className: "dsr-hrow", children: jsx("button", {
+                type: "button", className: "dsr-btn", disabled: busy,
+                onClick: repair, children: busy ? t("repairing") : t("repair")
+              }) }) : null,
+              (result?.kind === "repaired" || result?.kind === "restored") ? jsx("div", { className: "dsr-hrow", children: jsx("button", {
+                type: "button", className: "dsr-btn dsr-btn-secondary", disabled: busy,
+                onClick: restore, children: t("restore")
+              }) }) : null,
+              result?.text !== undefined ? jsx("div", { className: `dsr-hmsg${result.kind === "error" ? " dsr-error" : result.kind === "clean" ? "" : " dsr-ok"}`, children: result.text }) : null
+            ]
+          })
+        ]
+      });
+    }
+
+    /** Settings > sidebar section: cwd input + scan + corrupted-session table. */    function SessionRepairSection({ t, useStore, scan, repair, restore, setCwd }) {
       const s = useStore((st) => st);
       const busy = s.status !== "idle";
       const fmt = (text) => text.replace("{n}", s.sessions.length).replace("{m}", s.healthyCount);
@@ -271,6 +425,13 @@ window.__ModuleLoader__.load({
         store,
         inject: injected
       }, SessionRepairSection));
+
+      ctx.slots.inject("conversation.session.header.utilities", () => ctx.slots.register({
+        name: "conversation.session.header.utilities",
+        id: "session-repair",
+        order: 74,
+        locale: NS
+      }, RepairTrigger));
 
       syncStore();
     }
