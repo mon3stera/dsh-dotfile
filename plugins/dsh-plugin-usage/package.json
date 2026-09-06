@@ -1,0 +1,24 @@
+{
+  "name": "dsh-plugin-usage",
+  "version": "0.1.0",
+  "description": "Token-usage dashboard for DSH Web sessions: exact per-request accounting, cumulative totals, and an estimated context composition",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT"
+}

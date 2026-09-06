@@ -25,6 +25,13 @@
       name: dsh-plugin-diff-viewer
     - id: dsh-plugin-session-id
       name: dsh-plugin-session-id
+    # Token-usage dashboard: a session-header panel with the exact per-request
+    # accounting from the session log (input / cache read / cache write /
+    # output per request, cumulative totals, cache hit rate, prefix-rewrite
+    # flags) plus an estimated per-category composition of the current
+    # context. See docs/usage-dashboard.md.
+    - id: dsh-plugin-usage
+      name: dsh-plugin-usage
     # Phone-viewport ergonomics, active only below 640px (a strict subset of the
     # host's own 1024px narrow mode). An expanded sidebar becomes a drawer over
     # the conversation instead of squeezing it: the host keeps all three columns

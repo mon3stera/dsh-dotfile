@@ -26,6 +26,7 @@ docs/
   computer-use.md             Desktop tools: coordinate systems, pointer client, deployment
   session-repair.md           Session repair plugin behavior and companion data rules
   session-seq-corruption-report.md  Upstream Discussion draft for the seq-collision corruption
+  usage-dashboard.md          Usage dashboard: exact accounting, composition estimate, routes
 
 plugins/
   dsh-magic-context/         Compaction, memories, retrieval, provenance, Dreamer
@@ -35,6 +36,7 @@ plugins/
   dsh-plugin-outline/         Browser-only session outline panel
   dsh-plugin-diff-viewer/     Read-only git diff and file browser panel
   dsh-plugin-session-id/      Session id label in the session header
+  dsh-plugin-usage/           Token-usage dashboard: per-request accounting and composition
   dsh-plugin-mobile/          Phone-viewport ergonomics for the Web shell
   dsh-plugin-logo/            Custom Mon3tr brand mark and name
   dsh-plugin-image-model/     Image-generation endpoints as selectable models
@@ -62,6 +64,7 @@ tests/
   dsh-scheduler-smoke.mjs     Scheduler math, routes, run-now, and panel contract test
   dsh-computer-use-smoke.mjs  Desktop tools: wire encoding, key mapping, tree render, live handshakes
   dsh-session-repair-smoke.mjs Session repair: core repair passes, real decoder cross-check, host routes
+  dsh-usage-smoke.mjs         Usage dashboard: collector exactness, host routes, client contract
 ```
 
 ## Plugin Structure
@@ -170,6 +173,15 @@ Important context behavior:
 - `lib/client.js`: registers one entry in the `conversation.session.header.actions` list slot at `order: -9`, so the chip renders immediately after the agent-preset label (`order: -10`) and ahead of the interactive entries (`subagent-catalog` 10, `job-list` 20). Negative orders are the contract's reserved band for static session context, which is what an id is. The chip displays the id's distinguishing head (`session-` stripped, first 8 characters), carries the full id in `title`/`aria-label`/`data-dsh-session-id`, and copies the **full** id on click (async clipboard, hidden-textarea fallback).
 - `package.json`: Web runtime/locale/conversation client injection and package exports.
 - Purpose is diagnosis: the session id ties a UI symptom to durable evidence (session logs, `compartments` rows, Dreamer notices) and is otherwise only visible in the URL.
+
+### `dsh-plugin-usage`
+
+- `lib/collect.js`: pure core. `assistant/message` events carry the exact per-request usage (`inputTokens` is uncached input, `totalTokens` = input + cacheRead + output); `request/header` carries the assembled system prompt and tool definitions; message events carry the conversation material. The composition estimate buckets message characters by `source.kind` with a CJK-aware heuristic (CJK ≈ 0.85 tokens/char, other ≈ 3.8 chars/token) and normalizes the shares to the last request's exact `totalTokens`. Tool-result rows are bucketed by row type, not envelope role: some envelopes carry `role: "user"`. Spliced inserts and their surface rows share a message id, so counting happens on the spliced row and the id set dedupes.
+- `lib/index.js`: `GET /usage/overview?cwd=` (summary row per session) and `GET /usage/session?id=&cwd=` (full detail). Parsed logs are cached in memory keyed by path and invalidated by (mtimeMs, size); the cache entry must actually carry the stat pair (a version that stored `{header, collected}` alone missed on every request and re-scanned 4 s per call). zstd through the CLI, as in session-repair.
+- `lib/client.js`: session-header trigger plus a fixed panel with three tabs — composition (exact totals + estimated category bar/table with the deviation note), requests (exact per-request rows with full/partial prefix-rewrite flags: a later request with `cacheReadTokens === 0` is a full rewrite; under 50% of the previous context above 20k is a suspected rewrite), and sessions (workspace overview, click to copy the id). Polls the detail route every 15 s while open. The panel paints `--dsw-alias-bg-layer-1`, never `--dsw-alias-bg-base`.
+- `package.json`: Web runtime/locale/conversation/primitives client injection and package exports.
+- `jsx(Component)` without a second argument crashes the jsx runtime with `Cannot read properties of undefined (reading 'key')` and the slot host marks the entry abdicated — always pass `{}`.
+- See `docs/usage-dashboard.md`.
 
 ### `dsh-plugin-mobile`
 
@@ -316,7 +328,7 @@ Other useful context tests:
 - `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
 - `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, `dsh-image-model-smoke.mjs`, `dsh-scheduler-smoke.mjs`, or `dsh-computer-use-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one. `dsh-computer-use-smoke.mjs` includes two live checks that skip cleanly when their socket is absent: a raw Wayland handshake against the real compositor and an AT-SPI dump against the session bus.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-usage-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, `dsh-image-model-smoke.mjs`, `dsh-scheduler-smoke.mjs`, or `dsh-computer-use-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one. `dsh-computer-use-smoke.mjs` includes two live checks that skip cleanly when their socket is absent: a raw Wayland handshake against the real compositor and an AT-SPI dump against the session bus.
 
 ## Git and Editing Rules
 
