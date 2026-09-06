@@ -369,7 +369,17 @@ S(t) = I₀ · (1 + α·ln(1+k)) · exp(−(ln2/τ_eff)·Δt)
 
 ### 4.7 Dreamer（后台记忆整理者）
 
-一个低频率的后台 LLM 循环，负责把散落的会话产物沉淀为项目级记忆。
+一次维护 pass = 一个真实子会话。每次 pass 相互独立——后一次不继承前一次的对话上下文，跨 pass 的状态只存在于 context database（memories、session_facts、compartments、provenance）。
+
+**会话承载（`lib/dreamer-session.js`，默认 `dreamerMode: "session"`）**
+
+1. 触发后引擎在 parent 的 subagent catalog 下创建子会话：`agents.create({sessionId: "session-dream-*", meta: {cwd, parentSession, origin: "subagent", agentPreset: "dream"}})`，并 append 一条 `subagent/descriptor`（version 3 / one-shot / label "Dreamer pass"）——catalog 的 identity projection 靠这条事件折叠出可见行，没有它子会话在 catalog 里不可见。
+2. 子会话挂载专用 **dream agent 预设**（`preset/dream/`，由预设安装脚本与 context-compact 一起安装）：只挂 `dsh-magic-context/dream-agent` 注册器——它把只读维护工具注册进宿主 `tools` registry（executor 与旧 loop 共享，workspace/scope 在每次执行时从 `exec.agent.session` 解析），并接入宿主 `sessions` 服务——`session_context` 因此能读**驻留内存**的来源会话（通常是触发方父会话），仍受 workspace scope 校验与有界读取约束；非驻留来源一律降级为已持久化的 fact/compartment summary（live-only 语义与旧 loop 相同），外加 Dreamer 指令 section。**预设刻意不挂 compaction 组**：dream pass 无法压缩，上下文超限直接失败，这是"单次 pass 负载过重、应缩减 brief/源区间"的设计信号，而不是要用摘要掩盖的状态。
+3. 引擎通过 `sessionController.agents.selectForNextRequest(child, resolveCallConfig({provider, model}))` 在子会话上提交 Dreamer 模型路由（session-local selection 事件；解析失败则回落部署默认路由，不中止 pass），然后以素材 brief 作为首条 user 消息 `followup()`，`whenIdle()` 等待结束，超时 `cancel({kind:"parent"})`。
+4. 结束后从子会话原生日志读回结果：最后一次 `assistant/message` 的文本是 verdict，`tool/call`/`tool/result` 配对成动作列表（与旧 loop 同一形状），settled pass 给本批待校验记忆盖 `verified_at`。随后 `handle.dispose()` 释放子 Agent。
+5. 父会话只保留一条 model-invisible activity row（含子会话 id、步数与 verdict 摘要）；完整工具轨迹通过父会话的 subagent catalog 查看。子会话 id 固定 `session-dream-` 前缀，profile 预设的 `sessionFilter.excludeSessionIdPrefixes` 同时排除它与 scheduler 前缀，dream 子会话永不进入记忆管线。
+
+**兜底**：`dream` 预设未安装时引擎回落到旧的进程内辅助 loop；`dreamerMode: "loop"` 强制始终走旧 loop（`ctx.llm.streamAux()`，无 agent/会话，同下面描述的工具与预算语义）。
 
 **职责**
 
@@ -410,7 +420,7 @@ FROM compartments WHERE has_promoted_facts = 0 ORDER BY created_at;
 
 主 Agent 的 `context-tool-guidance` system-prompt section 明确指导：不需要或过时的段落用 `ctx_reduce`；写入记忆前先 `ctx_search`，重复则 `ctx_memory` update、陈旧则 delete、确认无重复/陈旧后再 write；需要记忆全文时用 `ctx_search`（含归档行）；需要段落原文时用 `ctx_expand`。
 
-**循环实现**：插件内自建轻量 loop（不走 DSH agent/deriveMessages，不占段落号）：system（角色 + schema + 工具说明）+ 素材初始消息 → `ctx.llm.stream` → 解析 tool_calls → 执行 → 结果回填 → 直到无 tool_calls 或轮次上限（默认 20）/总超时（默认 10 分钟）。进程级 single-flight（同时只跑一个 Dreamer）。Dreamer 是辅助 LLM 调用，路由默认跟随会话（或配置 provider/model）。
+**循环实现（旧 loop，现为 `dreamerMode: "loop"` 兜底路径）**：插件内自建轻量 loop（不走 DSH agent/deriveMessages，不占段落号）：system（角色 + schema + 工具说明）+ 素材初始消息 → `ctx.llm.stream` → 解析 tool_calls → 执行 → 结果回填 → 直到无 tool_calls 或轮次上限（默认 20）/总超时（默认 10 分钟）。进程级 single-flight（同时只跑一个 Dreamer）。Dreamer 是辅助 LLM 调用，路由默认跟随会话（或配置 provider/model）。session 模式同样受 single-flight 约束，工具 executor 由 `createDreamerExecutors()` 与旧 loop 共享。
 
 **来源上下文**：Organizer 首次读取原始会话后，facts/compartments 保留来源 session 与事件范围；直接通过 `ctx_memory` 写入的 memory 也保存当前 session/turn 来源。Dreamer 可用 `session_context` 在当前 workspace scope 内有界读取这些原始事件，用于判断用户明确指令和事实证据；来源 session 不可用时回退到已持久化的 fact/summary，不猜测缺失 provenance。
 

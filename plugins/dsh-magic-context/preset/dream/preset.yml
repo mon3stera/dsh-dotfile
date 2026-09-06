@@ -1,0 +1,3 @@
+name: Dreamer
+description: Background memory maintainer for dsh-magic-context — one child session per pass, read-only maintenance tools, no compaction.
+order: 6

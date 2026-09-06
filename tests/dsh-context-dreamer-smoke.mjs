@@ -1,8 +1,11 @@
 // dsh-magic-context Dreamer smoke test: internal tools, loop against a mock
-// LLM, and the archival code path.
+// LLM, the archival code path, the dream agent-plane registrar, and the
+// per-pass child-session driver.
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runDreamer, runArchival, createDreamerTools, buildDreamerBrief, summarizeDreamerActions } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/dreamer.js";
+import { runDreamerSession } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/dreamer-session.js";
+import { apply as applyDreamAgent } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/dream-agent.js";
 import { openDatabase } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/db.js";
 
 let failed = 0;
@@ -59,7 +62,7 @@ try {
 	check("promoted fact provenance", cdb.memoryById(promoted.id).source_session_id === "s");
 	const duplicateFact = cdb.insertFact({ sessionId: "s", scopePath: workspace, fact: "auth still uses TOKEN_TTL 3600s", importance: 4 });
 	check("discard_fact", (await run("discard_fact", { factId: duplicateFact })).ok === true && cdb.db.prepare("SELECT status FROM session_facts WHERE id = ?").get(duplicateFact).status === "discarded");
-	check("discard_fact rejects promoted", (() => { try { run("discard_fact", { factId }); return false; } catch { return true; } })());
+	check("discard_fact rejects promoted", await run("discard_fact", { factId }).then(() => false, () => true));
 	const c1 = cdb.insertCompartment({ sessionId: "s", scopePath: workspace, generation: 1, startSeq: 1, endSeq: 5, startPara: 1, endPara: 5, summary: "x".repeat(20000) });
 	cdb.setCompartmentStatus(c1, "ready");
 	cdb.markCompartmentLanded(c1, 42);
@@ -120,6 +123,190 @@ try {
 	// skipped when no material
 	const skipped = await runDreamer(fakeCtx, cdb, { provider: "p", model: "m", workspaceRoot: workspace, maxRounds: 5, timeoutMs: 5000, verifyIntervalDays: 30 });
 	check("dreamer skips empty", skipped.skipped === true);
+
+	// ── dream agent-plane registrar ─────────────────────────────────────────
+	// The dream-agent row registers the ten maintenance tools into the host
+	// registry and resolves workspace/scope from the executing agent at call
+	// time. Its database connection must land in DSH_HOME, which this test
+	// pins to the temporary home so the real deployment is never touched.
+	process.env.DSH_HOME = home;
+	const registeredTools = new Map();
+	const promptSections = [];
+	const disposers = [];
+	// A fake resident session (the "parent" that triggered the pass) exposed
+	// through the fake host sessions service, so the registry tools can read
+	// provenance sources like the legacy loop does.
+	const residentSession = {
+		id: "s2",
+		header: { cwd: workspace },
+		events: [
+			{ seq: 1, type: "user/message", data: { content: [{ type: "text", text: "The parent session states this convention explicitly." }] } },
+		],
+		deriveEventMessage: (event) => event.type === "user/message" ? { role: "user", content: event.data.content } : null,
+	};
+	const hostSessions = { get: (id) => id === "s2" ? residentSession : undefined };
+	applyDreamAgent({
+		tools: { register: (tool) => registeredTools.set(tool.name, tool) },
+		systemPrompt: { section: (section) => promptSections.push(section) },
+		inject: (serviceNames, callback) => {
+			callback({ sessions: serviceNames.includes("sessions") ? hostSessions : {} });
+		},
+		effect: (fn) => {
+			disposers.push(fn);
+			return fn;
+		},
+	});
+	check("dream agent registers eleven tools", registeredTools.size === 11 && ["sql_query", "session_context", "fs_list", "fs_read", "fs_grep", "memory_write", "memory_update", "memory_archive", "promote_fact", "compartment_mark"].every((name) => registeredTools.has(name)));
+	check("dream agent registers instruction section", promptSections.some((section) => section.name === "dreamer:instruction" && section.text.includes("You are Dreamer")));
+	const childExec = { agent: { session: { id: "dream-child", header: { cwd: workspace } } } };
+	const agentFsList = await registeredTools.get("fs_list").execute({ path: "." }, childExec);
+	check("dream agent resolves workspace from exec", agentFsList.map((entry) => entry.name).includes("src"));
+	const sourceRead = await registeredTools.get("session_context").execute({ sessionId: "s2" }, childExec);
+	check("dream agent reads a resident source session", sourceRead.available === true && JSON.stringify(sourceRead).includes("parent session states this convention"));
+	const missingRead = await registeredTools.get("session_context").execute({ sessionId: "session-gone" }, childExec);
+	check("dream agent degrades on non-resident source", missingRead.available === false && missingRead.error.includes("not live"));
+	const agentWrite = await registeredTools.get("memory_write").execute({ category: "CONVENTIONS", summary: "dream agent write", content: "from registry", importance: 4 }, childExec);
+	check("dream agent write reaches the database", typeof agentWrite.id === "number" && cdb.memoryById(agentWrite.id) !== undefined);
+	for (const dispose of disposers) dispose();
+	check("dream agent disposes its database", (() => { try { cdb.db.prepare("SELECT 1").get(); return true; } catch { return false; } })());
+
+	// ── session-mode driver: one child session per pass ─────────────────────
+	// A scripted child agent plays the dream pass; the fake host services
+	// verify the attachment mechanics and lifecycle the design depends on.
+	cdb.insertFact({ sessionId: "s", scopePath: workspace, fact: "dreamer runs as a child session", importance: 5 });
+	const driverFact = cdb.pendingFacts().at(-1);
+	const scriptedEvents = [];
+	const makeChildAgent = (childId, behavior) => {
+		const agent = {
+			session: {
+				id: childId,
+				header: { cwd: workspace, parentSession: "s", origin: "subagent" },
+				append: (type, data) => {
+					scriptedEvents.push({ type, data });
+					return scriptedEvents.length;
+				},
+				snapshotEvents: () => [...scriptedEvents],
+			},
+			followup: (message) => {
+				scriptedEvents.push({ type: "user/message", data: { content: message.content } });
+				for (const event of behavior.turn ?? []) scriptedEvents.push(event);
+			},
+			whenIdle: () => behavior.whenIdle(),
+			cancel: () => {
+				agent.cancelled = true;
+				behavior.onCancel?.();
+			},
+		};
+		return agent;
+	};
+	const createdChildren = [];
+	const selectedRoutes = [];
+	let disposed = 0;
+	const fakeAgent = makeChildAgent("session-dream-test1", {
+		turn: [
+			{ type: "tool/call", data: { callId: "c1", name: "promote_fact", arguments: JSON.stringify({ factId: driverFact.id, category: "CONVENTIONS", summary: "child session pass", content: "one child per pass", importance: 5 }) } },
+			{ type: "tool/result", data: { message: { role: "tool", source: { kind: "tool", callId: "c1" }, content: [{ type: "text", text: '{"id":9}' }] } } },
+			{ type: "assistant/message", data: { message: { role: "assistant", content: [{ type: "text", text: "Promoted the pending fact. Done." }] } } },
+			{ type: "turn/end", data: { turn: 1, reason: "completed" } },
+		],
+		whenIdle: () => Promise.resolve(),
+	});
+	const fakeDeps = {
+		agents: {
+			create: async ({ sessionId, meta, setup }) => {
+				createdChildren.push({ sessionId, meta });
+				const childAgent = Object.create(fakeAgent);
+				childAgent.session = { ...fakeAgent.session, id: sessionId };
+				await setup({});
+				return { agent: childAgent, dispose: async () => { disposed += 1; } };
+			},
+		},
+		agentPresets: {
+			resolve: async (id) => {
+				if (id !== "dream") throw new Error(`unknown preset ${id}`);
+				return { id: "dream" };
+			},
+			mount: async () => {},
+		},
+		sessionController: { agents: { selectForNextRequest: (agent, selection) => selectedRoutes.push({ agentId: agent.session.id, selection }) } },
+		llm: { resolveCallConfig: async (config) => ({ ...config, maxTokens: 4096 }) },
+		cdb,
+	};
+	const passResult = await runDreamerSession(fakeDeps, {
+		parentAgent: { session: { id: "s" } },
+		provider: "p",
+		model: "m",
+		timeoutMs: 5000,
+		verifyIntervalDays: 30,
+		scopePath: workspace,
+		workspaceRoot: workspace,
+	});
+	const created = createdChildren.at(-1);
+	check("session pass creates a dream child", created !== undefined && created.sessionId.startsWith("session-dream-"));
+	check("child attaches to the parent catalog", created.meta.parentSession === "s" && created.meta.origin === "subagent" && created.meta.agentPreset === "dream");
+	check("child carries a catalog descriptor event", scriptedEvents.some((event) => event.type === "subagent/descriptor" && event.data.version === 3 && event.data.mode === "one-shot"));
+	check("child receives the material brief", scriptedEvents.some((event) => event.type === "user/message" && JSON.stringify(event.data.content).includes("PENDING SESSION FACTS")));
+	check("dreamer route committed on the child", selectedRoutes.some((row) => row.agentId === created.sessionId && row.selection.provider === "p" && row.selection.model === "m"));
+	check("session pass collects actions from the child log", passResult.actions.length === 1 && passResult.actions[0].name === "promote_fact" && passResult.actions[0].ok === true);
+	check("session pass extracts the verdict", passResult.settled === true && passResult.stopReason === "completed" && passResult.summary === "Promoted the pending fact. Done.");
+	/* The driver only records actions from the child log; execution happens
+	 * inside the child's real agent loop, which the scripted agent fakes. */
+	check("session pass leaves execution to the child agent", cdb.pendingFacts().length === 1);
+	check("session pass stamps verified memories", passResult.memories.every((memory) => cdb.memoryById(memory.id).archived === 1 || cdb.memoryById(memory.id).verified_at !== null));
+	check("session pass disposes the child", disposed === 1);
+
+	// cancelled pass: the timeout fires, the child is cancelled, and the pass
+	// reports unsettled without stamping verified memories.
+	cdb.insertFact({ sessionId: "s", scopePath: workspace, fact: "timeout probe fact", importance: 3 });
+	let releaseWhenIdle;
+	const slowAgent = makeChildAgent("session-dream-test2", {
+		turn: [],
+		whenIdle: () => new Promise((resolvePromise) => {
+			releaseWhenIdle = resolvePromise;
+		}),
+		onCancel: () => {
+			scriptedEvents.push({ type: "turn/end", data: { turn: 1, reason: "aborted" } });
+			releaseWhenIdle();
+		},
+	});
+	const slowDeps = {
+		...fakeDeps,
+		agents: {
+			create: async ({ sessionId, meta, setup }) => {
+				await setup({});
+				return { agent: slowAgent, dispose: async () => { disposed += 1; } };
+			},
+		},
+	};
+	const timedOut = await runDreamerSession(slowDeps, {
+		parentAgent: { session: { id: "s" } },
+		provider: "p",
+		model: "m",
+		timeoutMs: 30,
+		verifyIntervalDays: 30,
+		scopePath: workspace,
+		workspaceRoot: workspace,
+	});
+	check("session pass cancels on timeout", timedOut.cancelled === true && timedOut.settled === false && slowAgent.cancelled === true);
+
+	// no material: drain every source list (facts pending, memories not yet
+	// verified, compartments not distilled), then the driver must not spawn a
+	// child at all. The dream-agent section wrote one fresh unverified memory,
+	// which is why this drains memories too.
+	while (cdb.pendingFacts().length > 0) cdb.discardFact(cdb.pendingFacts()[0].id, workspace);
+	cdb.db.prepare("UPDATE memories SET verified_at = ?").run(Date.now());
+	const noMaterial = await runDreamerSession(fakeDeps, {
+		parentAgent: { session: { id: "s" } },
+		provider: "p",
+		model: "m",
+		timeoutMs: 5000,
+		verifyIntervalDays: 30,
+		scopePath: workspace,
+		workspaceRoot: workspace,
+	});
+	/* Only the first pass ran through the recording fake create; the timeout
+	 * pass used its own closure and the skip pass spawned nothing. */
+	check("session pass skips without material", noMaterial.skipped === true && createdChildren.length === 1);
 
 	cdb.close();
 } finally {

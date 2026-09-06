@@ -170,6 +170,11 @@
           minSurfaceEvents: 4
           excludeSessionIdPrefixes:
             - session-sched-
+            # Per-pass Dreamer child sessions: the driver spawns one per pass,
+            # each named session-dream-*. They carry no engine of their own,
+            # but the prefix keeps them out of the shared memory pipeline even
+            # if a future composition mounts one.
+            - session-dream-
           # excludeCwdGlobs: ["/tmp/**"]
           # includeCwdGlobs: []
           # respectArchived: true

@@ -1,0 +1,36 @@
+# The `dream` agent preset: one Dreamer maintenance pass per child session.
+#
+# The engine's session-mode driver spawns a child under the parent's subagent
+# catalog for every pass, sends the material brief as the first user message,
+# and reads the verdict plus every tool action back from the child's native
+# log. Passes are independent — the only cross-pass state is the context
+# database — so each child starts empty and stays disposable.
+#
+# What this composition deliberately does NOT mount matters as much as what it
+# does:
+# - NO compaction group (no dsh-magic-context/engine, no compaction-basic, no
+#   command-compact): a dream pass cannot compact. Context overflow fails the
+#   pass loudly, which is the designed signal that a pass is too heavy and its
+#   brief or source ranges must shrink — not a condition to hide behind a
+#   silent summary.
+# - NO shell, no general filesystem tools, no delegation, no web, no goals:
+#   the tool surface below is the whole capability set, and every write goes
+#   through a purpose-built, schema-validated maintenance tool.
+#
+# The `dream-agent` row registers the ten maintenance tools
+# (sql_query/session_context/fs_list/fs_read/fs_grep/memory_write/
+# memory_update/memory_archive/promote_fact/discard_fact/compartment_mark)
+# into this preset's registry layer plus the Dreamer instruction section.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: >-
+      You are Dreamer, the background memory maintainer for this workspace. Your working directory is {{cwd}}. Work through the provided material lists using the maintenance tools, then finish with a plain-text summary of what you changed.
+
+# ── maintenance tools ───────────────────────────────────────────────────────
+
+- id: dream-agent
+  name: dsh-magic-context/dream-agent

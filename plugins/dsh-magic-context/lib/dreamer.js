@@ -138,267 +138,308 @@ async function grepTree(root, pattern, start, maxMatches = MAX_GREP_MATCHES) {
 	return matches;
 }
 
-/** Build the Dreamer's internal tool set. */
-export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = {}, sessions, currentSession } = {}) {
-	const root = resolve(workspaceRoot ?? process.cwd());
-	const resolveSession = (sessionId) => {
+/**
+ * Build the Dreamer's raw executor map, shared by the legacy in-loop tool set
+ * and the dream agent-plane registry tools.
+ *
+ * `getEnv()` is called at every execution: the legacy loop closes over one
+ * static environment, while a dream child session resolves workspace root,
+ * memory scope, and source sessions from the executing agent at runtime.
+ * @param cdb - context database.
+ * @param getEnv - returns { workspaceRoot, scopePath, retrieval, sessions, currentSession }.
+ */
+export function createDreamerExecutors(cdb, getEnv = () => ({})) {
+	const env = (exec) => {
+		const resolved = getEnv(exec) ?? {};
+		return {
+			workspaceRoot: resolve(resolved.workspaceRoot ?? process.cwd()),
+			scopePath: resolved.scopePath,
+			retrieval: resolved.retrieval ?? {},
+			sessions: resolved.sessions,
+			currentSession: resolved.currentSession,
+		};
+	};
+	const resolveSession = (sessionId, exec) => {
 		if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+		const { sessions, currentSession } = env(exec);
 		if (currentSession?.id === sessionId) return currentSession;
 		return typeof sessions?.get === "function" ? sessions.get(sessionId) : undefined;
 	};
-	const byName = new Map();
-	const add = (tool) => {
-		byName.set(tool.name, tool);
-		return tool;
-	};
-	const tools = [
-		add({
-			name: "sql_query",
-			description: "Run a READ-ONLY SQL SELECT against the context database (tables: memories, session_facts, compartments, paragraphs, skip_marks).",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: { sql: { type: "string" } },
-				required: ["sql"],
-			},
-			async execute(args) {
-				const sql = typeof args.sql === "string" ? args.sql.trim() : "";
-				if (!/^SELECT\b/i.test(sql) || sql.includes(";") || /\bload_extension\s*\(/i.test(sql)) {
-					throw new Error("sql_query only accepts one SELECT statement");
-				}
-				const rows = cdb.db.prepare(sql).all();
-				return rows.slice(0, MAX_SQL_ROWS);
-			},
-		}),
-		add({
-			name: "session_context",
-			description: "Read a bounded slice of original records from a source session or compartment in the current workspace. Use this before verifying source-backed memories or promoting facts.",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					sessionId: { type: "string" },
-					compartmentId: { type: "number" },
-					startSeq: { type: "number" },
-					endSeq: { type: "number" },
-					maxEvents: { type: "number" },
-					maxChars: { type: "number" },
-				},
-			},
-			async execute(args) {
-				let sessionId = args.sessionId;
-				let startSeq = args.startSeq;
-				let endSeq = args.endSeq;
-				if (args.compartmentId !== undefined) {
-					if (!Number.isSafeInteger(args.compartmentId) || args.compartmentId < 1) throw new Error("compartmentId must be a positive safe integer");
-					const compartment = cdb.compartmentById(args.compartmentId);
-					if (compartment === undefined || (scopePath !== undefined && compartment.scope_path !== scopePath)) {
-						throw new Error(`compartment ${args.compartmentId} does not exist in this workspace`);
-					}
-					if (sessionId !== undefined && sessionId !== compartment.session_id) throw new Error("sessionId does not match compartment source");
-					sessionId = compartment.session_id;
-					startSeq = compartment.start_seq;
-					endSeq = compartment.end_seq;
-				}
-				sessionId ??= currentSession?.id;
-				const session = resolveSession(sessionId);
-				if (session === undefined) return { available: false, sessionId, error: "source session is not live; use the stored fact or compartment summary" };
-				if (scopePath !== undefined && sessionMemoryScope(session) !== scopePath) throw new Error("source session does not belong to this workspace");
-				return { available: true, ...readSessionContext(session, { startSeq, endSeq, maxEvents: args.maxEvents, maxChars: args.maxChars }) };
-			},
-		}),
-		add({
-			name: "fs_list",
-			description: "List one directory under the workspace root.",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: { path: { type: "string" } },
-				required: ["path"],
-			},
-			execute: (args) => listDir(root, args.path ?? "."),
-		}),
-		add({
-			name: "fs_read",
-			description: "Read one text file under the workspace root (truncated at 64KB).",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: { path: { type: "string" } },
-				required: ["path"],
-			},
-			execute: (args) => readText(root, args.path),
-		}),
-		add({
-			name: "fs_grep",
-			description: "Case-insensitive regex search across the workspace tree (skips node_modules/.git), returning file:line matches.",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					pattern: { type: "string" },
-					path: { type: "string" },
-					maxMatches: { type: "number" },
-				},
-				required: ["pattern"],
-			},
-			execute: (args) => grepTree(root, args.pattern, args.path ?? ".", args.maxMatches),
-		}),
-		add({
-			name: "memory_write",
-			description: "Write a new project memory only when no live row covers the fact. Prefer memory_update on a duplicate, or discard_fact when a pending fact is redundant.",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					category: { type: "string", enum: ["ARCHITECTURE", "CONSTRAINTS", "CONVENTIONS", "PREFERENCES", "ENVIRONMENT"] },
-					summary: { type: "string" },
-					content: { type: "string" },
-					importance: { type: "number" },
-				},
-				required: ["category", "summary", "content", "importance"],
-			},
-			async execute(args) {
-				if (args.category !== "PREFERENCES" && typeof scopePath !== "string") throw new Error("project memory write requires a session workspace scope");
-				const id = cdb.writeMemory({ ...args, scopePath });
-				if (retrieval.embedding !== undefined && cdb.vecEnabled) {
-					try {
-						const vector = await retrieval.embedding.embed(args.summary);
-						cdb.setEmbedding(id, vector);
-					} catch {
-						// best-effort
-					}
-				}
-				return { id };
-			},
-		}),
-		add({
-			name: "memory_update",
-			description: "Update fields of an existing memory (category/summary/content/importance/archived).",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					id: { type: "number" },
-					category: { type: "string", enum: ["ARCHITECTURE", "CONSTRAINTS", "CONVENTIONS", "PREFERENCES", "ENVIRONMENT"] },
-					summary: { type: "string" },
-					content: { type: "string" },
-					importance: { type: "number" },
-					archived: { type: "boolean" },
-				},
-				required: ["id"],
-			},
-			async execute(args) {
-				if (cdb.memoryById(args.id, scopePath) === undefined) throw new Error(`memory ${args.id} does not exist in this workspace`);
-				const fields = { ...args };
-				delete fields.id;
-				if (fields.archived !== undefined) fields.archived = fields.archived ? 1 : 0;
-				if (fields.archived !== 1) fields.verified_at = Date.now();
-				const changed = cdb.updateMemory(args.id, fields, scopePath);
-				if (!changed) throw new Error(`memory ${args.id} does not exist`);
-				if (fields.summary !== undefined && retrieval.embedding !== undefined && cdb.vecEnabled) {
-					cdb.removeEmbedding(args.id);
-					try {
-						const vector = await retrieval.embedding.embed(cdb.memoryById(args.id).summary);
-						cdb.setEmbedding(args.id, vector);
-					} catch {
-						// FTS remains available when a corrected summary cannot be embedded.
-					}
-				}
-				return { ok: true };
-			},
-		}),
-		add({
-			name: "memory_archive",
-			description: "Archive (retire) an outdated memory; it stops being injected but stays searchable.",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: { id: { type: "number" } },
-				required: ["id"],
-			},
-			execute(args) {
-				if (cdb.memoryById(args.id, scopePath) === undefined) throw new Error(`memory ${args.id} does not exist in this workspace`);
-				const changed = cdb.updateMemory(args.id, { archived: 1 }, scopePath);
-				if (!changed) throw new Error(`memory ${args.id} does not exist`);
-				return { ok: true };
-			},
-		}),
-		add({
-			name: "promote_fact",
-			description: "Promote one pending session fact into a NEW project memory. If the fact duplicates a live memory, call discard_fact instead.",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					factId: { type: "number" },
-					category: { type: "string", enum: ["ARCHITECTURE", "CONSTRAINTS", "CONVENTIONS", "PREFERENCES", "ENVIRONMENT"] },
-					summary: { type: "string" },
-					content: { type: "string" },
-					importance: { type: "number" },
-				},
-				required: ["factId", "category", "summary", "content", "importance"],
-			},
-			async execute(args) {
-				const id = cdb.promoteFactToMemory({
-					factId: args.factId,
-					scopePath,
-					category: args.category,
-					summary: args.summary,
-					content: args.content,
-					importance: args.importance,
-				});
-				if (retrieval.embedding !== undefined && cdb.vecEnabled) {
-					try {
-						const vector = await retrieval.embedding.embed(args.summary);
-						cdb.setEmbedding(id, vector);
-					} catch {
-						// best-effort; the promoted memory remains FTS-searchable
-					}
-				}
-				return { id };
-			},
-		}),
-		add({
-			name: "discard_fact",
-			description: "Discard one pending session fact without creating a memory. Use this for one-off details and for facts that duplicate or are superseded by an existing live memory.",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: { factId: { type: "number" } },
-				required: ["factId"],
-			},
-			execute(args) {
-				cdb.discardFact(args.factId, scopePath);
-				return { ok: true };
-			},
-		}),
-		add({
-			name: "compartment_mark",
-			description: "Mark a compartment: processed=true after its facts are distilled, and/or archive=true to recommend archival (priority 1 distilled, 2 low importance, 3 old).",
-			parameters: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					compartmentId: { type: "number" },
-					processed: { type: "boolean" },
-					archive: { type: "boolean" },
-					importance: { type: "number" },
-				},
-				required: ["compartmentId"],
-			},
-			execute(args) {
+	return {
+		async sql_query(args) {
+			const sql = typeof args.sql === "string" ? args.sql.trim() : "";
+			if (!/^SELECT\b/i.test(sql) || sql.includes(";") || /\bload_extension\s*\(/i.test(sql)) {
+				throw new Error("sql_query only accepts one SELECT statement");
+			}
+			const rows = cdb.db.prepare(sql).all();
+			return rows.slice(0, MAX_SQL_ROWS);
+		},
+		async session_context(args, exec) {
+			const { scopePath, currentSession } = env(exec);
+			let sessionId = args.sessionId;
+			let startSeq = args.startSeq;
+			let endSeq = args.endSeq;
+			if (args.compartmentId !== undefined) {
+				if (!Number.isSafeInteger(args.compartmentId) || args.compartmentId < 1) throw new Error("compartmentId must be a positive safe integer");
 				const compartment = cdb.compartmentById(args.compartmentId);
-				if (compartment === undefined || (scopePath !== undefined && compartment.scope_path !== scopePath)) throw new Error(`compartment ${args.compartmentId} does not exist in this workspace`);
-				if (args.processed === true) cdb.markCompartmentPromoted(args.compartmentId);
-				if (args.archive === true || args.importance !== undefined) {
-					cdb.flagCompartmentArchive(args.compartmentId, args.importance);
+				if (compartment === undefined || (scopePath !== undefined && compartment.scope_path !== scopePath)) {
+					throw new Error(`compartment ${args.compartmentId} does not exist in this workspace`);
 				}
-				return { ok: true };
+				if (sessionId !== undefined && sessionId !== compartment.session_id) throw new Error("sessionId does not match compartment source");
+				sessionId = compartment.session_id;
+				startSeq = compartment.start_seq;
+				endSeq = compartment.end_seq;
+			}
+			sessionId ??= currentSession?.id;
+			const session = resolveSession(sessionId, exec);
+			if (session === undefined) return { available: false, sessionId, error: "source session is not live; use the stored fact or compartment summary" };
+			if (scopePath !== undefined && sessionMemoryScope(session) !== scopePath) throw new Error("source session does not belong to this workspace");
+			return { available: true, ...readSessionContext(session, { startSeq, endSeq, maxEvents: args.maxEvents, maxChars: args.maxChars }) };
+		},
+		async fs_list(args, exec) {
+			return listDir(env(exec).workspaceRoot, args.path ?? ".");
+		},
+		async fs_read(args, exec) {
+			return readText(env(exec).workspaceRoot, args.path);
+		},
+		async fs_grep(args, exec) {
+			return grepTree(env(exec).workspaceRoot, args.pattern, args.path ?? ".", args.maxMatches);
+		},
+		async memory_write(args, exec) {
+			const { scopePath, retrieval } = env(exec);
+			if (args.category !== "PREFERENCES" && typeof scopePath !== "string") throw new Error("project memory write requires a session workspace scope");
+			const id = cdb.writeMemory({ ...args, scopePath });
+			if (retrieval.embedding !== undefined && cdb.vecEnabled) {
+				try {
+					const vector = await retrieval.embedding.embed(args.summary);
+					cdb.setEmbedding(id, vector);
+				} catch {
+					// best-effort
+				}
+			}
+			return { id };
+		},
+		async memory_update(args, exec) {
+			const { scopePath, retrieval } = env(exec);
+			if (cdb.memoryById(args.id, scopePath) === undefined) throw new Error(`memory ${args.id} does not exist in this workspace`);
+			const fields = { ...args };
+			delete fields.id;
+			if (fields.archived !== undefined) fields.archived = fields.archived ? 1 : 0;
+			if (fields.archived !== 1) fields.verified_at = Date.now();
+			const changed = cdb.updateMemory(args.id, fields, scopePath);
+			if (!changed) throw new Error(`memory ${args.id} does not exist`);
+			if (fields.summary !== undefined && retrieval.embedding !== undefined && cdb.vecEnabled) {
+				cdb.removeEmbedding(args.id);
+				try {
+					const vector = await retrieval.embedding.embed(cdb.memoryById(args.id).summary);
+					cdb.setEmbedding(args.id, vector);
+				} catch {
+					// FTS remains available when a corrected summary cannot be embedded.
+				}
+			}
+			return { ok: true };
+		},
+		async memory_archive(args, exec) {
+			const { scopePath } = env(exec);
+			if (cdb.memoryById(args.id, scopePath) === undefined) throw new Error(`memory ${args.id} does not exist in this workspace`);
+			const changed = cdb.updateMemory(args.id, { archived: 1 }, scopePath);
+			if (!changed) throw new Error(`memory ${args.id} does not exist`);
+			return { ok: true };
+		},
+		async promote_fact(args, exec) {
+			const { scopePath, retrieval } = env(exec);
+			const id = cdb.promoteFactToMemory({
+				factId: args.factId,
+				scopePath,
+				category: args.category,
+				summary: args.summary,
+				content: args.content,
+				importance: args.importance,
+			});
+			if (retrieval.embedding !== undefined && cdb.vecEnabled) {
+				try {
+					const vector = await retrieval.embedding.embed(args.summary);
+					cdb.setEmbedding(id, vector);
+				} catch {
+					// best-effort; the promoted memory remains FTS-searchable
+				}
+			}
+			return { id };
+		},
+		async discard_fact(args, exec) {
+			cdb.discardFact(args.factId, env(exec).scopePath);
+			return { ok: true };
+		},
+		async compartment_mark(args, exec) {
+			const { scopePath } = env(exec);
+			const compartment = cdb.compartmentById(args.compartmentId);
+			if (compartment === undefined || (scopePath !== undefined && compartment.scope_path !== scopePath)) throw new Error(`compartment ${args.compartmentId} does not exist in this workspace`);
+			if (args.processed === true) cdb.markCompartmentPromoted(args.compartmentId);
+			if (args.archive === true || args.importance !== undefined) {
+				cdb.flagCompartmentArchive(args.compartmentId, args.importance);
+			}
+			return { ok: true };
+		},
+	};
+}
+
+/**
+ * Shared tool schemas for the Dreamer maintenance tools: one shallow
+ * JSON-schema shape consumed as-is by the legacy in-loop runner and flattened
+ * by the dream agent-plane registrar for the registry.
+ */
+export const DREAM_TOOL_SCHEMAS = {
+	sql_query: {
+		description: "Run a READ-ONLY SQL SELECT against the context database (tables: memories, session_facts, compartments, paragraphs, skip_marks).",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: { sql: { type: "string" } },
+			required: ["sql"],
+		},
+	},
+	session_context: {
+		description: "Read a bounded slice of original records from a source session or compartment in the current workspace. Use this before verifying source-backed memories or promoting facts.",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: {
+				sessionId: { type: "string" },
+				compartmentId: { type: "number" },
+				startSeq: { type: "number" },
+				endSeq: { type: "number" },
+				maxEvents: { type: "number" },
+				maxChars: { type: "number" },
 			},
-		}),
-	];
+		},
+	},
+	fs_list: {
+		description: "List one directory under the workspace root.",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: { path: { type: "string" } },
+			required: ["path"],
+		},
+	},
+	fs_read: {
+		description: "Read one text file under the workspace root (truncated at 64KB).",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: { path: { type: "string" } },
+			required: ["path"],
+		},
+	},
+	fs_grep: {
+		description: "Case-insensitive regex search across the workspace tree (skips node_modules/.git), returning file:line matches.",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: {
+				pattern: { type: "string" },
+				path: { type: "string" },
+				maxMatches: { type: "number" },
+			},
+			required: ["pattern"],
+		},
+	},
+	memory_write: {
+		description: "Write a new project memory only when no live row covers the fact. Prefer memory_update on a duplicate, or discard_fact when a pending fact is redundant.",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: {
+				category: { type: "string", enum: ["ARCHITECTURE", "CONSTRAINTS", "CONVENTIONS", "PREFERENCES", "ENVIRONMENT"] },
+				summary: { type: "string" },
+				content: { type: "string" },
+				importance: { type: "number" },
+			},
+			required: ["category", "summary", "content", "importance"],
+		},
+	},
+	memory_update: {
+		description: "Update fields of an existing memory (category/summary/content/importance/archived).",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: {
+				id: { type: "number" },
+				category: { type: "string", enum: ["ARCHITECTURE", "CONSTRAINTS", "CONVENTIONS", "PREFERENCES", "ENVIRONMENT"] },
+				summary: { type: "string" },
+				content: { type: "string" },
+				importance: { type: "number" },
+				archived: { type: "boolean" },
+			},
+			required: ["id"],
+		},
+	},
+	memory_archive: {
+		description: "Archive (retire) an outdated memory; it stops being injected but stays searchable.",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: { id: { type: "number" } },
+			required: ["id"],
+		},
+	},
+	promote_fact: {
+		description: "Promote one pending session fact into a NEW project memory. If the fact duplicates a live memory, call discard_fact instead.",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: {
+				factId: { type: "number" },
+				category: { type: "string", enum: ["ARCHITECTURE", "CONSTRAINTS", "CONVENTIONS", "PREFERENCES", "ENVIRONMENT"] },
+				summary: { type: "string" },
+				content: { type: "string" },
+				importance: { type: "number" },
+			},
+			required: ["factId", "category", "summary", "content", "importance"],
+		},
+	},
+	discard_fact: {
+		description: "Discard one pending session fact without creating a memory. Use this for one-off details and for facts that duplicate or are superseded by an existing live memory.",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: { factId: { type: "number" } },
+			required: ["factId"],
+		},
+	},
+	compartment_mark: {
+		description: "Mark a compartment: processed=true after its facts are distilled, and/or archive=true to recommend archival (priority 1 distilled, 2 low importance, 3 old).",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: {
+				compartmentId: { type: "number" },
+				processed: { type: "boolean" },
+				archive: { type: "boolean" },
+				importance: { type: "number" },
+			},
+			required: ["compartmentId"],
+		},
+	},
+};
+
+/** Build the Dreamer's internal tool set for the legacy in-loop runner. */
+export function createDreamerTools(cdb, { workspaceRoot, scopePath, retrieval = {}, sessions, currentSession } = {}) {
+	const executors = createDreamerExecutors(cdb, () => ({ workspaceRoot, scopePath, retrieval, sessions, currentSession }));
+	const byName = new Map();
+	const tools = Object.entries(DREAM_TOOL_SCHEMAS).map(([toolName, schema]) => add(byName, {
+		name: toolName,
+		description: schema.description,
+		parameters: schema.parameters,
+		execute: executors[toolName],
+	}));
 	return { tools, byName };
+}
+
+/** Register one tool definition into a name map. */
+function add(byName, tool) {
+	byName.set(tool.name, tool);
+	return tool;
 }
 
 /** Material lists handed to the Dreamer as its first user message. */

@@ -25,6 +25,7 @@
   "exports": {
     ".": "./lib/index.js",
     "./engine": "./lib/engine-plugin.js",
+    "./dream-agent": "./lib/dream-agent.js",
     "./db": "./lib/db.js",
     "./settings": "./lib/settings.js",
     "./client": "./lib/client.js",

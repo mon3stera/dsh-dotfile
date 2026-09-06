@@ -35,6 +35,7 @@ import {
 	RerankClient,
 } from "./retrieval.js";
 import { buildDreamerBrief, DEFAULT_DREAMER_MAX_TOKENS, runArchival, runDreamer, summarizeDreamerActions } from "./dreamer.js";
+import { DreamPresetMissingError, runDreamerSession } from "./dreamer-session.js";
 import { recordActivity, settleActivity, startActivity } from "./notifications.js";
 import { mergeContextConfig, setSessionFilterSeed } from "./settings.js";
 import { clearContextUsage, setContextUsage } from "./usage.js";
@@ -89,6 +90,7 @@ const OWN_KEYS = new Set([
 	"dreamerIdleMinutes",
 	"dreamerMaxRounds",
 	"dreamerTimeoutMs",
+	"dreamerMode",
 	"verifyIntervalDays",
 	"compartmentBudgetTokens",
 	"dreamerProvider",
@@ -263,6 +265,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		dreamerIdleMinutes: z.number().step(1).min(1),
 		dreamerMaxRounds: z.number().step(1).min(1),
 		dreamerTimeoutMs: z.number().step(1).min(1000),
+		dreamerMode: z.string(),
 		verifyIntervalDays: z.number().step(1).min(1),
 		compartmentBudgetTokens: z.number().step(1).min(1),
 		dreamerProvider: z.string(),
@@ -343,6 +346,10 @@ export class ContextEngine extends BasicCompactionEngine {
 				idleMinutes: own.dreamerIdleMinutes ?? DEFAULT_DREAMER_IDLE_MINUTES,
 				maxRounds: own.dreamerMaxRounds ?? DEFAULT_DREAMER_MAX_ROUNDS,
 				timeoutMs: own.dreamerTimeoutMs ?? DEFAULT_DREAMER_TIMEOUT_MS,
+				// 'session' runs each pass as a child session of the parent (full
+				// native audit trail, subagent-catalog attachment); 'loop' keeps the
+				// legacy in-process auxiliary loop. Anything but 'loop' is 'session'.
+				mode: own.dreamerMode === "loop" ? "loop" : "session",
 				verifyIntervalDays: own.verifyIntervalDays ?? DEFAULT_VERIFY_INTERVAL_DAYS,
 				compartmentBudgetTokens: own.compartmentBudgetTokens ?? DEFAULT_COMPARTMENT_BUDGET_TOKENS,
 				provider: own.dreamerProvider ?? "",
@@ -363,6 +370,20 @@ export class ContextEngine extends BasicCompactionEngine {
 			});
 		} catch {
 			this._workspaceRegistry = undefined;
+		}
+		/* Session-mode Dreamer needs the host agent factory and preset service to
+		 * spawn per-pass child sessions; unavailable services fall back to the
+		 * legacy in-process loop. */
+		try {
+			ctx.inject?.(["agents", "agentPresets", "sessionController"], (hostCtx) => {
+				this._agents = hostCtx.agents;
+				this._agentPresets = hostCtx.agentPresets;
+				this._sessionController = hostCtx.sessionController;
+			});
+		} catch {
+			this._agents = undefined;
+			this._agentPresets = undefined;
+			this._sessionController = undefined;
 		}
 		ctx.effect(() => () => {
 			for (const timer of this.idleTimers.values()) clearTimeout(timer);
@@ -947,6 +968,27 @@ export class ContextEngine extends BasicCompactionEngine {
 		const activityId = this._activityStart(agent, "Context: Dreamer maintenance pass");
 		try {
 			const workspaceRoot = agent.session.header?.cwd;
+			const useSessionMode = dreamer.mode === "session" && this._agents !== undefined && this._agentPresets !== undefined;
+			if (useSessionMode) {
+				const result = await this._runDreamerSessionPass(agent, dreamer, target, { workspaceRoot, scopePath, material });
+				const archival = runArchival(this.cdb, { budgetTokens: dreamer.compartmentBudgetTokens });
+				this._activitySettle(
+					agent,
+					activityId,
+					result.settled ? "success" : "error",
+					[
+						`Pending facts: ${material.facts.length}; memories verified: ${material.memories.length}; compartments distilled: ${material.compartments.length}.`,
+						result.settled
+							? `Pass session: ${result.childSessionId} (${result.rounds} step${result.rounds === 1 ? "" : "s"}; full trace in the subagent catalog).`
+							: `Pass session ${result.childSessionId} did not settle${result.cancelled ? " (timed out)" : typeof result.stopReason === "string" ? ` (turn ended: ${result.stopReason}${result.error === undefined ? "" : `; ${describeAuxFailure(result.error)}`})` : ""}.`,
+						`Summary: ${summarizeDreamerActions(result.actions)}.`,
+						result.summary !== undefined && result.summary.length > 0 ? `Verdict: ${result.summary.slice(0, 500)}.` : "",
+						`Archived compartments: ${archival.archived.length}.`,
+					].filter((line) => line.length > 0).join("\n"),
+				);
+				return { ...result, archival };
+			}
+
 			const result = await runDreamer(this.ctx, this.cdb, {
 				agent,
 				provider: target.provider,
@@ -975,6 +1017,48 @@ export class ContextEngine extends BasicCompactionEngine {
 			);
 			return { ...result, archival };
 		} catch (error) {
+			const note = error instanceof DreamPresetMissingError
+				? " dream preset missing; falling back to the in-process loop"
+				: "";
+			if (error instanceof DreamPresetMissingError) {
+				try {
+					const result = await runDreamer(this.ctx, this.cdb, {
+						agent,
+						provider: target.provider,
+						model: target.model,
+						...(target.reasoningEffort === undefined ? {} : { reasoningEffort: target.reasoningEffort }),
+						maxTokens: dreamer.maxTokens,
+						sessions: this.ctx.sessions,
+						workspaceRoot: agent.session.header?.cwd,
+						scopePath,
+						maxRounds: dreamer.maxRounds,
+						timeoutMs: dreamer.timeoutMs,
+						verifyIntervalDays: dreamer.verifyIntervalDays,
+						retrieval: this.ownConfig.retrievalConfig,
+					});
+					const archival = runArchival(this.cdb, { budgetTokens: dreamer.compartmentBudgetTokens });
+					this._activitySettle(
+						agent,
+						activityId,
+						"success",
+						[
+							`Pending facts: ${material.facts.length}; memories verified: ${material.memories.length}; compartments distilled: ${material.compartments.length}.`,
+							`Completed ${result.rounds} round${result.rounds === 1 ? "" : "s"} (in-process fallback${note.trim()}).`,
+							`Summary: ${summarizeDreamerActions(result.actions)}.`,
+							`Archived compartments: ${archival.archived.length}.`,
+						].join("\n"),
+					);
+					return { ...result, archival };
+				} catch (fallbackError) {
+					this._activitySettle(
+						agent,
+						activityId,
+						"error",
+						`Dreamer failed during its background memory-maintenance pass: ${describeAuxFailure(fallbackError instanceof Error ? fallbackError.message : String(fallbackError))}`,
+					);
+					throw fallbackError;
+				}
+			}
 			this._activitySettle(
 				agent,
 				activityId,
@@ -985,6 +1069,30 @@ export class ContextEngine extends BasicCompactionEngine {
 		} finally {
 			this.dreamerBusy = false;
 		}
+	}
+
+	/** One session-mode Dreamer pass: a child session of `agent` on the dream preset. */
+	async _runDreamerSessionPass(agent, dreamer, target, { workspaceRoot, scopePath }) {
+		const llm = this.ctx.llm ?? this.ctx.get?.("llm");
+		return runDreamerSession(
+			{
+				agents: this._agents,
+				agentPresets: this._agentPresets,
+				sessionController: this._sessionController,
+				llm,
+				cdb: this.cdb,
+			},
+			{
+				parentAgent: agent,
+				provider: target.provider,
+				model: target.model,
+				...(target.reasoningEffort === undefined ? {} : { reasoningEffort: target.reasoningEffort }),
+				timeoutMs: dreamer.timeoutMs,
+				verifyIntervalDays: dreamer.verifyIntervalDays,
+				scopePath,
+				workspaceRoot,
+			},
+		);
 	}
 
 	/** Overflow / manual fallback: land a ready compartment or generate synchronously. */
