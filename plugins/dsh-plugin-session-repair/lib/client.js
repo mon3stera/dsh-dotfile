@@ -83,6 +83,8 @@ window.__ModuleLoader__.load({
       "checking": "检查中…",
       "cleanMsg": "未检测到 seq 损坏。若会话仍无法加载，请使用设置页的会话修复面板查看详情。",
       "damagedMsg": "检测到损坏：{gap}。预览：删除 {d} 条合成事件，修复后共 {e} 条事件。",
+      "containerMsg": "容器格式损坏（整份日志被压成了单帧），事件内容健康；将重新编码为两帧容器（frame1 = header，frame2 = 事件），内容零改动。",
+      "containerShort": "容器单帧",
       "repairedMsg": "修复完成：共 {e} 条事件，末尾 seq {l}。已备份原文件。刷新后重新打开此会话。",
       "restoreDone": "已从备份恢复。",
       "close": "关闭"
@@ -115,6 +117,8 @@ window.__ModuleLoader__.load({
       "checking": "Checking…",
       "cleanMsg": "No seq corruption detected. If the session still fails to load, use the Session repair section in Settings for details.",
       "damagedMsg": "Corruption detected: {gap}. Preview: would drop {d} synthetic events, {e} events after repair.",
+      "containerMsg": "Broken container framing (the whole log was compressed as one frame) while the event content is healthy; it will be re-encoded as a two-frame container (frame 1 = header, frame 2 = events) with the content untouched.",
+      "containerShort": "single-frame container",
       "repairedMsg": "Repaired: {e} events, last seq {l}. Original backed up. Refresh and reopen this session.",
       "restoreDone": "Restored from backup.",
       "close": "Close"
@@ -133,6 +137,13 @@ window.__ModuleLoader__.load({
     /** Format the gap description for one corrupted session. */
     function gapText(t, session) {
       if (session.error !== undefined) return session.error;
+
+      if (session.containerBroken === true) {
+        const gap = session.gap;
+        const seq = gap === null || gap === undefined ? "" : ` · seq ${gap.got === null ? "unparsable" : `expected ${gap.expected}, got ${gap.got}`}`;
+        return t("containerShort") + seq;
+      }
+
       const gap = session.gap;
       if (gap === null || gap === undefined) return "";
       if (gap.got === null) return `unparsable row at ${gap.row}`;
@@ -190,11 +201,13 @@ window.__ModuleLoader__.load({
         setBusy(true);
         setResult(null);
         post("/session-repair/repair", { dryRun: true })
-          .then((data) => setResult({
-            kind: "damaged",
-            data,
-            text: t("damagedMsg").replace("{gap}", gapLabel(data)).replace("{d}", data.passes.reduce((n, p) => n + p.dropped, 0)).replace("{e}", data.eventsAfter)
-          }))
+          .then((data) => setResult(data.recontainerizeOnly === true
+            ? { kind: "damaged", data, text: t("containerMsg") }
+            : {
+              kind: "damaged",
+              data,
+              text: t("damagedMsg").replace("{gap}", gapLabel(data)).replace("{d}", data.passes.reduce((n, p) => n + p.dropped, 0)).replace("{e}", data.eventsAfter)
+            }))
           .catch((error) => setResult(error.status === 409 ? { kind: "clean" } : { kind: "error", text: String(error?.message ?? error) }))
           .finally(() => setBusy(false));
       };

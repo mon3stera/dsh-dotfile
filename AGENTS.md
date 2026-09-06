@@ -25,6 +25,7 @@ docs/
   diff-viewer.md              Diff viewer routes, confinement, and baseline choice
   computer-use.md             Desktop tools: coordinate systems, pointer client, deployment
   session-repair.md           Session repair plugin behavior and companion data rules
+  session-framing-incident-2026-09-06.md  Incident report: single-frame container bricks boot
   session-seq-corruption-report.md  Upstream Discussion draft for the seq-collision corruption
   usage-dashboard.md          Usage dashboard: exact accounting, composition estimate, routes
   tool-gate.md                Progressive tool loading: restriction, catalog, expand
@@ -65,7 +66,7 @@ tests/
   dsh-image-model-smoke.mjs   Image adapter contract, prompt selection, admission limits
   dsh-scheduler-smoke.mjs     Scheduler math, routes, run-now, and panel contract test
   dsh-computer-use-smoke.mjs  Desktop tools: wire encoding, key mapping, tree render, live handshakes
-  dsh-session-repair-smoke.mjs Session repair: core repair passes, real decoder cross-check, host routes
+  dsh-session-repair-smoke.mjs Session repair: core repair passes, real decoder cross-check, host routes, container framing
   dsh-usage-smoke.mjs         Usage dashboard: collector exactness, host routes, client contract
   dsh-tool-gate-smoke.mjs     Tool gate: visible-deny math, expand transitions, lifecycle wiring
 ```
@@ -251,6 +252,8 @@ Important context behavior:
 
 - `lib/repair.js`: pure core. Rows are parsed from the decompressed JSONL; the exact contiguity scan mirrors the persistence reader's invariant, with packed chunk rows (`text-chunks` / `reasoning-chunks` / `tool-call-chunks` carrying `seq0`) expanded to `data.texts.length` / `data.args.length` events. The fixed repair pattern locates the first backward seq transition, deletes the synthetic `interrupted-tool-result` batch when present (renumbering the remaining committed rows down by three) and lets the rescanned gap shift the late tail up by one uniform delta; `seq`, `seq0`, `sourceEventSeqs`, and the replace range of a landed `surfaceOp` marker all shift — a stale marker range fails restore's surface fold with "surface replace: end seq not found in surface" while the contiguity scan passes. Also ports `projectKey` / `encodeSegment` from the persistence backend for path resolution.
 - `lib/index.js`: `GET /session-repair/scan`, `POST /session-repair/repair` (`dryRun` supported; atomic write with a `.bak-<ts>` backup and post-write re-verification), and `POST /session-repair/restore` (newest backup back). zstd through the CLI because DSH writes many concatenated frames per log, which the one-shot zlib zstd functions do not decode.
+- Two corruption classes are covered. The backward-seq collision is the original one. The second is a broken container framing (whole log compressed as one zstd frame — seq-healthy but it fail-closes every profile at boot on `assertZstdHeaderFrame`): `containerHeaderBroken` decodes only the first frame and asserts it is exactly the header line, `scanSessionFile` reports `containerBroken` and counts such a log as corrupted, and `repairLogFile` re-containerizes via `compressLog`'s two-frame layout with byte-identical content (`recontainerizeOnly`) — combined incidents are fixed in the same write, and post-write verification checks both the seq scan and the container contract.
+- `lib/cli.mjs`: offline CLI (`scan <log>` / `repair <log> [--dry-run]` / `scan-all`) run against the installed copy, because a container-broken log makes DSH unbootable and the in-process routes unreachable — exactly when the tool is needed. All log rewrites must go through the plugin; a manual one-shot `zstd -f` recompression is precisely how the single-frame incident was produced (see `docs/session-framing-incident-2026-09-06.md`).
 - `lib/client.js`: a "会话修复 / Session repair" settings section — workspace path (localStorage; empty scans every project directory), scan, per-session dry run / repair / restore — plus a "修复 / Repair" trigger in the `conversation.session.header.utilities` slot (order 74, between usage 72 and outline 80): a per-session panel anchored to the trigger whose dry run doubles as the status probe (200 = damaged with a preview, 409 = clean), then repair or restore for exactly this session, with `cwd` from the sessions list store. The sidebar row menu (rename/fork/archive) is hardcoded in the host workspace bundle with no extension slot, which is why the entry lives in the header band.
 - The plugin is generic and does not touch `dsh-magic-context`'s database; after a real repair its seq references must be shifted by the same rule (see `docs/session-repair.md`).
 - See `docs/session-repair.md` and `docs/session-seq-corruption-report.md` (upstream Discussion draft).

@@ -65,6 +65,46 @@ content) survives.
 The zstd codec is the `zstd` CLI: DSH writes many concatenated frames per
 log, which the one-shot zlib zstd functions do not decode.
 
+## Second corruption class: broken container framing (2026-09-06)
+
+A session log compressed as **one whole-file zstd frame** keeps its seq
+numbering perfectly healthy but bricks every profile at boot: the workspace
+init fail-closes on `assertZstdHeaderFrame` ("first frame is not exactly one
+header line") while listing artifacts, so one bad file stops DSH from
+starting at all. See `docs/session-framing-incident-2026-09-06.md`. The scan
+and repair now cover both classes:
+
+- `scanSessionFile` decodes only the first frame (located by zstd magic) and
+  asserts it is exactly the header line + newline; the result is reported as
+  `containerBroken: true`, and such a log counts as corrupted even with a
+  clean seq scan.
+- `repairLogFile` (shared by the route and the CLI) re-containerizes whenever
+  the framing is broken: `compressLog` always emits the two-frame layout, so a
+  container-only incident is fixed with byte-identical event content
+  (`recontainerizeOnly: true`, empty passes), while a combined seq + container
+  incident is fixed in the same write. Post-write verification now checks the
+  seq scan **and** the container contract.
+
+## Offline CLI
+
+The HTTP routes need a running DSH, but a container-broken log makes DSH
+unbootable — the web tool is unreachable exactly when it is needed. Run the
+CLI against the installed copy (so its `@deepseek-ai/*` imports resolve):
+
+```bash
+node ~/.dsh/profiles/node_modules/dsh-plugin-session-repair/lib/cli.mjs \
+  scan <path/to/session.jsonl.zstd>
+node ~/.dsh/profiles/node_modules/dsh-plugin-session-repair/lib/cli.mjs \
+  repair <path/to/session.jsonl.zstd> [--dry-run]
+node ~/.dsh/profiles/node_modules/dsh-plugin-session-repair/lib/cli.mjs scan-all
+```
+
+`scan`/`repair` take a direct log path (backups included); `scan-all` sweeps
+every project directory under `$DSH_HOME/sessions`. Write-path discipline: all
+log rewrites must go through this plugin (routes or CLI) — a manual
+`zstd -f file` recompression produces exactly the single-frame incident, and
+backup names must keep the `.bak-<unix-ms>` convention.
+
 ## Client UI
 
 A "会话修复 / Session repair" section in the Settings sidebar: workspace path

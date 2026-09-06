@@ -313,6 +313,7 @@ console.log("host routes");
   check("scan reports one corrupted session", scanRes.status === 200 && scanRes.body.ok && scanRes.body.sessions.length === 1);
   check("scan flags the synthetic batch", scanRes.body.sessions[0].hasSyntheticBatch === true);
   check("scan gap numbers", scanRes.body.sessions[0].gap.expected === 11 && scanRes.body.sessions[0].gap.got === 5);
+  check("scan also flags the fixture's single-frame container", scanRes.body.sessions[0].containerBroken === true);
 
   const repair = route("/session-repair/repair");
   const sessionId = "session-11111111-2222-4333-8444-555566667777";
@@ -346,7 +347,50 @@ console.log("host routes");
   check("repair 404s unknown sessions", missing.status === 404);
 }
 
+// ---------- container-only incident (2026-09-06 class) ----------
+// A whole-file single-frame compression leaves the seq numbering healthy but
+// bricks every profile at boot (assertZstdHeaderFrame fail-closes workspace
+// init). Scan must flag it, repair must re-containerize without touching the
+// event content, and the offline CLI must reach it without a running DSH.
+console.log("container-only incident");
+{
+  const healthyLines = [HEADER];
+  const row = (type, seq, data) => healthyLines.push(JSON.stringify({ type, seq, time: 1000 + seq, data }));
+  row("user/message", 0, { content: [{ type: "text", text: "hello" }], role: "user", id: "u0" });
+  row("turn/start", 1, { turn: 1 });
+  row("turn/end", 2, { turn: 1, reason: { kind: "completed" } });
+  const healthyText = healthyLines.join("\n") + "\n";
+
+  const logPath = `${TEST_HOME}/container-case/session.jsonl.zstd`;
+  mkdirSync(`${TEST_HOME}/container-case`, { recursive: true });
+  writeLog(logPath, healthyText);
+  const before = execFileSync("zstd", ["-dc", "--", logPath]).toString("utf8");
+  check("fixture is a single-frame healthy log", verifyFrameLayout(logPath, healthyText) !== null && scanWithRealDecoder(before).ok);
+
+  const scanned = host.scanSessionFile(logPath);
+  check("scan flags the container as broken", scanned.containerBroken === true && scanned.corrupted === true && scanned.gap === null);
+  check("scan still counts the events", scanned.events === 3);
+
+  const dry = host.repairLogFile(logPath, true);
+  check("dry run reports recontainerize-only", dry.ok && dry.dryRun === true && dry.recontainerizeOnly === true && dry.passes.length === 0 && !dry.backup);
+
+  const cli = execFileSync("node", [`${INSTALLED_PLUGIN_DIR}/lib/cli.mjs`, "repair", logPath, "--dry-run"], { encoding: "utf8" });
+  const cliSummary = JSON.parse(cli);
+  check("offline CLI reaches the log without a running DSH", cliSummary.ok === true && cliSummary.recontainerizeOnly === true);
+
+  const fixed = host.repairLogFile(logPath, false);
+  check("repair verifies post-write", fixed.ok && fixed.verified === true);
+  check("backup written", typeof fixed.backup === "string" && existsSync(fixed.backup));
+
+  const after = execFileSync("zstd", ["-dc", "--", logPath]).toString("utf8");
+  check("content is byte-identical after re-containerize", after === before);
+  check("written file satisfies the header-frame layout", verifyFrameLayout(logPath, after) === null);
+  check("container passes the validation after repair", host.containerHeaderBroken(logPath) === false);
+  check("re-containerized log is not corrupted again", host.repairLogFile(logPath, false).status === 409);
+}
+
 // ---------- client contract ----------
+
 console.log("client contract");
 {
   const clientText = readFileSync(`${PLUGIN_DIR}/lib/client.js`, "utf8");

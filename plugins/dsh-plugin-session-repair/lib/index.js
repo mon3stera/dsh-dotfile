@@ -33,6 +33,7 @@ import { copyFileSync, existsSync, readdirSync, readFileSync, renameSync, statSy
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
+import { zstdDecompressSync } from "node:zlib";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 import { encodeSegment, parseLog, projectKey, repairRows, scanRows, serializeLog } from "./repair.js";
 
@@ -40,10 +41,36 @@ export const name = "dsh-plugin-session-repair";
 
 const SESSION_ID_PATTERN = /^session-[0-9a-fA-F-]{8,}$/;
 const LOG_NAME = "session.jsonl.zstd";
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
 
 /** Sessions root for the deployment. */
 export function sessionsRoot() {
   return join(resolveDshHome(), "sessions");
+}
+
+/**
+ * Container validation with the same semantics as the reader's
+ * `assertZstdHeaderFrame`: frame 1 must decode to exactly the header line
+ * plus one newline. Only the first frame is decoded (its plaintext is the
+ * ~200-byte header), so this is cheap enough for a full-store scan. A log
+ * compressed as one whole-file frame fails here while its seq numbering can
+ * be perfectly healthy - the 2026-09-06 incident class.
+ *
+ * @param {string} path - log file path.
+ * @returns {boolean} true when the container framing is broken.
+ */
+export function containerHeaderBroken(path) {
+  const blob = readFileSync(path);
+  if (blob.indexOf(ZSTD_MAGIC) !== 0) return true;
+  const next = blob.indexOf(ZSTD_MAGIC, ZSTD_MAGIC.length);
+  let text;
+  try {
+    text = zstdDecompressSync(next === -1 ? blob : blob.subarray(0, next)).toString("utf8");
+  } catch {
+    return true;
+  }
+  const newline = text.indexOf("\n");
+  return newline === -1 || newline !== text.length - 1;
 }
 
 /** Decompress a (possibly multi-frame) zstd log via the CLI.
@@ -128,10 +155,25 @@ function listBackups(path) {
  */
 export function scanSessionFile(path) {
   const stat = statSync(path);
+  const containerBroken = containerHeaderBroken(path);
   const parsed = parseLog(decompressLog(path).toString("utf8"));
   const scan = scanRows(parsed.rows);
   const gap = scan.gap;
-  const session = { sessionId: parsed.header?.id ?? null, sizeBytes: stat.size, mtimeMs: stat.mtimeMs, events: scan.events, lastSeq: scan.lastSeq, corrupted: !scan.ok, gap: null, hasSyntheticBatch: false, backups: listBackups(path) };
+  const seqCorrupted = !scan.ok;
+  const session = {
+    sessionId: parsed.header?.id ?? null,
+    sizeBytes: stat.size,
+    mtimeMs: stat.mtimeMs,
+    events: scan.events,
+    lastSeq: scan.lastSeq,
+    containerBroken,
+    // A container-broken log bricks every profile at boot even when its seq
+    // numbering is healthy, so it counts as corrupted either way.
+    corrupted: seqCorrupted || containerBroken,
+    gap: null,
+    hasSyntheticBatch: false,
+    backups: listBackups(path)
+  };
 
   if (gap !== null && gap.got !== null) {
     session.gap = { expected: gap.expected, got: gap.got, row: gap.index };
@@ -211,6 +253,79 @@ async function handleScan(req, res) {
 }
 
 /**
+ * Repair one log file: the fixed seq pattern when the numbering collided,
+ * plus a re-containerize pass whenever the framing is broken. Rebuilding with
+ * `compressLog` fixes both in one write, so a container-only incident (healthy
+ * seq, whole-file single frame) is repaired without touching event content.
+ *
+ * @param {string} path - absolute log path.
+ * @param {boolean} dryRun - build and verify, write nothing.
+ * @returns {object} summary payload with `ok`, or `{ok: false, status, error}`.
+ */
+export function repairLogFile(path, dryRun) {
+  let parsed;
+  try {
+    parsed = parseLog(decompressLog(path).toString("utf8"));
+  } catch (error) {
+    return { ok: false, status: 500, error: `decompress failed: ${error?.message ?? error}` };
+  }
+
+  const before = scanRows(parsed.rows);
+  const containerBroken = containerHeaderBroken(path);
+  if (before.ok && !containerBroken) {
+    return { ok: false, status: 409, error: "session log is not corrupted" };
+  }
+
+  let repaired = null;
+  let passes = [];
+  if (!before.ok) {
+    repaired = repairRows(parsed);
+    if (!repaired.ok) {
+      return { ok: false, status: 422, error: repaired.error, gap: before.gap };
+    }
+    passes = repaired.passes;
+  }
+
+  const summary = {
+    ok: true,
+    dryRun: dryRun === true,
+    path,
+    containerBroken,
+    recontainerizeOnly: before.ok && containerBroken,
+    gap: before.ok ? null : { expected: before.gap.expected, got: before.gap.got },
+    passes,
+    eventsBefore: before.events,
+    eventsAfter: repaired === null ? before.events : repaired.scan.events,
+    lastSeq: repaired === null ? before.lastSeq : repaired.scan.lastSeq,
+    backups: listBackups(path)
+  };
+  if (summary.dryRun) {
+    return summary;
+  }
+
+  const backupPath = `${path}.bak-${Date.now()}`;
+  copyFileSync(path, backupPath);
+  summary.backup = backupPath;
+
+  const tmpPath = `${path}.repair-tmp-${process.pid}`;
+  writeFileSync(tmpPath, compressLog(serializeLog(parsed)));
+  renameSync(tmpPath, path);
+
+  // Refuse to report success unless the written file passes the exact seq scan
+  // AND the container contract (first frame decodes to exactly the header).
+  const after = parseLog(decompressLog(path).toString("utf8"));
+  const verify = scanRows(after.rows);
+  if (!verify.ok) {
+    return { ok: false, status: 500, error: `post-repair verification failed: expected ${verify.gap?.expected}, got ${verify.gap?.got}`, backup: backupPath };
+  }
+  if (containerHeaderBroken(path)) {
+    return { ok: false, status: 500, error: "post-repair verification failed: container framing is broken", backup: backupPath };
+  }
+  summary.verified = true;
+  return summary;
+}
+
+/**
  * POST /session-repair/repair - repair one corrupted log. Body:
  * {cwd?, sessionId, dryRun?}. With dryRun the repaired text is built and
  * verified but nothing is written.
@@ -228,59 +343,9 @@ async function handleRepair(req, res) {
     return;
   }
 
-  let parsed;
-  try {
-    parsed = parseLog(decompressLog(path).toString("utf8"));
-  } catch (error) {
-    writeJson(res, 500, { error: `decompress failed: ${error?.message ?? error}` });
-    return;
-  }
-
-  const before = scanRows(parsed.rows);
-  if (before.ok) {
-    writeJson(res, 409, { error: "session log is not corrupted" });
-    return;
-  }
-
-  const repaired = repairRows(parsed);
-  if (!repaired.ok) {
-    writeJson(res, 422, { error: repaired.error, gap: before.gap });
-    return;
-  }
-
-  const summary = {
-    ok: true,
-    dryRun: dryRun === true,
-    sessionId,
-    path,
-    gap: { expected: before.gap.expected, got: before.gap.got },
-    passes: repaired.passes,
-    eventsBefore: before.events,
-    eventsAfter: repaired.scan.events,
-    lastSeq: repaired.scan.lastSeq,
-    backups: listBackups(path)
-  };
-  if (summary.dryRun) {
-    writeJson(res, 200, summary);
-    return;
-  }
-
-  const backupPath = `${path}.bak-${Date.now()}`;
-  copyFileSync(path, backupPath);
-  summary.backup = backupPath;
-
-  const tmpPath = `${path}.repair-tmp-${process.pid}`;
-  writeFileSync(tmpPath, compressLog(serializeLog(parsed)));
-  renameSync(tmpPath, path);
-
-  // Refuse to report success unless the written file passes the exact scan.
-  const verify = scanRows(parseLog(decompressLog(path).toString("utf8")).rows);
-  if (!verify.ok) {
-    writeJson(res, 500, { error: `post-repair verification failed: expected ${verify.gap?.expected}, got ${verify.gap?.got}`, backup: backupPath });
-    return;
-  }
-  summary.verified = true;
-  writeJson(res, 200, summary);
+  const summary = repairLogFile(path, dryRun === true);
+  summary.sessionId = sessionId;
+  writeJson(res, summary.ok ? 200 : summary.status, summary);
 }
 
 /**
