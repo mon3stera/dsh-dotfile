@@ -8,7 +8,7 @@ DSH process runs in. Host-side only — no browser half.
 | Tool | Reads/writes | Backend |
 |---|---|---|
 | `desktop_windows` | window list, focus, close, fullscreen | `niri msg --json` IPC |
-| `desktop_tree` | AT-SPI2 accessibility/widget tree with desktop-global pixel extents | Python helper (`lib/atspi-tree.py`) over `gi.repository.Atspi` |
+| `desktop_tree` | AT-SPI2 accessibility/widget tree; per-app coordinate space (compositor-anchored or window-relative) | Python helper (`lib/atspi-tree.py`) over `gi.repository.Atspi`, reconciled with niri IPC by `lib/coords.js` |
 | `desktop_screenshot` | full desktop / one output / one window, returned as an image block | `grim` (wlr-screencopy); window capture tries `niri msg action screenshot-window` first |
 | `desktop_mouse` | move / click / down / up / drag / scroll | raw Wayland client for `zwlr_virtual_pointer_v1` (`lib/wayland-pointer.js`); wheel via `ydotool` |
 | `desktop_key` | type text (CJK included), key combos, single keys | `wtype` (virtual-keyboard protocol), `ydotool` keycode fallback |
@@ -18,9 +18,29 @@ describing the workflow: list windows → tree/screenshot → act → verify.
 
 ## Coordinate systems
 
-- The accessibility tree reports **desktop-global logical pixels**; niri IPC and
-  `desktop_mouse` speak the same coordinates. Multi-monitor bounding boxes with
-  negative origins work: the client converts to the normalized
+- **A Wayland client cannot know its own position**, so AT-SPI extents are never
+  desktop-global on their own. Measured on niri 26.04: GTK3 reports extents
+  relative to its toplevel (frame at `0,0`, children at real intra-window
+  offsets), XWayland reports them relative to the X root, and GTK4 reports `0,0`
+  for every node including the toplevel — sizes only, no positions.
+- `desktop_tree` therefore reconciles the tree with the compositor
+  (`lib/coords.js`): it matches each toplevel against `niri msg --json windows`
+  (title first, app id and size as tie-breakers) and anchors it when the
+  compositor can supply an origin. Floating windows can:
+  `tile_pos_in_workspace_view` is **output-local**, so
+  `global = output.logical + tile_pos`, with the output resolved through the
+  window's workspace. Verified against grim pixel localization on a rotated
+  second monitor (window at local `783,50` on an output whose `logical` origin
+  is `-1440,0`).
+- **Tiled windows cannot be anchored**: niri reports
+  `tile_pos_in_workspace_view: null` for every tiled window (upstream
+  [issue #2381](https://github.com/YaLTeR/niri/issues/2381); PR
+  [#1265](https://github.com/niri-wm/niri/pull/1265) is still open). Their
+  extents are printed unchanged and the app line says `WINDOW-RELATIVE`, so the
+  model is never handed a coordinate that silently points somewhere else. The
+  workarounds are a screenshot, or floating the window first.
+- `desktop_mouse` speaks desktop-global logical pixels. Multi-monitor bounding
+  boxes with negative origins work: the client converts to the normalized
   `zwlr_virtual_pointer_v1.motion_absolute` space using the bounding box from
   `niri msg --json outputs` (`logical` per output).
 - `desktop_screenshot` may downscale (`grim -s`) to fit the attachment store's

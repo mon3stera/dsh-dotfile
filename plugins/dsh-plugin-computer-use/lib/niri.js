@@ -38,6 +38,16 @@ export async function outputs() {
 }
 
 /**
+ * All workspaces: `{id, idx, name, output, is_active, is_focused, ...}`. Used to
+ * map a window to the output whose `logical` origin completes an absolute
+ * position, because `tile_pos_in_workspace_view` is output-local.
+ */
+export async function workspaces() {
+	const raw = await niri(["--json", "workspaces"]);
+	return JSON.parse(raw);
+}
+
+/**
  * Bounding box of the desktop in global logical pixels, plus per-output
  * records. Coordinates from the accessibility tree and niri itself are
  * desktop-global, so targeting normalizes into this box.

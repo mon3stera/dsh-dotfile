@@ -213,6 +213,10 @@ window.__ModuleLoader__.load({
 			meterMemoriesHint: "Injected project_memory prefix. It rides every request but is not part of the conversation figure.",
 			meterCompartments: "\u21B3 Compartments",
 			meterCompartmentsHint: "Compartment checkpoints on the surface. Already counted inside conversation messages, shown here as a sub-total.",
+			meterCompartmentsExactHint: "Compartment checkpoints on the surface, priced with the model's real tokenizer. Already counted inside conversation messages, shown here as a sub-total.",
+			meterMeasured: "Request total",
+			meterMeasuredHint: "What the compaction triggers act on: exact provider usage while the request envelope is unchanged, plus estimated growth since. The rows above are composition estimates.",
+			meterMemoriesExactHint: "Injected project_memory prefix, priced with the model's real tokenizer. It rides every request but is not part of the conversation figure.",
 			targetSessionRoute: "Same as the session model",
 			targetManual: "Custom provider/model\u2026",
 			targetSaved: "saved",
@@ -253,6 +257,10 @@ window.__ModuleLoader__.load({
 			meterMemoriesHint: "注入的 project_memory 前缀。它随每次请求发送，但不计入「对话消息」。",
 			meterCompartments: "\u21B3 Compartment",
 			meterCompartmentsHint: "surface 上的 Compartment checkpoint。已包含在「对话消息」内，此处仅作为其中的小计。",
+			meterCompartmentsExactHint: "surface 上的 Compartment checkpoint，按模型真实分词器计价。已包含在「对话消息」内，此处仅作为其中的小计。",
+			meterMeasured: "实际占用",
+			meterMeasuredHint: "压缩触发真正依据的数字：请求头未变时取 provider 返回的精确 usage，再加上之后新增内容的估算。上面各行只是构成估算。",
+			meterMemoriesExactHint: "注入的 project_memory 前缀，按模型真实分词器计价。它随每次请求发送，但不计入「对话消息」。",
 			targetSessionRoute: "沿用 session 模型",
 			targetManual: "自定义 provider/model\u2026",
 			targetSaved: "已保存",
@@ -382,20 +390,39 @@ window.__ModuleLoader__.load({
 					// Compartments inherit the conversation tint from the last native
 					// row (they are part of that figure); Memories get their own.
 					const template = native[native.length - 1];
+					const compartments = usage.compartments ?? {};
+					const memories = usage.memories ?? {};
+					const measured = usage.measured ?? {};
 					syncMeterRow(rows, template, {
 						key: "compartments",
 						label: t("meterCompartments"),
-						hint: t("meterCompartmentsHint"),
-						tokens: usage.compartments?.tokens ?? 0,
+						hint: compartments.exact
+							? `${t("meterCompartmentsExactHint")} chars/4: ${formatMeterTokens(compartments.heuristicTokens ?? 0)}.`
+							: t("meterCompartmentsHint"),
+						tokens: compartments.tokens ?? 0,
 						indent: true,
 					});
 					syncMeterRow(rows, template, {
 						key: "memories",
 						label: t("meterMemories"),
-						hint: t("meterMemoriesHint"),
-						tokens: usage.memories?.tokens ?? 0,
+						hint: memories.exact ? t("meterMemoriesExactHint") : t("meterMemoriesHint"),
+						tokens: memories.tokens ?? 0,
 						tint: METER_MEMORY_TINT,
 					});
+					// The request total is the figure the compaction triggers act on:
+					// the rows above are composition estimates, this one is anchored.
+					if ((measured.tokens ?? 0) > 0) {
+						const window = measured.window ?? 0;
+						const share = window > 0 ? ` \u00b7 ${Math.round((measured.tokens / window) * 100)}%` : "";
+						syncMeterRow(rows, template, {
+							key: "measured",
+							label: `${t("meterMeasured")}${share}`,
+							hint: window > 0
+								? `${t("meterMeasuredHint")} (${formatMeterTokens(measured.tokens)} / ${formatMeterTokens(window)})`
+								: t("meterMeasuredHint"),
+							tokens: measured.tokens,
+						});
+					}
 				};
 				const load = async () => {
 					try {

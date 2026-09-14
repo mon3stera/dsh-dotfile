@@ -592,19 +592,28 @@ export async function runDreamer(ctx, cdb, opts) {
  * summaries within a token budget by archiving in priority order (promoted >
  * low importance > old). Surface removal happens separately, per session, in
  * the engine (archived checkpoint nodes need a live session to replace).
+ *
+ * Each summary is priced by its exact token count when the engine has recorded
+ * one (`summary_tokens`), otherwise by the four-characters-per-token estimate.
+ * The budget itself is expressed in those same exact tokens, so a CJK-heavy
+ * chain is no longer allowed twice the material its budget names.
+ *
  * @param cdb - context database.
  * @param opts - { budgetTokens }.
  * @returns { archived: number[], total } archived compartment ids and remaining total.
  */
-export function runArchival(cdb, { budgetTokens = 40000 } = {}) {
-	const active = cdb.allActiveCompartments();
-	let total = active.reduce((sum, compartment) => sum + estimateTokens(compartment.summary), 0);
+export function runArchival(cdb, { budgetTokens = 40000, sessionId } = {}) {
+	const price = (compartment) =>
+		Number.isFinite(compartment.summary_tokens) ? compartment.summary_tokens : estimateTokens(compartment.summary);
+	const active = cdb.allActiveCompartments().filter((row) => sessionId === undefined || row.session_id === sessionId);
+	let total = active.reduce((sum, compartment) => sum + price(compartment), 0);
 	if (total <= budgetTokens) return { archived: [], total };
 	const archived = [];
 	for (const compartment of cdb.archivalCandidates()) {
 		if (total <= budgetTokens) break;
+		if (sessionId !== undefined && compartment.session_id !== sessionId) continue;
 		cdb.archiveCompartment(compartment.id);
-		total -= estimateTokens(compartment.summary);
+		total -= price(compartment);
 		archived.push(compartment.id);
 	}
 	return { archived, total };

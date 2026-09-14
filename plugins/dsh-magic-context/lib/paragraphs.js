@@ -102,8 +102,16 @@ export function installParagraphInjector(session, cdb, opts = {}) {
 			cacheGen = gen;
 		}
 		for (const seq of nodes.slice(cacheNodes)) {
-			const msg = session.deriveEventMessage(sessionEventAt(session, seq));
+			const event = sessionEventAt(session, seq);
+			const msg = session.deriveEventMessage(event);
 			if (!msg) continue;
+			// The system prompt is not a conversation paragraph; prefixing it
+			// would inject §N§ into the prompt itself. Rows numbered by an
+			// older rebuild are ignored here.
+			if (event?.type === "system/message") {
+				cache.push(msg);
+				continue;
+			}
 			const no = cdb.paragraphFor(session.id, seq);
 			if (no === undefined) {
 				cache.push(msg);
@@ -125,7 +133,8 @@ export function installParagraphInjector(session, cdb, opts = {}) {
 /**
  * Surface-event listener that assigns paragraph numbers as events land.
  *
- * Skips: `tool/call` (log-only), assistant messages whose tool calls are all
+ * Skips: `system/message` (the prompt, including in-history updates),
+ * `tool/call` (log-only), assistant messages whose tool calls are all
  * excluded tools, and tool results whose paired `tool/call` named an excluded
  * tool. Every other surface event (including a landing checkpoint's
  * replacement user message) receives the next global number.
@@ -160,6 +169,10 @@ export function createParagraphAssigner(cdb, { skipToolNames = SKIP_TOOL_NAMES }
 			rememberCall(session, event.data.callId, event.data.name);
 			return;
 		}
+		// The system prompt (and later in-history prompt updates) are surface
+		// events but not conversation paragraphs: numbering them would put
+		// §N§ in the prompt and count them toward retainRounds.
+		if (event.type === "system/message") return;
 		if (event.type === "assistant/message") {
 			const calls = event.data.message.content.filter((block) => block.type === "tool-call");
 			if (calls.length > 0 && calls.every((call) => skipToolNames.has(call.name))) return;

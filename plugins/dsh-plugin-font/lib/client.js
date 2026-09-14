@@ -72,6 +72,47 @@ window.__ModuleLoader__.load({
 		const MAX_STACK = 8;
 		const sanitizeFamily = (name) => String(name ?? "").replace(/['"]/g, "").trim();
 
+		/** @font-face format() token per face extension (mirrors the host allowlist). */
+		const WEBFONT_FORMATS = { ttf: "truetype", otf: "opentype", woff: "woff", woff2: "woff2", ttc: "collection" };
+		/** fontconfig numeric weights (thin 0 .. black 210) on the CSS 100..900 scale. */
+		const FC_WEIGHTS = [[0, 100], [40, 200], [50, 300], [80, 400], [100, 500], [180, 600], [200, 700], [205, 800], [210, 900]];
+		const cssWeight = (fc) => FC_WEIGHTS.reduce((best, entry) => (Math.abs(entry[0] - fc) < Math.abs(best[0] - fc) ? entry : best))[1];
+		/** A family name no real system installs; it is the missing-font baseline
+		 * the probe compares against; the measured text mixes latin, CJK and
+		 * digits so an installed family is very unlikely to coincide with it. */
+		const WEBFONT_PROBE_FAMILY = "dft-missing-font-probe";
+		const WEBFONT_PROBE_TEXT = "MfWq国123";
+
+		/** True when the family is locally installed (or undecidable): keep the
+		 * system copy, which has the family's full weight/style fidelity, and
+		 * emit no rule. Undecidable counts as local so a sandboxed document
+		 * degrades to today's behaviour instead of forcing downloads.
+		 * document.fonts.check is deliberately NOT used: it answers "can this
+		 * text render without loading a font", not "is this family installed" —
+		 * on a machine without the family the glyphs still render through the
+		 * system fallback and it returns true, skipping the download. The
+		 * width comparison is the reliable probe: a font string that leads with
+		 * the family only measures differently from the missing-font baseline
+		 * when the family actually matched a local face. */
+		const localFontAvailable = (family) => {
+			try {
+				const canvas = document.createElement("canvas");
+				const ctx2d = canvas.getContext ? canvas.getContext("2d") : null;
+				if (!ctx2d || typeof ctx2d.measureText !== "function" || !("font" in ctx2d)) return true;
+				/* measureText takes the text; the font list goes on ctx.font. The
+				 * family-led list measures differently from the baseline only when
+				 * the family matched a real local face; a zero baseline (no default
+				 * font?) is undecidable and counts as local. */
+				ctx2d.font = `72px '${WEBFONT_PROBE_FAMILY}'`;
+				const baseline = ctx2d.measureText(WEBFONT_PROBE_TEXT).width;
+				if (!(baseline > 0)) return true;
+				ctx2d.font = `72px '${family}', '${WEBFONT_PROBE_FAMILY}'`;
+				return ctx2d.measureText(WEBFONT_PROBE_TEXT).width !== baseline;
+			} catch {
+				return true;
+			}
+		};
+
 		/** Dropdown presets; empty selection = system default, CUSTOM = free text. */
 		const CUSTOM = "__custom__";
 		const BODY_FONT_PRESETS = [
@@ -106,6 +147,8 @@ window.__ModuleLoader__.load({
 			".dft-chipBtn{flex:none;width:18px;height:18px;border:none;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;font-size:12px;line-height:1;padding:0;border-radius:6px;font-family:inherit}",
 			".dft-chipBtn:hover:not(:disabled){color:var(--dsw-alias-label-primary);background:var(--dsw-alias-border-l2)}",
 			".dft-chipBtn:disabled{opacity:.35;cursor:default}",
+			".dft-webfonts{display:flex;align-items:center;gap:8px;margin-top:2px;color:var(--dsw-alias-label-secondary);font-size:13px;font-family:inherit}",
+			".dft-webfonts input{width:14px;height:14px;margin:0;accent-color:var(--dsw-alias-label-primary)}",
 			".dft-clear{border:none;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;font-size:12px;padding:2px 6px;border-radius:6px;font-family:inherit}",
 			".dft-clear:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-border-l2)}",
 			".dft-preview{color:var(--dsw-alias-label-secondary);font-family:var(--dsw-font-family);margin-top:2px}",
@@ -135,6 +178,7 @@ window.__ModuleLoader__.load({
 			"font.codeSize": "代码字号",
 			"font.weight": "正文字重",
 			"font.codeWeight": "代码字重",
+			"font.webfonts": "把所选字体作为 Web 字体提供（未安装它们的浏览器按需从服务端加载）",
 			"font.weightNormal": "正常",
 			"font.preview": "字体预览 Aa 中文 123",
 			"font.previewCode": "代码预览 const x = 42",
@@ -152,6 +196,7 @@ window.__ModuleLoader__.load({
 			"font.codeSize": "Code size",
 			"font.weight": "Body weight",
 			"font.codeWeight": "Code weight",
+			"font.webfonts": "Serve the selected fonts as web fonts (browsers without them load on demand)",
 			"font.weightNormal": "Normal",
 			"font.preview": "Preview Aa 中文 123",
 			"font.previewCode": "Code preview const x = 42",
@@ -161,9 +206,9 @@ window.__ModuleLoader__.load({
 		/** Mirror store for the settings row (the theme row pattern). */
 		function createFontRowStore() {
 			return defineStore({
-				init: () => ({ families: [], codeFamilies: [], fontSize: null, codeFontSize: null, fontWeight: 0, codeFontWeight: 0, natural: { body: null, code: null }, fonts: null, adding: "", revision: -1 }),
+				init: () => ({ families: [], codeFamilies: [], fontSize: null, codeFontSize: null, fontWeight: 0, codeFontWeight: 0, serveFontFiles: true, natural: { body: null, code: null }, fonts: null, adding: "", revision: -1 }),
 				actions: {
-					sync: (d, families, codeFamilies, fontSize, codeFontSize, fontWeight, codeFontWeight, revision) => {
+					sync: (d, families, codeFamilies, fontSize, codeFontSize, fontWeight, codeFontWeight, serveFontFiles, revision) => {
 						if (revision <= d.revision) return;
 						d.families = families;
 						d.codeFamilies = codeFamilies;
@@ -171,6 +216,7 @@ window.__ModuleLoader__.load({
 						d.codeFontSize = codeFontSize;
 						d.fontWeight = fontWeight;
 						d.codeFontWeight = codeFontWeight;
+						d.serveFontFiles = serveFontFiles;
 						d.revision = revision;
 					},
 					setNatural: (d, body, code) => {
@@ -289,7 +335,7 @@ window.__ModuleLoader__.load({
 		};
 
 		/** Settings > General row: body + code font stacks, sizes, and weights. */
-		function FontRow({ t, useStore, setFamilies, setCodeFamilies, setFontSize, setCodeFontSize, setFontWeight, setCodeFontWeight, setAdding }) {
+		function FontRow({ t, useStore, setFamilies, setCodeFamilies, setFontSize, setCodeFontSize, setFontWeight, setCodeFontWeight, setServeFontFiles, setAdding }) {
 			const s = useStore((st) => st);
 			const bodyOptions = s.fonts ? s.fonts.families : BODY_FONT_PRESETS;
 			const codeOptions = s.fonts ? (s.fonts.mono && s.fonts.mono.length ? s.fonts.mono : s.fonts.families) : CODE_FONT_PRESETS;
@@ -361,6 +407,17 @@ window.__ModuleLoader__.load({
 					}),
 					stepper("font.weight", s.fontWeight || 0, weightDisplay(s.fontWeight || 0), WEIGHT_DELTA_MIN, WEIGHT_DELTA_MAX, 100, setFontWeight),
 					stepper("font.codeWeight", s.codeFontWeight || 0, weightDisplay(s.codeFontWeight || 0), WEIGHT_DELTA_MIN, WEIGHT_DELTA_MAX, 100, setCodeFontWeight),
+					jsx("label", {
+						className: "dft-webfonts",
+						children: [
+							jsx("input", {
+								type: "checkbox",
+								checked: s.serveFontFiles !== false,
+								onChange: (e) => { setServeFontFiles(Boolean(e.target.checked)); }
+							}),
+							jsx("span", { children: t("font.webfonts") })
+						]
+					}),
 					jsx("div", { className: "dft-hint", children: t("font.hint") })
 				]
 			});
@@ -370,8 +427,61 @@ window.__ModuleLoader__.load({
 			const store = createFontRowStore();
 			let bound = null;
 			let saveTimer = null;
-			const state = { families: [], codeFamilies: [], fontSize: null, codeFontSize: null, fontWeight: 0, codeFontWeight: 0, fonts: null, revision: -1 };
+			const state = { families: [], codeFamilies: [], fontSize: null, codeFontSize: null, fontWeight: 0, codeFontWeight: 0, serveFontFiles: true, fonts: null, fontFaces: null, revision: -1 };
 			let originalStacks = null;
+			/** One style tag for the emitted @font-face rules; rebuilt only when the
+			 * rules text changes. webFontServed tracks families we already serve —
+			 * once a rule exists, document.fonts.check would match it and wrongly
+			 * report the family as "locally available" on later re-applications. */
+			let webFontTag = null;
+			let webFontSignature = null;
+			const webFontServed = new Set();
+			const WEBFONT_CSS_ID = "dsh-plugin-font/webfonts.css";
+
+			const faceRule = (family, index, face) => {
+				const format = WEBFONT_FORMATS[face.ext];
+				if (!format) return "";
+				const style = face.slant === 100 || face.slant === 200 ? "italic" : "normal";
+				return `@font-face{font-family:'${family}';src:url("/font/file?family=${encodeURIComponent(family)}&index=${index}") format("${format}");font-display:swap;font-weight:${cssWeight(face.weight)};font-style:${style};}`;
+			};
+
+			/** Register the selected stack families for clients without them. The
+			 * host route only serves fc-list-enumerated faces, so a family absent
+			 * from the catalog (route down, bitmap font, custom name) just skips. */
+			const applyWebFonts = () => {
+				const rules = [];
+				if (state.serveFontFiles && state.fontFaces) {
+					const seen = new Set();
+					for (const family of [...state.families, ...state.codeFamilies]) {
+						const clean = sanitizeFamily(family);
+						if (!clean || seen.has(clean)) continue;
+						seen.add(clean);
+						if (!webFontServed.has(clean) && localFontAvailable(clean)) continue;
+						const faces = state.fontFaces[clean];
+						if (!Array.isArray(faces) || !faces.length) continue;
+						webFontServed.add(clean);
+						faces.forEach((face, index) => {
+							const rule = faceRule(clean, index, face);
+							if (rule) rules.push(rule);
+						});
+					}
+				}
+				const signature = rules.join("\n");
+				if (signature === webFontSignature) return;
+				webFontSignature = signature;
+				if (!rules.length) {
+					webFontServed.clear();
+					if (webFontTag) webFontTag.remove();
+					webFontTag = null;
+					return;
+				}
+				if (!webFontTag) {
+					webFontTag = document.createElement("style");
+					webFontTag.dataset.pluginCss = WEBFONT_CSS_ID;
+					document.head.appendChild(webFontTag);
+				}
+				webFontTag.textContent = signature;
+			};
 
 			let markdownBaselines = null;
 			const markdownVar = (suffix) => `--dsw-font-markdown-${suffix}`;
@@ -467,6 +577,7 @@ window.__ModuleLoader__.load({
 				};
 				restack(BODY_FONT_VAR, originalStacks.body, state.families);
 				restack(CODE_FONT_VAR, originalStacks.code, state.codeFamilies);
+				applyWebFonts();
 				/* the user-message bubble and the conversation chrome size off the
 				 * theme's own content-font-size axis (the native setting writes it
 				 * through the theme presenter) — drive the same axis so both sides
@@ -508,7 +619,7 @@ window.__ModuleLoader__.load({
 			};
 
 			const syncStore = () => {
-				if (bound) bound.sync(state.families, state.codeFamilies, state.fontSize, state.codeFontSize, state.fontWeight, state.codeFontWeight, state.revision);
+				if (bound) bound.sync(state.families, state.codeFamilies, state.fontSize, state.codeFontSize, state.fontWeight, state.codeFontWeight, state.serveFontFiles, state.revision);
 			};
 
 			/** Persist after a quiet period; failures are swallowed (next change retries). */
@@ -518,6 +629,7 @@ window.__ModuleLoader__.load({
 					saveTimer = null;
 					/* omitted keys mean "follow the theme": null sizes, zero weights */
 					const payload = { families: state.families, codeFamilies: state.codeFamilies };
+					if (state.serveFontFiles === false) payload.serveFontFiles = false;
 					if (state.fontSize !== null) payload.fontSize = state.fontSize;
 					if (state.codeFontSize !== null) payload.codeFontSize = state.codeFontSize;
 					if (state.fontWeight !== 0) payload.fontWeight = state.fontWeight;
@@ -559,6 +671,13 @@ window.__ModuleLoader__.load({
 					const value = clampWeightDelta(patch.fontWeight);
 					if (value !== state.fontWeight) {
 						state.fontWeight = value;
+						changed = true;
+					}
+				}
+				if (patch.serveFontFiles !== undefined) {
+					const value = Boolean(patch.serveFontFiles);
+					if (value !== state.serveFontFiles) {
+						state.serveFontFiles = value;
 						changed = true;
 					}
 				}
@@ -626,6 +745,12 @@ window.__ModuleLoader__.load({
 							state.codeFontWeight = desiredCodeWeight;
 							changed = true;
 						}
+						/* absent = on (the host schema default), so old configs stay serving */
+						const desiredServeFonts = config.serveFontFiles !== false;
+						if (desiredServeFonts !== state.serveFontFiles) {
+							state.serveFontFiles = desiredServeFonts;
+							changed = true;
+						}
 						if (!changed) return;
 						state.revision += 1;
 						applyTypography();
@@ -642,7 +767,9 @@ window.__ModuleLoader__.load({
 						if (!catalog || catalog.ok !== true || !Array.isArray(catalog.families)) return;
 						const fonts = { families: catalog.families, mono: Array.isArray(catalog.mono) ? catalog.mono : [] };
 						state.fonts = fonts;
+						state.fontFaces = catalog.faces && typeof catalog.faces === "object" ? catalog.faces : {};
 						if (bound) bound.setFonts(fonts);
+						applyWebFonts();
 					})
 					.catch(() => { /* host route may be absent until restart */ });
 			};
@@ -660,6 +787,7 @@ window.__ModuleLoader__.load({
 					setCodeFontSize: (value) => { commit({ codeFontSize: value }); },
 					setFontWeight: (delta) => { commit({ fontWeight: delta }); },
 					setCodeFontWeight: (delta) => { commit({ codeFontWeight: delta }); },
+					setServeFontFiles: (value) => { commit({ serveFontFiles: value }); },
 					setAdding: (which) => { if (bound) bound.setAdding(which); }
 				};
 			};
@@ -672,6 +800,10 @@ window.__ModuleLoader__.load({
 			}, "dsh-plugin-font: theme baselines");
 			ctx.effect(() => () => {
 				if (saveTimer) clearTimeout(saveTimer);
+				if (webFontTag) webFontTag.remove();
+				webFontTag = null;
+				webFontSignature = null;
+				webFontServed.clear();
 				document.documentElement.style.removeProperty(BODY_FONT_VAR);
 				document.documentElement.style.removeProperty(CODE_FONT_VAR);
 				const body = document.body;

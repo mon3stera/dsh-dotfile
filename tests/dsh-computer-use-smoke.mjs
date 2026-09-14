@@ -122,9 +122,68 @@ const dump = {
 const rendered = treeModule.renderTree(dump, 50);
 ok(rendered.includes("## app \"obsidian\""), "tree render includes app header");
 ok(rendered.includes("push button \"OK\""), "tree render includes node role and name");
-ok(rendered.includes("@300,400 60x24"), "tree render includes desktop-global extents");
+ok(rendered.includes("@300,400 60x24"), "unanchored render passes extents through unchanged");
 ok(rendered.includes("actions=[press]"), "tree render includes actions");
-ok(rendered.includes("desktop-global logical pixels"), "tree render documents the coordinate space");
+ok(rendered.includes("coordinate space"), "tree render documents the coordinate contract");
+ok(rendered.includes("WINDOW-RELATIVE"), "unanchored extents are labelled window-relative");
+
+// ------------------------------------------------------------- coordinate reconciliation
+const coords = await import(`${RUNTIME}/lib/coords.js`);
+const comp = {
+	outputs: { "DP-3": { logical: { x: 0, y: 0, width: 2560, height: 1440 } } },
+	workspaces: [{ id: 1, output: "DP-3" }],
+	windows: [
+		{ id: 10, title: "Vault", app_id: "obsidian", workspace_id: 1, is_floating: true, layout: { window_size: [800, 600], tile_pos_in_workspace_view: [900, 120] } },
+		{ id: 11, title: "Vault", app_id: "obsidian", workspace_id: 1, is_floating: false, layout: { window_size: [800, 600], tile_pos_in_workspace_view: null } },
+		{ id: 12, title: "Other", app_id: "obsidian", workspace_id: 1, is_floating: true, layout: { window_size: [100, 100], tile_pos_in_workspace_view: [1, 2] } },
+	],
+};
+const floating = { id: "5.0", role: "frame", name: "Vault", st: [], ext: [100, 200, 800, 600], ch: [
+	{ id: "5.0.1", role: "push button", name: "OK", st: [], ext: [300, 400, 60, 24] },
+] };
+const zeroed = { id: "6.0", role: "dialog", name: "Dialog", st: [], ext: [0, 0, 400, 200], ch: [
+	{ id: "6.0.1", role: "push button", name: "OK", st: [], ext: [0, 0, 60, 24] },
+] };
+eq(coords.matchWindow(floating, comp.windows)?.id, 10, "match prefers title and size over a same-title window of another size");
+eq(coords.matchWindow({ id: "x", role: "frame", name: "nothing", ext: [0, 0, 1, 1] }, comp.windows), null, "unmatched window yields null");
+eq(coords.matchWindow({ id: "y", role: "window", name: "", ext: [-99, -99, 1, 1] }, comp.windows), null, "an unnamed a11y window never matches by app id");
+eq(coords.geometryUsable({ id: "z", role: "window", name: "", ext: [-99, -99, 1, 1] }), false, "1x1 placeholder windows report no geometry");
+eq(JSON.stringify(coords.originOf(comp.windows[0], comp.workspaces, comp.outputs)), "[900,120]", "floating origin is output.logical + tile_pos");
+eq(coords.originOf(comp.windows[1], comp.workspaces, comp.outputs), null, "tiled window has no compositor origin");
+ok(coords.geometryUsable(floating), "window-relative extents count as usable geometry");
+eq(coords.geometryUsable(zeroed), false, "all-zero extents report no geometry");
+const anchored = coords.anchorToplevel(floating, comp);
+eq(anchored.state, "absolute", "floating toplevel anchors");
+eq(JSON.stringify(anchored.offset), "[800,-80]", "offset is origin minus the toplevel's reported position");
+eq(coords.anchorToplevel({ ...floating, ext: [0, 0, 800, 600] }, { ...comp, windows: [comp.windows[1]] }).reason, "tiled", "tiled toplevel stays relative");
+eq(coords.anchorToplevel(zeroed, comp).state, "none", "zero-geometry toplevel is flagged");
+
+const absoluteRender = treeModule.renderTree(
+	{ apps: [{ name: "obsidian", node: { id: "5", role: "application", name: "obsidian", st: [], ext: null, ch: [floating] } }], total_nodes: 3, truncated: false },
+	50,
+	coords.anchorTree({ apps: [{ name: "obsidian", node: { id: "5", role: "application", name: "obsidian", st: [], ext: null, ch: [floating] } }], total_nodes: 3, truncated: false }, comp),
+);
+ok(absoluteRender.includes("@900,120 800x600"), "anchored render shifts the toplevel to its compositor origin");
+ok(absoluteRender.includes("@1100,320 60x24"), "anchored render shifts descendants by the same offset");
+ok(absoluteRender.includes("desktop-global logical pixels"), "all-anchored render announces desktop-global extents");
+
+const tiledRender = treeModule.renderTree(
+	{ apps: [{ name: "obsidian", node: { id: "5", role: "application", name: "obsidian", st: [], ext: null, ch: [{ ...floating, ext: [0, 0, 800, 600] }] } }], total_nodes: 2, truncated: false },
+	50,
+	coords.anchorTree({ apps: [{ name: "obsidian", node: { id: "5", role: "application", name: "obsidian", st: [], ext: null, ch: [{ ...floating, ext: [0, 0, 800, 600] }] } }], total_nodes: 2, truncated: false }, { ...comp, windows: [comp.windows[1]] }),
+);
+ok(tiledRender.includes("@0,0 800x600"), "tiled window extents stay window-relative");
+ok(tiledRender.includes("WINDOW-RELATIVE"), "tiled window line says window-relative");
+ok(tiledRender.includes("no position for tiled windows"), "tiled window line explains why the origin is missing");
+
+const zeroRender = treeModule.renderTree(
+	{ apps: [{ name: "zenity", node: { id: "6", role: "application", name: "zenity", st: [], ext: null, ch: [zeroed] } }], total_nodes: 2, truncated: false },
+	50,
+	coords.anchorTree({ apps: [{ name: "zenity", node: { id: "6", role: "application", name: "zenity", st: [], ext: null, ch: [zeroed] } }], total_nodes: 2, truncated: false }, comp),
+);
+ok(zeroRender.includes("@? 60x24"), "zero-geometry render drops unusable positions but keeps sizes");
+ok(zeroRender.includes("no widget geometry exposed"), "zero-geometry app line points at desktop_screenshot");
+
 const empty = treeModule.renderTree({ apps: [], total_nodes: 0, truncated: false }, 50);
 ok(empty.includes("ACCESSIBILITY_ENABLED=1"), "empty tree explains the a11y coverage gap");
 const truncated = treeModule.renderTree({

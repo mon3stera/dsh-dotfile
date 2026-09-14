@@ -12,6 +12,12 @@
       name: dsh-plugin-font
     - id: dsh-plugin-hide-session-titles
       name: dsh-plugin-hide-session-titles
+    # Decorative background particle effects (rain / starfield / snow /
+    # fireflies) on a fixed pointer-transparent canvas above the shell, with
+    # density and opacity steppers in Settings > General. Persisted under
+    # $DSH_HOME/effects/config.json; the loop pauses while the tab is hidden.
+    - id: dsh-plugin-effects
+      name: dsh-plugin-effects
     # Scheduled tasks: each due task spawns a fresh session and submits its
     # prompt; the entry sits in the sidebar footer action list, above Settings.
     - id: dsh-plugin-scheduler
@@ -39,6 +45,17 @@
     # the rest of the session. The ctx_* tools stay resident on purpose.
     - id: dsh-plugin-tool-gate
       name: dsh-plugin-tool-gate
+    # Hypa output compression: shadows each agent's `bash` tool with an
+    # identical definition whose execute runs the command through
+    # `hypa rewrite` (decision) + `hypa -c` (buffered compression), so noisy
+    # output reaches the model already reduced with a
+    # `[hypa: N->M tok, -P%, reducer=id]` footer. The model's command string and
+    # the wire schema are unchanged; background jobs, bare shell builtins,
+    # confining sandbox modes, and commands Hypa classifies as
+    # interactive/unsafe run unmodified, and every failure path falls back to
+    # the original command. Requires the `hypa` binary on PATH. See docs/hypa.md.
+    - id: dsh-plugin-hypa
+      name: dsh-plugin-hypa
     # Phone-viewport ergonomics, active only below 640px (a strict subset of the
     # host's own 1024px narrow mode). An expanded sidebar becomes a drawer over
     # the conversation instead of squeezing it: the host keeps all three columns

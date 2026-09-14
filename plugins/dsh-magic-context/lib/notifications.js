@@ -31,6 +31,19 @@ import { boundContextSummary, createUserMessage } from "@deepseek-ai/dsh-llm";
 
 const PLUGIN = "dsh-magic-context";
 
+/**
+ * The released event schema types `command/run.source` as exactly
+ * `{ kind: "user" }`: the frozen v0 codec audits a stored log against that
+ * member set before migrating it (`dsh-session-format-v0-to-v1` validates
+ * `exactRecord(source, ["kind"])` and then `kind === "user"`), and an extra
+ * member makes the whole session refuse migration — the write-open a resume
+ * performs is what fails, so the session stays listed and readable but cannot be
+ * continued on a newer line. Plugin attribution therefore lives in the
+ * `commandId` namespace (`dsh-magic-context/<uuid>-<n>`) and in the row title,
+ * never in `source`.
+ */
+const ACTIVITY_SOURCE = Object.freeze({ kind: "user" });
+
 /** Row bodies are read by humans; a runaway provider string must not fill the log. */
 const MAX_ACTIVITY_TEXT_CHARS = 4000;
 
@@ -76,7 +89,7 @@ export function startActivity(session, title, activityId = mintActivityId()) {
 	const appended = appendActivityEvent(session, "command/run", {
 		commandId: activityId,
 		name: title.trim(),
-		source: { kind: "plugin", plugin: PLUGIN },
+		source: ACTIVITY_SOURCE,
 	});
 	return appended ? activityId : undefined;
 }

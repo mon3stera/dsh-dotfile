@@ -47,12 +47,13 @@ const check = (label, ok) => {
 	const mixedResult3 = { type: "tool/result", seq: 11, surfaceOp: "append", data: { callId: "c3", message: { content: [{ type: "text", text: "r3" }] } } };
 	const mixedResult4 = { type: "tool/result", seq: 12, surfaceOp: "append", data: { callId: "c4", message: { content: [{ type: "text", text: "r4" }] } } };
 	const checkpoint = { type: "user/message", seq: 13, surfaceOp: { op: "replace", start: 1, end: 12 }, data: { content: [{ type: "text", text: "checkpoint" }] } };
+	const systemMsg = { type: "system/message", seq: 18, surfaceOp: "append", data: { turn: 1, step: 1, message: { role: "system", content: [{ type: "text", text: "prompt" }] } } };
 	const logOnly = { type: "compaction/start", seq: 14, data: { compactionId: "x", turn: null } };
 	const expandAsst = { type: "assistant/message", seq: 15, surfaceOp: "append", data: { message: { content: [{ type: "tool-call", name: "ctx_expand", callId: "c5", arguments: "{\"paragraph\":7}" }] } } };
 	const expandCall = { type: "tool/call", seq: 16, data: { callId: "c5", name: "ctx_expand", arguments: "{\"paragraph\":7}" } };
 	const expandResult = { type: "tool/result", seq: 17, surfaceOp: "append", data: { callId: "c5", message: { content: [{ type: "text", text: "expanded" }] } } };
-	for (const e of [userMsg, asstMsg, toolCall1, toolResult1, reduceAsst, reduceCall, reduceResult, mixedAsst, mixedCall3, mixedCall4, mixedResult3, mixedResult4, checkpoint, logOnly, expandAsst, expandCall, expandResult]) assigner(sess, e);
-	check("assigner: user+assistant+tool-result+checkpoint numbered, ctx_reduce/ctx_expand excluded", JSON.stringify(calls) === JSON.stringify([["s1", 1], ["s1", 2], ["s1", 4], ["s1", 8], ["s1", 12], ["s1", 13]]));
+	for (const e of [userMsg, asstMsg, toolCall1, toolResult1, reduceAsst, reduceCall, reduceResult, mixedAsst, mixedCall3, mixedCall4, mixedResult3, mixedResult4, checkpoint, logOnly, expandAsst, expandCall, expandResult, systemMsg]) assigner(sess, e);
+	check("assigner: user+assistant+tool-result+checkpoint numbered, ctx_reduce/ctx_expand/system excluded", JSON.stringify(calls) === JSON.stringify([["s1", 1], ["s1", 2], ["s1", 4], ["s1", 8], ["s1", 12], ["s1", 13]]));
 	const restoredCalls = [];
 	const restoredAssigner = createParagraphAssigner({ assignParagraph: (sid, seq) => restoredCalls.push([sid, seq]) });
 	const restoredSession = {

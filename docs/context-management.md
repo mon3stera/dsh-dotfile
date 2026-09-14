@@ -60,7 +60,7 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 
 - **覆盖范围固化**：Compartment 在 65% 生成时刻确定 `start_seq..end_seq`（保留最近 N 个有 paragraph number 的 model-visible 消息，并在 tool pairing 安全边界截断）。落地时替换**就是**这个固化范围，绝不外扩。
 - **保留尾**：生成时刻的最近 N 个段落 + 生成之后所有新增内容，全部原文保留。
-- **链式多代**：每代 checkpoint 节点永久留在 surface：`[C1][C2]…[Ck] + 原文尾`。下一代只摘要上一代落地点之后的新内容，**不对旧 checkpoint 二次摘要**（避免信息损失）。后续单独设计"重整"机制（数据库按代次/覆盖 seqs/段落号区间建立索引，为重整预留）。
+- **链式多代**：每代 checkpoint 节点永久留在 surface。0.1.5 起 surface 是 `[system][C1][C2]…[Ck] + 原文尾`（node 0 的 `system/message` 是受保护的系统提示词，host 折叠拒绝用 `user/message` 覆盖它）。下一代只摘要上一代落地点之后的新内容，**不对旧 checkpoint 二次摘要**（避免信息损失），也**永不把 system head 算进 compactable range**。后续单独设计"重整"机制（数据库按代次/覆盖 seqs/段落号区间建立索引，为重整预留）。
 - **落地后**：若 surface 仍高于 65%（极端保留尾过大），立即进入下一代生成循环，自洽无需特殊处理。
 - **Dreamer 归档**：旧 checkpoint 节点由 Dreamer 标记、代码逻辑真实归档（§4.7），归档会从 surface 移除 checkpoint 节点并更新预算——这是落地之外唯一允许的 surface 变更。
 
@@ -135,9 +135,72 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 
 > 客户端半边的注册条件：`dsh-client-modules` 用 `require.resolve(\`${entryName}/package.json\`)` 解析 loader 条目名，因此只有名字**恰为包名**的条目才会注册 client bundle。`dsh-magic-context/settings`、`/notice` 这类子路径条目会以 `ERR_PACKAGE_PATH_NOT_EXPORTED` 静默跳过。bundle patch 现在在宿主根挂载带 `host: true` 的裸名 `dsh-magic-context` shell，它负责 settings/notice 并让浏览器半边从 Web 首次启动就进入 boot manifest；agent preset 另挂 `dsh-magic-context/engine`，所以 ContextEngine 仍只存在于隔离的 compaction realm。
 
+### 3.2.3 精确分词与 checkpoint 链预算（`exactTokens`）
+
+宿主的 token meter 把每个内容块按**固定 4 字符/token** 计价（`@deepseek-ai/dsh-token-meter/lib/types/estimate.js`）。在本部署的中文技术材料上这个密度是错的，而且是**方向性**的错：实测（DeepSeek-V3 BPE，1000 次请求的真实会话）
+
+| 材料 | chars/4 | 精确分词器 | 偏差 |
+| --- | --- | --- | --- |
+| 23 条 compartment summary | 58,812 | **106,911** | 1.82x 偏低（占 272k 窗口 39.3%） |
+| 中文 user 消息 | 9,405 | 19,241 | 2.05x 偏低 |
+| 英文/代码 assistant 消息 | 39,904 | 53,010 | 1.33x 偏低 |
+| 系统提示词 + 工具 schema | 6,722 | 5,814 | 0.86x（启发式反而偏高） |
+
+偏差随内容语言变化，所以**任何固定系数都修不好**。本插件因此自带一个可选的精确计数器（`lib/tokenizer.js`）：
+
+- 用 Rust 绑定 `tokenizers`（`Tokenizer.fromFile`）加载 `$DSH_HOME/magic-context/tokenizers/<tokenizerFile>`（默认 `deepseek.json`，`scripts/fetch-tokenizer.mjs` 下载约 7.5MB 的 DeepSeek-V3 词表）。
+- 逐块计价，但保持宿主估算器的**结构**（每 block +4、每条 message +4），因此数字与宿主口径可比，只差密度模型。
+- surface 节点不可变，所以按 seq 缓存：每步只给新增节点分词（一次完整 surface 约 1.5s，增量后为毫秒级）。
+- 全程 fail-open：绑定缺失、词表缺失或编码失败都返回 `null`，调用方继续用宿主启发式。不可用状态每 60s 重试一次（`LOAD_RETRY_MS`），因为补装绑定或下载词表都可能在进程运行期间发生。
+
+部署两步（缺任一步都只是回退到启发式，不会报错）：
+
+```bash
+dsh plugin --profile web add tokenizers          # 装进 $DSH_HOME/profiles/web/node_modules/
+node scripts/fetch-tokenizer.mjs                 # 词表落到 $DSH_HOME/magic-context/tokenizers/
+ln -sfn "$DSH_HOME/profiles/web/node_modules/tokenizers" \
+        "$DSH_HOME/profiles/node_modules/dsh-magic-context/node_modules/tokenizers"
+```
+
+第三条链接是必需的：插件运行副本自己的 `node_modules/`（rsync 排除、保存可选 peer）才是 `import("tokenizers")` 的解析目标，`profiles/web/node_modules` 不在它的解析路径上。profile 被 pnpm 重新 prune 后要重建该链接。
+
+面板因此多出一行 **`实际占用`**（`measured`）：它是宿主 `measure().totalTokens`，也就是压缩触发真正依据的数字——请求头未变时直接取 provider 返回的精确 usage，只对锚点之后的新增内容做估算。上面各行是构成估算，这一行是锚定值；`↳ Compartment` 的 tooltip 同时给出精确值与 chars/4 对照值。
+
+### 3.2.4 checkpoint 链条预算（`compartmentBudgetRatio`）
+
+`range.js` 的链条设计决定：下一次 range 从**受保护的 system head 与最后一个 checkpoint 之后**开始，已落地的 checkpoint 永不重摘要。因此 0.1.5 的 surface 是 `[system][C1][C2]…[Ck] + 新内容`，链条只增不减——唯一的退休机制是归档。`selectCompartmentRange` 与 host `dsh-compaction-basic` 一样，永远从第一个非 `system/message` 的 surface 节点起选；落地时 `adjustLandingStart` 会把仍指向 system head（含被后续 prompt 更新换掉的旧 head）的历史 ready 行裁到同一起点，否则 replace 会被 host 拒绝（`surface replace: node 0 holds the system prompt…`）。
+
+归档原先只在 **Dreamer pass 结束时**触发（`runArchival` 的 3 个调用点全在 Dreamer 路径里），且预算 `compartmentBudgetTokens` 用的还是 chars/4。实测会话因此停在：23 个未归档 checkpoint（106,911 精确 token ≈ 窗口 39%）+ 记忆前缀 + system/tools + 保留尾部 ≈ 落地后仍高于 65% 生成线，于是每次落地后 2-6 分钟就再次生成。
+
+现在的规则：
+
+- `agent/pre-step` 里落地之后立即执行 `_boundCheckpointChain()`，**不再依赖 Dreamer 是否成功运行**。
+- 预算优先跟随路由窗口：`compartmentBudgetRatio`（默认 0.15）× 该 session 的 `contextWindow`；窗口未知时回退到绝对值 `compartmentBudgetTokens`。ratio 置 0 可关闭该路径。
+- 只处理**当前 session** 的链条（`runArchival({ sessionId })`），Dreamer 的全局预算保持原样。
+- 摘要价格在生成完成时用精确分词器写入 `compartments.summary_tokens`，`runArchival` 优先用它、缺失时回退 chars/4。
+- 归档成功后由 `_removeArchivedCheckpoints()` 在下一个 pre-step 把对应节点从 surface 撤下（该机制本来就每次 pre-step 运行，卡点只在"标记"）。
+
 ### 3.3 落地事务（事件契约，与内置一致）
 
-`compaction/start`（锁）→ `compaction/summary`（含代次、覆盖范围、shadowedSeqs、摘要）→ `user/message`（`surfaceOp:{op:"replace",start,end}` + `compactCheckpointSource(compactionId)` + `sourceEventSeqs`）→ `compaction/end`。复用 `BasicCompactionEngine` 的事务、稳定性断言、`/compact`（`compactNow` → `runMaintenance`）。
+`compaction/start`（锁）→ `compaction/summary`（含代次、覆盖范围、shadowedSeqs、摘要）→ `user/message`（`surfaceOp:{op:"replace",startSeq,endSeq}` + `compactCheckpointSource(compactionId)` + `sourceEventSeqs`）→ `compaction/end`。复用 `BasicCompactionEngine` 的事务、稳定性断言、`/compact`（`compactNow` → `runMaintenance`）。
+
+替换标记的键名在 0.1.5 改名：0.1.2 读写 `{op,start,end}`，0.1.5 的 `isReplaceOp` 只接受 `{op,startSeq,endSeq}`。硬编码任一种都会在跨版本时炸（0.1.5 上写旧形状 = `session event "user/message" carries an invalid replace surfaceOp`，每次落地都失败；反向则让旧 reader 折叠 surface 时找不到节点）。因此 `lib/session-compat.js` 的 `replaceSurfaceOp()` 用 **host 自己的校验器**做一次 memoized 探针：两个形状各试一次，只有一方被接受就采用它，两者同判（宽松校验器 / 没有 `./surface` 子路径）则退回 0.1.2 的 `start/end`。引擎构造时预热探针，避免首次落地在压缩事务里付模块加载的代价。`landing.js` 的落地与 `engine.js` 的归档清理两处写入都用它；`shadowedRange` 保持 `{start,end}` 不变（实测 v3 日志仍是这个形状）。
+
+### 3.3.1 事件坐标纪元（0.1.5 v0→v3 迁移的后果）
+
+0.1.5 的格式迁移把 v0 日志重写成 v3：折叠掉整条 `assistant/chunk` 流并插入合成的 `system/message`，**每个事件都被重新编号**。magic-context 的 seq 键行（`paragraphs`、`skip_marks`；`compartments.start_seq/end_seq`、`memories.source_start_seq/end_seq` 是引用）因此落在一套已不存在的坐标系里。这不是"明显报错"而是"静默取错"：`paragraphFor(sessionId, seq)` 只要新旧空间有重叠就会命中过期行，`§N§` 前缀挂到别的消息上，`ctx_expand` 取回别的段落。
+
+**为什么是重建而不是映射**：段落号是单调递增的"第几条模型可见消息"，不是内容身份。实测（见 `docs/dsh-015-upgrade-handoff.md` §B）：一个会话的 `paragraphs` 分成前迁移 head 段（旧 seq + 旧段落号）和后迁移 tail 段（实时 seq + 接续旧计数器的段落号），tail 的段落号在**任何**固定偏移下都对不上实时回放的 rank——旧号无法翻译。所以 `lib/coordinates.js` 的策略是**重建**：
+
+- `replayParagraphs(session)` 用与引擎相同的 `createParagraphAssigner` 规则按实时事件序回放并重排段落号 1..N（同一日志回放两次结果相同 → 幂等）。
+- `rebuildSessionCoordinates()` 在一个事务里整体替换该会话的 `paragraphs`，并按新编号重算 `skip_marks`（seq 已不是实时段落的标记被丢弃，避免标记到错误段落）。
+- 纪元由 `session_epochs(session_id, format_version, events, rebuilt_at)` 记录：`agent/session-start` 时 `inspectSessionCoordinates()` 判为 `current` 就跳过，`empty`（无行）只补标记，`stale` 才重建。新会话永远不会重建。
+- `retireStaleReadyCompartments()` 把 span 落在日志长度之外的 `ready` compartment 标记为 `stale`（status=failed + 原因）：这类行既不可能落地、又因"有 ready 就跳过生成"而堵住后续压缩，退掉它是自愈的关键。实时坐标的 ready 行不受影响（判据只有日志长度）。
+- landing 里另有 `assertSpanInCurrentLog()`：span 越过日志末尾时直接拒绝（按"span 已变"失败，绝不拿新坐标去替换无关内容），覆盖未经 session-start 钩子的旁路。
+- 截断保护 `DEFAULT_RETAIN_RATIO = 0.5`：迁移会让合法回放变小（实测保留 52%~95%），但 5 事件的日志声称 2308 段（本库真实存在）是日志被截断，不是坐标过期——低于该比例的重建被拒绝并报告，需 `--force` 才覆盖。
+- `compartments`/`memories` 的旧 seq 引用**不做映射**：旧坐标没有对应的实时事件，映射只能编造。可以留着是因为只有 `ready` compartment 会消费这些列（落地），已被上面的机制覆盖；已落地行的 `landing_seq` 只被 `_removeArchivedCheckpoints` 读取，且带 `nodes.includes(seq)` 检查，过期值是个 no-op。
+
+离线入口：`scripts/rebuild-coordinates.mjs [--dry-run] [--force] [all | <id> ...]`，写前 `VACUUM INTO` 备份，只读每个会话的**最高世代**日志（`lib/logs.js`）。已迁移会话实测：`078919ac` 1558→818、`c71b3623` 4273→2142、`390452a4` 2326→1205 行，`mismatched=0` / `missingSeqs=0`，并退掉两个不可达的 ready 行（429、438）。
 
 ### 3.4 ctx_reduce / ctx_expand 工具
 
@@ -488,7 +551,10 @@ dreamerIdleMinutes: 15          # 会话空闲触发
 dreamerMaxRounds: 20            # 工具循环轮次上限
 dreamerTimeoutMs: 600000        # 总超时
 verifyIntervalDays: 30          # 记忆校验周期
-compartmentBudgetTokens: 40000  # 未归档 Compartments 总预算
+compartmentBudgetTokens: 40000  # 未归档 Compartments 总预算（窗口未知时的回退值）
+compartmentBudgetRatio: 0.15    # 本 session 存活 checkpoint 链占路由窗口的上限；0 关闭落地路径的裁剪
+exactTokens: true               # 用 Rust tokenizers 精确计价（缺绑定/词表时自动回退启发式）
+tokenizerFile: deepseek.json    # $DSH_HOME/magic-context/tokenizers/ 下的 BPE 词表
 dreamerProvider: ''             # 空 = 跟随会话路由
 dreamerModel: ''
 dreamerReasoningEffort: ''      # 空 = adapter 默认档位

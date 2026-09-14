@@ -22,6 +22,14 @@
  * file is kept beside the log as `session.jsonl.zstd.bak-<unix-ms>` before any
  * write; repair is atomic (temporary file plus rename).
  *
+ * A fourth, non-corrupting class is covered by lib/normalize.js: released-v0
+ * schema violations (a `command/run.source` carrying a `plugin` member, a
+ * `model/selection` carrying `maxTokens`, a `subagent/descriptor` at version 2).
+ * The 0.1.2 line loads such logs happily and a 0.1.5 reader refuses to MIGRATE
+ * them, so the session stays listed but cannot be resumed there; `scan` reports
+ * them as `legacyShapes`/`migrationReady` rather than as corruption, and
+ * `repair` normalizes them in the same write.
+ *
  * The zstd codec is the `zstd` CLI: DSH writes session logs as many
  * concatenated frames (one per append batch), which the one-shot zlib zstd
  * functions do not decode.
@@ -35,7 +43,8 @@ import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { zstdDecompressSync } from "node:zlib";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
-import { encodeSegment, parseLog, projectKey, repairRows, scanRows, serializeLog } from "./repair.js";
+import { encodeSegment, parseLog, projectKey, repairRows, repairStaleProvenance, scanProvenance, scanRows, serializeLog } from "./repair.js";
+import { normalizeRows, scanLegacyShapes } from "./normalize.js";
 
 export const name = "dsh-plugin-session-repair";
 
@@ -160,6 +169,12 @@ export function scanSessionFile(path) {
   const scan = scanRows(parsed.rows);
   const gap = scan.gap;
   const seqCorrupted = !scan.ok;
+  const provenance = scanProvenance(parsed.rows);
+  // Released-v0 schema violations. These do NOT count as corruption: the current
+  // line loads the log happily and a 0.1.5 reader refuses to MIGRATE it, so the
+  // session stays listed and readable but cannot be resumed there. See
+  // lib/normalize.js for the four shapes and how each is rewritten.
+  const legacy = scanLegacyShapes(parsed.rows);
   const session = {
     sessionId: parsed.header?.id ?? null,
     sizeBytes: stat.size,
@@ -168,8 +183,22 @@ export function scanSessionFile(path) {
     lastSeq: scan.lastSeq,
     containerBroken,
     // A container-broken log bricks every profile at boot even when its seq
-    // numbering is healthy, so it counts as corrupted either way.
-    corrupted: seqCorrupted || containerBroken,
+    // numbering is healthy; stale provenance blocks every compaction for the
+    // session (the token meter refuses to re-assemble provider output), so
+    // either counts as corrupted.
+    corrupted: seqCorrupted || containerBroken || provenance.length > 0,
+    staleProvenance: provenance.length,
+    staleProvenanceSample: provenance.length > 0
+      ? { seq: provenance[0].seq, invalidSeqs: provenance[0].invalidSeqs.slice(0, 4) }
+      : null,
+    legacyShapes: legacy.length,
+    legacyShapeSample: legacy.length > 0
+      ? { seq: legacy[0].seq, type: legacy[0].type, fix: legacy[0].fix, detail: legacy[0].detail }
+      : null,
+    legacyUnfixable: legacy.filter((entry) => entry.unfixable).length,
+    // A normalized log is what a newer line's migration audits before it
+    // publishes a successor generation.
+    migrationReady: legacy.length === 0,
     gap: null,
     hasSyntheticBatch: false,
     backups: listBackups(path)
@@ -195,6 +224,10 @@ export function scanWorkspaces(cwd) {
 
   const sessions = [];
   const healthy = [];
+  // Schema-hygienic but structurally healthy logs that a 0.1.5 reader would
+  // refuse to migrate: reported separately so an operator can normalize them
+  // before moving to a newer line without treating them as corruption.
+  const needsNormalization = [];
   for (const dir of dirs) {
     let entries;
     try {
@@ -208,13 +241,34 @@ export function scanWorkspaces(cwd) {
       try {
         const info = scanSessionFile(path);
         info.projectDir = dir;
-        (info.corrupted ? sessions : healthy).push(info);
+        if (info.corrupted) {
+          sessions.push(info);
+          continue;
+        }
+        healthy.push(info);
+        if (info.legacyShapes > 0) {
+          needsNormalization.push({
+            sessionId: info.sessionId,
+            projectDir: dir,
+            legacyShapes: info.legacyShapes,
+            legacyUnfixable: info.legacyUnfixable,
+            legacyShapeSample: info.legacyShapeSample,
+            // A sweep that rewrites logs must be able to tell whether a log is
+            // being written right now (see the CLI's --min-age-seconds).
+            mtimeMs: info.mtimeMs
+          });
+        }
       } catch (error) {
         sessions.push({ sessionId: entry, projectDir: dir, corrupted: true, error: String(error?.message ?? error), backups: [] });
       }
     }
   }
-  return { sessions, healthyCount: healthy.length };
+  return {
+    sessions,
+    healthyCount: healthy.length,
+    legacyShapedCount: needsNormalization.length,
+    needsNormalization
+  };
 }
 
 /** End a JSON response. */
@@ -272,8 +326,10 @@ export function repairLogFile(path, dryRun) {
 
   const before = scanRows(parsed.rows);
   const containerBroken = containerHeaderBroken(path);
-  if (before.ok && !containerBroken) {
-    return { ok: false, status: 409, error: "session log is not corrupted" };
+  const provenance = scanProvenance(parsed.rows);
+  const legacy = scanLegacyShapes(parsed.rows);
+  if (before.ok && !containerBroken && provenance.length === 0 && legacy.length === 0) {
+    return { ok: false, status: 409, error: "session log needs no repair" };
   }
 
   let repaired = null;
@@ -286,12 +342,37 @@ export function repairLogFile(path, dryRun) {
     passes = repaired.passes;
   }
 
+  let provenancePass = null;
+  if (provenance.length > 0) {
+    provenancePass = repairStaleProvenance(parsed.rows);
+    if (provenancePass === null || !provenancePass.ok) {
+      return { ok: false, status: 422, error: "stale provenance could not be realigned onto chunk slots", staleProvenance: provenance };
+    }
+  }
+
+  let normalizePass = null;
+  if (legacy.length > 0) {
+    normalizePass = normalizeRows(parsed.rows);
+    if (!normalizePass.ok) {
+      return {
+        ok: false,
+        status: 422,
+        error: "released-v0 schema violations could not be normalized",
+        legacyShapes: normalizePass.unfixable
+      };
+    }
+  }
+
   const summary = {
     ok: true,
     dryRun: dryRun === true,
     path,
     containerBroken,
-    recontainerizeOnly: before.ok && containerBroken,
+    recontainerizeOnly: before.ok && containerBroken && provenance.length === 0 && legacy.length === 0,
+    staleProvenance: provenance.length,
+    provenancePass,
+    legacyShapes: legacy.length,
+    normalizePass,
     gap: before.ok ? null : { expected: before.gap.expected, got: before.gap.got },
     passes,
     eventsBefore: before.events,
@@ -311,8 +392,9 @@ export function repairLogFile(path, dryRun) {
   writeFileSync(tmpPath, compressLog(serializeLog(parsed)));
   renameSync(tmpPath, path);
 
-  // Refuse to report success unless the written file passes the exact seq scan
-  // AND the container contract (first frame decodes to exactly the header).
+  // Refuse to report success unless the written file passes the exact seq scan,
+  // the container contract (first frame decodes to exactly the header), AND the
+  // provenance scan (every cited source seq is an assistant/chunk slot).
   const after = parseLog(decompressLog(path).toString("utf8"));
   const verify = scanRows(after.rows);
   if (!verify.ok) {
@@ -320,6 +402,14 @@ export function repairLogFile(path, dryRun) {
   }
   if (containerHeaderBroken(path)) {
     return { ok: false, status: 500, error: "post-repair verification failed: container framing is broken", backup: backupPath };
+  }
+  const verifyProvenance = scanProvenance(after.rows);
+  if (verifyProvenance.length > 0) {
+    return { ok: false, status: 500, error: `post-repair verification failed: ${verifyProvenance.length} provenance issue(s) remain`, backup: backupPath };
+  }
+  const verifyLegacy = scanLegacyShapes(after.rows);
+  if (verifyLegacy.length > 0) {
+    return { ok: false, status: 500, error: `post-repair verification failed: ${verifyLegacy.length} released-v0 schema violation(s) remain`, backup: backupPath };
   }
   summary.verified = true;
   return summary;

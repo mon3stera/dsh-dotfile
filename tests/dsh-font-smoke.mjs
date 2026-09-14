@@ -9,7 +9,7 @@
  * custom-property token stream. The plugin manages ordered font stacks
  * (body/code) plus size and weight deltas.
  */
-import { readFileSync, existsSync, mkdirSync, rmSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, rmSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
@@ -48,6 +48,7 @@ globalThis.MutationObserver = class {
   disconnect() { }
 };
 const styleTags = [];
+const createdTags = [];
 globalThis.document = {
   documentElement: docEl,
   body: fakeBody,
@@ -55,7 +56,17 @@ globalThis.document = {
     appendChild(tag) { styleTags.push(tag); }
   },
   querySelectorAll() { return []; },
-  createElement(tag) { return { dataset: {}, textContent: "", style: {}, remove() { } }; },
+  createElement(tag) {
+    if (tag === "canvas") {
+      /* width probe stub: Noto Sans SC / DejaVu Sans measure as locally installed */
+      const ctx2d = { font: "" };
+      ctx2d.measureText = (text) => ({ width: /Noto Sans SC|DejaVu Sans/.test(ctx2d.font) ? 200 : 77 });
+      return { getContext: () => ctx2d };
+    }
+    const el = { tagName: tag, dataset: {}, textContent: "", style: {}, removed: false, remove() { el.removed = true; } };
+    createdTags.push(el);
+    return el;
+  },
   getElementById() { return { value: "" }; }
 };
 const FONT_VARS = new Map();
@@ -106,7 +117,16 @@ const postedConfigs = [];
 let configStore = null; // null => 404
 globalThis.fetch = async (url, opts) => {
   if (url === "/font/list") {
-    return { ok: true, status: 200, json: async () => ({ ok: true, families: ["DejaVu Sans", "LXGW WenKai", "Noto Sans SC"], mono: ["JetBrainsMono Nerd Font", "Noto Sans Mono"] }) };
+    return { ok: true, status: 200, json: async () => ({
+      ok: true,
+      families: ["DejaVu Sans", "LXGW WenKai", "Noto Sans SC"],
+      mono: ["JetBrainsMono Nerd Font", "Noto Sans Mono"],
+      faces: {
+        "LXGW WenKai": [{ ext: "ttf", weight: 80, slant: 0 }, { ext: "ttf", weight: 200, slant: 0 }],
+        "DejaVu Sans": [{ ext: "otf", weight: 80, slant: 0 }],
+        "Noto Sans SC": [{ ext: "otf", weight: 80, slant: 0 }]
+      }
+    }) };
   }
   if (url === "/font/config" && opts?.method === "POST") {
     postedConfigs.push(JSON.parse(opts.body));
@@ -186,7 +206,8 @@ const renderTree = (node) => {
   return node;
 };
 const renderRow = () => renderTree(ctx._entry.Component({ t: (k) => ctx._locales.zh[k] ?? k, useStore, ...props }));
-const textInputs = (node) => countTags(node, "input").filter((i) => i.props.type !== "range");
+const textInputs = (node) => countTags(node, "input").filter((i) => i.props.type === "text");
+const webfontCheckbox = (node) => countTags(node, "input").find((i) => i.props.type === "checkbox");
 const countTags = (node, tag, out = []) => {
   if (!node || typeof node !== "object") return out;
   if (node.type === tag) out.push(node);
@@ -240,6 +261,31 @@ row = renderRow();
 if (!storeInstance.getSnapshot().families.includes("My Custom Font")) throw new Error("FAIL: custom entry not added: " + JSON.stringify(storeInstance.getSnapshot().families));
 if (!styleProps["--dsw-font-family"].includes("'My Custom Font',")) throw new Error("FAIL: custom entry not restacked: " + styleProps["--dsw-font-family"]);
 console.log("custom picker entry OK");
+
+// web fonts: catalog faces + the canvas width probe drive the @font-face rules.
+// The probe stub reports LXGW WenKai as NOT installed, so both faces (regular
+// 400 + bold 700) get rules; locally installed families get none.
+await new Promise((r) => setTimeout(r, 50)); // let a late catalog fetch settle
+props.setFontSize(14); // any commit re-runs applyTypography -> applyWebFonts
+const webTag = styleTags.find((t) => t.dataset && t.dataset.pluginCss === "dsh-plugin-font/webfonts.css");
+if (!webTag) throw new Error("FAIL: webfont style tag missing");
+if (!webTag.textContent.includes("@font-face{font-family:'LXGW WenKai';src:url(\"/font/file?family=LXGW%20WenKai&index=0\") format(\"truetype\");font-display:swap;font-weight:400;font-style:normal;}")) throw new Error("FAIL: regular face rule: " + webTag.textContent);
+if (!webTag.textContent.includes("index=1\") format(\"truetype\");font-display:swap;font-weight:700")) throw new Error("FAIL: bold face rule: " + webTag.textContent);
+if (webTag.textContent.includes("Noto Sans SC") || webTag.textContent.includes("DejaVu Sans")) throw new Error("FAIL: locally available families must not get rules: " + webTag.textContent);
+if (webTag.textContent.includes("My Custom Font")) throw new Error("FAIL: family without catalog faces must be skipped: " + webTag.textContent);
+console.log("webfont rules OK: local-first skip + per-face weight mapping");
+
+// toggle off: tag dropped; toggle on: rules rebuilt
+const toggle = webfontCheckbox(renderRow());
+if (!toggle) throw new Error("FAIL: webfont toggle missing from the row");
+if (toggle.props.checked !== true) throw new Error("FAIL: toggle default should be on");
+toggle.props.onChange({ target: { checked: false } });
+if (webTag.removed !== true) throw new Error("FAIL: toggle off should remove the webfont tag");
+props.setServeFontFiles(true);
+const webTag2 = styleTags.filter((t) => t.dataset && t.dataset.pluginCss === "dsh-plugin-font/webfonts.css").pop();
+if (!webTag2 || webTag2 === webTag || !webTag2.textContent.includes("LXGW WenKai")) throw new Error("FAIL: toggle on should recreate the rules");
+console.log("webfont toggle OK");
+
 
 // sizes (weight still 0): probe-resolved baselines; body and code scale independently
 props.setFontSize(15);
@@ -427,32 +473,97 @@ await handleConfig(bigReq, res);
 if (res.out.status !== 413) throw new Error("FAIL: oversize config should 413");
 if (consumed !== big.length) throw new Error("FAIL: oversize body not drained");
 
-// font enumeration: parse + route with stubbed fc-list runner
-const { parseFcFamilies, handleFontList, _setFontRunner, _resetFontCache } = host;
+// font enumeration: faces parsing + routes with a stubbed fc-list runner
+const { parseFcFamilies, parseFcFaces, handleFontList, handleFontFile, _setFontRunner, _resetFontCache } = host;
 const fcRaw = "Noto Sans Khmer,Noto Sans Khmer SemiBold\n  LXGW WenKai  \nLXGW WenKai\nNoto Sans SC\n";
 const parsed = parseFcFamilies(fcRaw);
 if (parsed.join("|") !== "LXGW WenKai|Noto Sans Khmer|Noto Sans Khmer SemiBold|Noto Sans SC") throw new Error("FAIL: parse: " + parsed.join("|"));
+
+const US = "\u001F";
+const faceLines = [
+  `${TEST_HOME}/fonts/Fake-LXGW-Regular.ttf${US}LXGW WenKai${US}80${US}0${US}0`,
+  `${TEST_HOME}/fonts/Fake-LXGW-Bold.ttf${US}LXGW WenKai${US}200${US}0${US}0`,
+  `${TEST_HOME}/fonts/Fake-DejaVu.otf${US}DejaVu Sans${US}80${US}0${US}0`,
+  `${TEST_HOME}/fonts/Fake-Italic.ttf${US}Fake Family${US}80${US}100${US}0`,
+  `${TEST_HOME}/fonts/Fake-Bitmap.pcf${US}Bitmap Family${US}80${US}0${US}0`,
+  `${TEST_HOME}/fonts/Fake-Multi.ttf${US}Khmer A,Khmer B${US}100${US}0${US}0`
+];
+const faces = parseFcFaces(faceLines.join("\n"));
+if ((faces["LXGW WenKai"] || []).length !== 2) throw new Error("FAIL: two faces for LXGW: " + JSON.stringify(faces["LXGW WenKai"]));
+if (faces["LXGW WenKai"][0].ext !== "ttf" || faces["LXGW WenKai"][0].weight !== 80 || faces["LXGW WenKai"][1].weight !== 200) throw new Error("FAIL: face fields: " + JSON.stringify(faces["LXGW WenKai"]));
+if (faces["Khmer A"]?.length !== 1 || faces["Khmer B"]?.length !== 1) throw new Error("FAIL: multi-family face: " + JSON.stringify(faces));
+if (faces["Bitmap Family"]) throw new Error("FAIL: bitmap faces must be skipped");
+if (parseFcFaces("garbage\n\n")[0] !== undefined) throw new Error("FAIL: malformed lines should be skipped");
+
+mkdirSync(TEST_HOME + "/fonts", { recursive: true });
+const fakeFontBytes = Buffer.from("FAKE TTF BYTES");
+for (const name of ["Fake-LXGW-Regular.ttf", "Fake-LXGW-Bold.ttf", "Fake-DejaVu.otf", "Fake-Italic.ttf"]) {
+  writeFileSync(TEST_HOME + "/fonts/" + name, fakeFontBytes);
+}
+
 let runnerCalls = 0;
-_setFontRunner((query, cb) => {
+_setFontRunner((args, cb) => {
   runnerCalls += 1;
-  cb(null, query === ":spacing=100" ? "JetBrainsMono Nerd Font\nNoto Sans Mono\n" : fcRaw);
+  const pattern = args.join(" ");
+  if (pattern.includes("spacing=100")) { cb(null, "JetBrainsMono Nerd Font\nNoto Sans Mono\n"); return; }
+  if (pattern.includes("--format=")) { cb(null, faceLines.join("\n")); return; }
+  cb(new Error("unexpected fc-list args: " + pattern));
 });
 res = fakeRes();
 await handleFontList(fakeReq("/font/list", null, {}, "GET"), res);
 const catalog = JSON.parse(res.out.body);
-if (!catalog.ok || catalog.families.length !== 4 || !catalog.mono.includes("JetBrainsMono Nerd Font")) throw new Error("FAIL: catalog: " + res.out.body);
+if (!catalog.ok || catalog.families.length !== 5 || !catalog.mono.includes("JetBrainsMono Nerd Font")) throw new Error("FAIL: catalog: " + res.out.body);
+if (!("LXGW WenKai" in catalog.faces) || catalog.faces["LXGW WenKai"].length !== 2) throw new Error("FAIL: faces in catalog: " + res.out.body);
+if (JSON.stringify(catalog.faces["LXGW WenKai"]) !== JSON.stringify([{ ext: "ttf", weight: 80, slant: 0 }, { ext: "ttf", weight: 200, slant: 0 }])) throw new Error("FAIL: wire faces must project ext/weight/slant only: " + res.out.body);
 // second call within TTL serves the cache (no extra fc-list runs)
 res = fakeRes();
 await handleFontList(fakeReq("/font/list", null, {}, "GET"), res);
 if (runnerCalls !== 2) throw new Error("FAIL: cache: runner called " + runnerCalls + " times");
+
+// /font/file serves an enumerated face; the family/index pair is the only addressing surface
+const fileReq = (query, method = "GET") => fakeReq(`/font/file${query}`, null, {}, method);
+res = fakeRes();
+await handleFontFile(fileReq("?family=LXGW%20WenKai&index=0"), res);
+if (res.out.status !== 200) throw new Error("FAIL: font file 200: " + res.out.status);
+if (res.out.headers["content-type"] !== "font/ttf" || res.out.headers["content-length"] !== fakeFontBytes.length) throw new Error("FAIL: file headers: " + JSON.stringify(res.out.headers));
+if (!res.out.headers["cache-control"].includes("immutable")) throw new Error("FAIL: immutable cache: " + JSON.stringify(res.out.headers));
+if (!res.out.body.equals(fakeFontBytes)) throw new Error("FAIL: file body bytes");
+res = fakeRes();
+await handleFontFile(fileReq("?family=LXGW%20WenKai&index=1"), res);
+if (res.out.headers["content-type"] !== "font/ttf") throw new Error("FAIL: index 1 should be the bold ttf");
+res = fakeRes();
+await handleFontFile(fileReq("?family=Fake%20Family&index=0"), res);
+if (res.out.headers["content-type"] !== "font/ttf") throw new Error("FAIL: italic face still ttf");
+res = fakeRes();
+await handleFontFile(fileReq("?family=LXGW%20WenKai&index=99"), res);
+if (res.out.status !== 404) throw new Error("FAIL: out-of-range index should 404");
+res = fakeRes();
+await handleFontFile(fileReq("?family=Nope&index=0"), res);
+if (res.out.status !== 404) throw new Error("FAIL: unknown family should 404");
+res = fakeRes();
+await handleFontFile(fileReq("?family=Bitmap%20Family&index=0"), res);
+if (res.out.status !== 404) throw new Error("FAIL: bitmap family should not be served");
+res = fakeRes();
+await handleFontFile(fileReq("?family=LXGW%20WenKai&index=0", "HEAD"), res);
+if (res.out.status !== 200 || res.out.body !== undefined) throw new Error("FAIL: HEAD should send headers only");
+res = fakeRes();
+await handleFontFile(fileReq("?family=LXGW%20WenKai&index=0", "PUT"), res);
+if (res.out.status !== 405) throw new Error("FAIL: PUT should 405");
+
+// missing file on disk (enumerated then deleted) -> 404, not a crash
+rmSync(TEST_HOME + "/fonts/Fake-DejaVu.otf");
+res = fakeRes();
+await handleFontFile(fileReq("?family=DejaVu%20Sans&index=0"), res);
+if (res.out.status !== 404) throw new Error("FAIL: vanished file should 404");
+
 // runner failure -> ok:false (client falls back to presets)
 _resetFontCache();
-_setFontRunner((query, cb) => cb(new Error("no fc-list")));
+_setFontRunner((args, cb) => cb(new Error("no fc-list")));
 res = fakeRes();
 await handleFontList(fakeReq("/font/list", null, {}, "GET"), res);
 const degraded = JSON.parse(res.out.body);
-if (degraded.ok !== false) throw new Error("FAIL: degraded catalog: " + res.out.body);
-console.log("font enumeration OK (parse, route, cache, degrade)");
+if (degraded.ok !== false || degraded.faces === undefined) throw new Error("FAIL: degraded catalog: " + res.out.body);
+console.log("font enumeration OK (faces, routes, cache, file serving, degrade)");
 
 console.log("HOST SMOKE OK");
 rmSync(TEST_HOME, { recursive: true, force: true });

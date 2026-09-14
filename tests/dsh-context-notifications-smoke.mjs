@@ -9,6 +9,7 @@ import {
 	settleActivity,
 	startActivity,
 } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-magic-context/lib/notifications.js";
+import { scanLegacyShapes } from "/home/mon3tr/.dsh/profiles/node_modules/dsh-plugin-session-repair/lib/normalize.js";
 
 let failed = 0;
 const check = (label, ok) => {
@@ -35,7 +36,8 @@ const runningId = startActivity(session, "Context: compartment generation 7");
 check("start appends command/run", session.events.length === 1 && session.events[0].type === "command/run");
 check("start returns the pairing id", typeof runningId === "string" && runningId.length > 0);
 check("run carries the row title as name", session.events[0].data.name === "Context: compartment generation 7");
-check("run declares the plugin as source", session.events[0].data.source.kind === "plugin" && session.events[0].data.source.plugin === "dsh-magic-context");
+check("run declares the released source shape", session.events[0].data.source.kind === "user" && Object.keys(session.events[0].data.source).length === 1);
+check("run keeps plugin attribution in the commandId namespace", session.events[0].data.commandId.startsWith("dsh-magic-context/"));
 check("run has no surface marker", session.events[0].opts === undefined);
 check("run alone leaves the row running (no done event)", session.events.filter((event) => event.type === "command/done").length === 0);
 
@@ -55,6 +57,19 @@ check("recordActivity writes a settled pair", recordActivity(oneShot, "Context: 
 check("settled pair is run then done", oneShot.events.map((event) => event.type).join(",") === "command/run,command/done");
 check("recordActivity defaults to success", oneShot.events[1].data.kind === "success");
 check("recordActivity forwards an error kind", recordActivity(fakeSession(), "t", "boom", "error") === true);
+
+// --- released-schema hygiene -------------------------------------------------
+//
+// The frozen v0 member inventory is what a newer line's format catalog audits
+// before it migrates a stored log, and one offending member refuses the WHOLE
+// session there (the resume write-open fails while the file stays byte-identical).
+// Every row this module emits must therefore pass the same rules the offline
+// normalizer enforces; the two plugins are checked against each other so a future
+// member added here fails this test instead of stranding sessions on the upgrade.
+
+const asRow = (event) => ({ obj: { type: event.type, seq: event.seq ?? 0, data: event.data } });
+const emitted = [...session.events, ...errorSession.events, ...oneShot.events];
+check("activity rows carry no released-v0 schema violation", scanLegacyShapes(emitted.map(asRow)).length === 0);
 
 // --- boundaries and refusals -------------------------------------------------
 

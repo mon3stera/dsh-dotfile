@@ -1,0 +1,26 @@
+{
+  "name": "dsh-plugin-effects",
+  "version": "0.1.0",
+  "description": "Decorative background particle effects for the DSH web surface: rain, starfield, snow, and fireflies rendered on a pointer-transparent canvas overlay, with a settings row in General. Persisted across restarts.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-theme",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT"
+}

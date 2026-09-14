@@ -107,18 +107,39 @@ export function scanRows(rows) {
   return { ok: true, events: expected, lastSeq: expected - 1, gap: null };
 }
 
+/** Shift one storage-form provenance entry (a bare seq, or an inclusive
+ * [start, end] pair as written by the reader's range encoding). */
+function shiftProvenanceEntry(entry, threshold, delta) {
+  if (Array.isArray(entry) && entry.length === 2 && entry.every((seq) => typeof seq === "number")) {
+    return entry.map((seq) => (seq >= threshold ? seq + delta : seq));
+  }
+  return typeof entry === "number" && entry >= threshold ? entry + delta : entry;
+}
+
 /** Shift every seq-bearing field of one row by `delta`. */
 function shiftRow(obj, threshold, delta) {
   if (typeof obj === "object" && obj !== null) {
     if (typeof obj.seq === "number" && obj.seq >= threshold) obj.seq += delta;
     if (typeof obj.seq0 === "number" && obj.seq0 >= threshold) obj.seq0 += delta;
     if (Array.isArray(obj.sourceEventSeqs)) {
-      obj.sourceEventSeqs = obj.sourceEventSeqs.map((seq) => (seq >= threshold ? seq + delta : seq));
+      // Storage form mixes bare seqs with inclusive [start, end] pairs; a
+      // naive flat map silently skips the pairs (array >= number is always
+      // false), which is exactly how the 2026-09-06 batch left stale
+      // provenance behind.
+      obj.sourceEventSeqs = obj.sourceEventSeqs.map((entry) => shiftProvenanceEntry(entry, threshold, delta));
     }
     if (obj.surfaceOp !== null && typeof obj.surfaceOp === "object" && !Array.isArray(obj.surfaceOp)) {
+      // The positional-replacement marker was renamed at 0.1.5: a v0 log carries
+      // `{op, start, end}`, a v3 log `{op, startSeq, endSeq}` (the host's
+      // isReplaceOp validates exactly the latter). Both shapes must ride the
+      // renumber — a marker left behind fails restore's surface fold with
+      // "surface replace: end seq ... not found in surface" while the
+      // contiguity scan still passes.
       const op = obj.surfaceOp;
-      if (typeof op.start === "number" && op.start >= threshold) op.start += delta;
-      if (typeof op.end === "number" && op.end >= threshold) op.end += delta;
+      const startKey = typeof op.start === "number" ? "start" : typeof op.startSeq === "number" ? "startSeq" : null;
+      const endKey = typeof op.end === "number" ? "end" : typeof op.endSeq === "number" ? "endSeq" : null;
+      if (startKey !== null && op[startKey] >= threshold) op[startKey] += delta;
+      if (endKey !== null && op[endKey] >= threshold) op[endKey] += delta;
     }
   }
 }
@@ -259,4 +280,134 @@ export function encodeSegment(raw) {
     else out += "~" + code.toString(16).toUpperCase().padStart(4, "0");
   }
   return out;
+}
+
+/**
+ * Decode storage-form provenance (bare seqs plus inclusive [start, end]
+ * pairs) into explicit seqs, mirroring the persistence reader's
+ * decodeSeqRanges. Returns null for a malformed value.
+ *
+ * @param {Array} value - one row's stored `sourceEventSeqs`.
+ * @returns {number[]|null}
+ */
+export function decodeProvenance(value) {
+  if (!Array.isArray(value)) return null;
+  const decoded = [];
+  for (const entry of value) {
+    if (typeof entry === "number") {
+      if (!Number.isSafeInteger(entry) || entry < 0) return null;
+      decoded.push(entry);
+      continue;
+    }
+    if (Array.isArray(entry) && entry.length === 2 && entry.every((seq) => typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0) && entry[0] <= entry[1]) {
+      for (let seq = entry[0]; seq <= entry[1]; seq++) decoded.push(seq);
+      continue;
+    }
+    return null;
+  }
+  return decoded;
+}
+
+/** Re-encode explicit seqs into the storage form (runs of 3+ become pairs). */
+function encodeProvenance(decoded) {
+  const out = [];
+  for (let start = 0; start < decoded.length;) {
+    let end = start;
+    while (end + 1 < decoded.length && decoded[end + 1] === decoded[end] + 1) end += 1;
+    if (end - start >= 2) out.push([decoded[start], decoded[end]]);
+    else for (let index = start; index <= end; index++) out.push(decoded[index]);
+    start = end + 1;
+  }
+  return out;
+}
+
+/**
+ * Set of seqs whose event slot is an `assistant/chunk`: explicit chunk rows
+ * and all three packed chunk-row tags (the reader expands every packed row
+ * member to an `assistant/chunk` event).
+ *
+ * @param {Array<{obj: object}>} rows - event rows (header excluded).
+ * @returns {Set<number>}
+ */
+export function buildChunkSlots(rows) {
+  const slots = new Set();
+  for (const row of rows) {
+    const obj = row.obj;
+    if (obj.type !== "assistant/chunk" && !CHUNK_ROW_TYPES.has(obj.type)) continue;
+    const span = rowSpan(obj);
+    if (span === null) continue;
+    for (let seq = span.start; seq < span.start + span.len; seq++) slots.add(seq);
+  }
+  return slots;
+}
+
+/**
+ * Scan the provenance of every `assistant/message` row: each cited seq must
+ * be strictly earlier than the message and resolve to an `assistant/chunk`
+ * slot (the token meter re-assembles provider output through them and throws
+ * otherwise, which silently blocks every compaction path for the session).
+ *
+ * @param {Array<{obj: object}>} rows - event rows (header excluded).
+ * @returns {Array<{index: number, seq: number, invalidSeqs: number[]}>}
+ */
+export function scanProvenance(rows) {
+  const chunks = buildChunkSlots(rows);
+  const issues = [];
+  for (const [index, row] of rows.entries()) {
+    const obj = row.obj;
+    if (obj?.type !== "assistant/message" || !Array.isArray(obj.sourceEventSeqs)) continue;
+    const decoded = decodeProvenance(obj.sourceEventSeqs);
+    if (decoded === null || decoded.length === 0) continue;
+    const bad = new Set();
+    for (const seq of decoded) {
+      if (seq >= obj.seq || !chunks.has(seq)) bad.add(seq);
+    }
+    if (bad.size > 0) issues.push({ index, seq: obj.seq, invalidSeqs: [...bad].sort((a, b) => a - b) });
+  }
+  return issues;
+}
+
+/**
+ * Resync stale provenance: a repair that renumbered event seqs but skipped
+ * range-encoded provenance pairs leaves `assistant/message` rows citing
+ * pre-shift positions. The stale list is uniformly off by the row's own
+ * renumber delta, so realign it onto the contiguous `assistant/chunk` run
+ * that ends immediately before the message (delta = run end - stale end),
+ * then accept the shift only when EVERY realigned seq lands on a chunk slot
+ * strictly before the message — a wrong alignment fails loudly instead of
+ * corrupting the row.
+ *
+ * @param {Array<{obj: object}>} rows - event rows (header excluded).
+ * @returns {object|null} pass summary, or null when nothing needed repair.
+ */
+export function repairStaleProvenance(rows) {
+  const issues = scanProvenance(rows);
+  if (issues.length === 0) return null;
+  const chunks = buildChunkSlots(rows);
+  const repaired = [];
+  const failures = [];
+  for (const issue of issues) {
+    const row = rows[issue.index].obj;
+    const decoded = decodeProvenance(row.sourceEventSeqs);
+    const span = rowSpan(row);
+    if (decoded === null || decoded.length === 0 || span === null) {
+      failures.push({ seq: issue.seq, reason: "malformed provenance" });
+      continue;
+    }
+
+    const runEnd = span.start - 1;
+    const delta = runEnd - decoded[decoded.length - 1];
+
+    const shifted = decoded.map((seq) => seq + delta);
+    if (delta === 0 || shifted.some((seq) => seq < 0 || seq >= row.seq || !chunks.has(seq))) {
+      failures.push({ seq: issue.seq, reason: `realignment by ${delta} does not land on chunk slots` });
+      continue;
+    }
+    row.sourceEventSeqs = encodeProvenance(shifted);
+    repaired.push({ seq: issue.seq, delta });
+  }
+  if (failures.length > 0) {
+    return { mode: "stale-provenance", repaired, failures, ok: false };
+  }
+  return { mode: "stale-provenance", repaired, failures, ok: true };
 }

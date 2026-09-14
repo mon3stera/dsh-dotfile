@@ -29,17 +29,20 @@ docs/
   session-seq-corruption-report.md  Upstream Discussion draft for the seq-collision corruption
   usage-dashboard.md          Usage dashboard: exact accounting, composition estimate, routes
   tool-gate.md                Progressive tool loading: restriction, catalog, expand
+  hypa.md                     Bash output compression through the Hypa runtime
 
 plugins/
   dsh-magic-context/         Compaction, memories, retrieval, provenance, Dreamer
   dsh-plugin-background/      Wallpaper/background settings and upload routes
   dsh-plugin-font/            Font settings and font discovery
   dsh-plugin-hide-session-titles/  Session-title visibility toggle
+  dsh-plugin-effects/          Decorative background particle effects
   dsh-plugin-outline/         Browser-only session outline panel
   dsh-plugin-diff-viewer/     Read-only git diff and file browser panel
   dsh-plugin-session-id/      Session id label in the session header
   dsh-plugin-usage/           Token-usage dashboard: per-request accounting and composition
   dsh-plugin-tool-gate/       Progressive tool loading: gate heavy tools behind tool_expand
+  dsh-plugin-hypa/            Bash output compression through the Hypa runtime
   dsh-plugin-mobile/          Phone-viewport ergonomics for the Web shell
   dsh-plugin-logo/            Custom Mon3tr brand mark and name
   dsh-plugin-image-model/     Image-generation endpoints as selectable models
@@ -58,6 +61,7 @@ tests/
   dsh-bg-smoke.mjs            Background plugin smoke test
   dsh-font-smoke.mjs          Font plugin smoke test
   dsh-session-titles-smoke.mjs  Session title plugin smoke test
+  dsh-effects-smoke.mjs       Background effects client + config route smoke test
   dsh-outline-smoke.mjs       Outline client smoke test
   dsh-diff-viewer-smoke.mjs   Diff viewer host routes and client contract test
   dsh-session-id-smoke.mjs    Session id header label client contract test
@@ -66,9 +70,10 @@ tests/
   dsh-image-model-smoke.mjs   Image adapter contract, prompt selection, admission limits
   dsh-scheduler-smoke.mjs     Scheduler math, routes, run-now, and panel contract test
   dsh-computer-use-smoke.mjs  Desktop tools: wire encoding, key mapping, tree render, live handshakes
-  dsh-session-repair-smoke.mjs Session repair: core repair passes, real decoder cross-check, host routes, container framing
+  dsh-session-repair-smoke.mjs Session repair: core repair passes (v0 and v3 marker shapes), row-encoding cross-check, host routes, container framing
   dsh-usage-smoke.mjs         Usage dashboard: collector exactness, host routes, client contract
   dsh-tool-gate-smoke.mjs     Tool gate: visible-deny math, expand transitions, lifecycle wiring
+  dsh-hypa-smoke.mjs          Hypa wrapping math, skip/fail-open paths, shadow registration
 ```
 
 ## Plugin Structure
@@ -110,6 +115,9 @@ lib/
   organizer-xml.js          Organizer XML/schema validation, local escaping repair, repair prompt
   aux-llm.js                Bounded retry/backoff for auxiliary (non-agent-loop) LLM calls
   landing.js                Stable checkpoint landing and surface replacement
+  session-compat.js         Cross-version session seams: eventAt reads and the replace-marker key-name probe
+  coordinates.js            Event-coordinate epochs: paragraph replay, session rebuild, stale-compartment retirement
+  logs.js                   Highest-generation session-log resolution and zstd reading
   commands.js               /dream, /ctx-search, /inject-memory, and /organize-memories commands
   notifications.js          Model-invisible activity rows and the model-facing notice
   scope.js                  Git-worktree/session scope resolution
@@ -134,7 +142,7 @@ Important context behavior:
 - Auxiliary output budgets are configurable and self-correcting: `summarizationMaxTokens` (32768) and `dreamerMaxTokens` (16384) are clamped to the target model's `defaultMaxTokens`, and `streamAux` grows the cap once on `MAX_TOKENS` instead of retrying an identical request. A reasoning model spends this budget on thinking first, so an under-sized cap truncates deterministically before any output.
 - Image content never blocks a text-only organizer: `stripImageContent()` replaces image blocks with a text placeholder, proactively when `resolveModelInfo().inputModalities` excludes `image` (deepseek declares `["text"]`), and as a one-shot recovery when an undeclared route answers `UNSUPPORTED_CONTENT`.
 - Provider failure text is normalized by `describeAuxFailure()` before it reaches `compartments.error` or any activity row. This mattered most while failures were injected as conversation content (a raw HTML error page rode every later request and fed the next attempt its own error page), and still bounds what a hostile provider string can write into the log.
-- `compactNow` distinguishes a busy agent (the maintenance task never started) from a work failure (`summary`, with the normalized reason) and an abort (`cancelled`). Reporting every failure as `busy` previously hid deterministic summarization failures.
+- `compactNow` distinguishes a busy agent (the maintenance task never started) from a work failure (`summary`, with the normalized reason) and an abort (`cancelled`). Reporting every failure as `busy` previously hid deterministic summarization failures. Deterministic trigger-path failures (the token meter refusing to measure, for example) are reported through `_reportCompactionFailure` as one settled error activity row per distinct reason per session — the 65% generation and 80% landing triggers fire on every step boundary and used to fail before the generation machinery opened its own row, leaving only a process-log warning nobody sees while the context keeps growing; a clean measurement clears the notice so a later failure re-reports.
 - Organizer XML stays fail-closed. When validation fails, one local schema-aware pass (`sanitizeOrganizerOutput`) may re-classify unescaped text as text and strip a markdown fence, but its result must pass the unchanged validator; otherwise the single bounded model repair call runs as before.
 - New memory writes and fact promotions carry source session/compartment provenance when available. Old memories may have no recoverable source provenance.
 - The main Agent receives `context-tool-guidance` for `ctx_reduce`, `ctx_expand`, `ctx_memory`, and `ctx_search`. It must `ctx_search` before writing a memory: update a duplicate, delete a stale row, and write only when neither applies.
@@ -148,8 +156,8 @@ Important context behavior:
 
 ### `dsh-plugin-font`
 
-- `lib/index.js`: `/font/config` route, validated font settings, `fc-list` discovery, and persistence under `$DSH_HOME/font/config.json`.
-- `lib/client.js`: browser settings row and font application.
+- `lib/index.js`: `/font/config` route, validated font settings (including the `serveFontFiles` toggle, default on), `fc-list` discovery, and persistence under `$DSH_HOME/font/config.json`. Discovery runs one `fc-list : --format=` template carrying `%{file}`/`%{family}`/`%{weight}`/`%{slant}`/`%{index}` joined by the ASCII unit separator — with an explicit trailing `\n`, because a custom `--format` replaces the default format whole and every face would otherwise land on one line. `/font/list` adds a per-family face projection (`{ext, weight, slant}` only — server-side paths never cross the wire), and `GET /font/file?family=&index=` serves one enumerated face as a web font: the family/index pair is the whole addressing surface (no path parameter, so nothing outside the fc-list enumeration is reachable), bitmap extensions are skipped, the response carries the extension-derived MIME plus `cache-control: immutable`.
+- `lib/client.js`: browser settings row and font application. The selected stack families are registered as web fonts through one `dsh-plugin-font/webfonts.css` style tag of `@font-face` rules pointing at `/font/file`; it is local-first — a canvas width probe (family-led font string vs a missing-font baseline) reports the family as locally installed, no rule is emitted and the system copy keeps its full weight fidelity. `document.fonts.check` is deliberately not used: it answers "can this text render without loading a font", so a missing family whose glyphs the fallback renders returns true and would wrongly skip the download. An undecidable probe (no canvas) counts as local, so a sandboxed document degrades to today's behaviour instead of forcing downloads. fontconfig's numeric weights (thin 0 .. black 210) map onto the CSS 100..900 scale and slant 100/200 onto italic. Families already served are tracked, because once a rule exists `check` would match the plugin's own face and wrongly skip it; the rules rebuild only when the text changes, an empty rule set removes the tag, and a panel checkbox (`serveFontFiles`, persisted only when off — absent means on) disables the whole feature.
 - Sizes drive the theme's own content-size axis (`--dsh-content-font-size` inline on body) in addition to the markdown overrides, so the user-message bubble (which sizes off that axis in the chat package) and the assistant content scale together. The theme presenter rewrites the axis on every theme apply, so a MutationObserver on the body style attribute re-asserts the explicit value; the follow state (no configured size) never touches the axis. The weight delta stays scoped to the markdown composites — the bubble inherits the body weight.
 - `package.json`: Web client injection and package exports.
 
@@ -157,6 +165,13 @@ Important context behavior:
 
 - `lib/index.js`: `/session-titles/config` route and persisted hidden-title toggle under `$DSH_HOME/session-titles/config.json`.
 - `lib/client.js`: browser toggle button and UI behavior.
+- `package.json`: Web client injection and package exports.
+
+### `dsh-plugin-effects`
+
+- Decorative background particle effects on a fixed, pointer-transparent canvas overlay above the whole shell: `rain` (tilted falling streaks), `stars` (twinkling starfield with flares), `snow` (swaying flakes), `fireflies` (wandering glowing motes), `orbit` (gray random-walk particles; the pointer is an attractor with a 140px capture radius — captured particles ease onto circular orbits around it and are released on pointer leave or past the 190px release radius), or `none`. `none` (the default) hides the canvas and never starts the loop.
+- `lib/index.js`: `/effects/config` route; persists `{effect, intensity, opacity}` under `$DSH_HOME/effects/config.json` (atomic write; the schemastery build has no `z.enum`, so the effect id is a `z.const` union).
+- `lib/client.js`: the canvas engine (`createEngine` — DPR-capped backing store, particle sets regenerated on resize/intensity change, rAF loop paused while `document.hidden`, `opacity` via canvas style) plus a "背景特效 / Background effects" row in Settings > General (`settings.general.item`, order 22): effect chips, a density stepper (0.25–2) and an opacity stepper (10–100%). The canvas positioning and `pointer-events: none` are inline styles, not rules, so no host stylesheet can dislodge them.
 - `package.json`: Web client injection and package exports.
 
 ### `dsh-plugin-outline`
@@ -200,6 +215,17 @@ Important context behavior:
 - Two deliberate cache rewrite points: the first request of a session (smaller prefix) and each expand call (the tool block changes). The catalog tells the model to batch expansions for exactly this reason.
 - Config: `enabled`, `hidden`, `sectionOrder` (1615), `expandToolName`. Mounted as a plain host patch row in the profile patch, not a preset row — per-agent restriction must happen when the agent exists, which the lifecycle hooks provide.
 - Verified end to end on an isolated instance: request 1 carried 17 tools (was 36) with the catalog in the system prompt; a real model turn called `tool_expand(["workflow", "subagent"])` and the next request (reason `change`) carried 19 with those present and the rest still gated. See `docs/tool-gate.md`.
+
+### `dsh-plugin-hypa`
+
+- Runs every foreground `bash` call through [Hypa](https://github.com/Hypabolic/Hypa): `hypa -c` buffers the output, applies deterministic reducers and DSL filters, and appends `[hypa: 363->206 tok, -43%, reducer=git-status]` when it saved tokens. The model's command string is untouched.
+- Integration is a **per-agent shadow** of the `bash` tool definition, not a hook. `tools/pre-execute` (the Claude-Code `PreToolUse` analogue) deliberately cannot rewrite `exec.arguments`, and `dsh-hooks-claude-code` parses `hookSpecificOutput.updatedInput` but only logs it, so Hypa's own `hypa hook --agent claude` bridge is a no-op here; mutating `exec.arguments` in a `tools/execute` wrapper is exactly the desync the design forbids. `ToolRuntime.view(scope)` applies the agent's own layer last, so `agent.ctx.tools.register({...base, execute})` shadows the inherited `bash`. `lib/index.js` (host plane, inject: `tools`, `systemPrompt`) captures the base definition BEFORE registering (the global view first, the agent view as fallback), then reuses description/parameters/output/presentation callbacks by reference, so the wire schema and the prompt prefix are unchanged. Lifecycle and re-shadow-on-resume mirror `dsh-plugin-tool-gate`.
+- `lib/wrap.js` (pure): `SHELL_WORDS` and `isBareShellWord` (Hypa spawns a simple command as argv directly, so `type`/`time`/`exit`/`cd` with no shell metacharacters fail with `hypa: An error occurred trying to start process` — those are skipped; `cd /tmp && pwd` carries shell syntax and wraps fine), `singleQuote`/`buildWrappedCommand` (`hypa --timeout-ms <ms> -c '<command>'`), `parseRewriteResult`/`outcomeWraps`, `skipReason`, `createDecisionCache`, and `createDecider`.
+- The executed command is built by the plugin, **not** taken from `hypa rewrite`: the rewritten string is double-quoted, so the outer shell expands `$` inside it (`grep -n '$foo' file` loses the literal `$`). Hypa still applies its reducers on the generic wrapper path — `hypa -c 'git status'` produced the same `reducer=git-status` footer as `hypa git status`. `--timeout-ms` is always passed because Hypa's own default is 30 s (10 min for package managers), far shorter than a harness bash call should die at; the model's `timeoutMs` wins, else `defaultTimeoutMs` (600000).
+- `hypa rewrite --json` exits 0/1/2/3 for Rewritten+GenericWrapper/Passthrough/Deny/Ask, so `execFile` rejects on three of the four decisions with a valid JSON payload on stdout — the rejection payload is parsed before treating it as a failure. `Passthrough`/`Deny`/`Ask` run the original: compression is not a policy layer.
+- Skips, all failing open: `enabled: false`, empty command, an existing `hypa` command, `run_in_background: true` (buffering would break incremental `job_output` reads), a bare shell builtin, a sandbox mode outside `sandboxModes` (Hypa writes `~/.hypa`, so a confined mode would deny its writes), a missing binary (probed once, then remembered), a rewrite timeout, or an unparseable payload. Small outputs pass through unchanged anyway.
+- Config: `enabled`, `hypaBin`, `defaultTimeoutMs`, `rewriteTimeoutMs`, `decisionTtlMs`, `sandboxModes`, `systemPromptNote`, `sectionOrder` (1620). Mounted as a host patch row.
+- Verified: `tests/dsh-hypa-smoke.mjs` (stub binary through the real `execFile` path, every skip/fail-open branch, identical-schema shadow, resume re-shadowing); live one-shot on `--profile headless --patch` where the tool result carried `[hypa: 363->206 tok, -43%, reducer=git-status]` and `~/.hypa/hypa.db` recorded the matching `command_metrics` row. See `docs/hypa.md`.
 
 ### `dsh-plugin-mobile`
 
@@ -253,9 +279,9 @@ Important context behavior:
 
 ### `dsh-plugin-session-repair`
 
-- `lib/repair.js`: pure core. Rows are parsed from the decompressed JSONL; the exact contiguity scan mirrors the persistence reader's invariant, with packed chunk rows (`text-chunks` / `reasoning-chunks` / `tool-call-chunks` carrying `seq0`) expanded to `data.texts.length` / `data.args.length` events. The fixed repair pattern locates the first backward seq transition, deletes the synthetic `interrupted-tool-result` batch when present (renumbering the remaining committed rows down by three) and lets the rescanned gap shift the late tail up by one uniform delta; `seq`, `seq0`, `sourceEventSeqs`, and the replace range of a landed `surfaceOp` marker all shift — a stale marker range fails restore's surface fold with "surface replace: end seq not found in surface" while the contiguity scan passes. Also ports `projectKey` / `encodeSegment` from the persistence backend for path resolution.
+- `lib/repair.js`: pure core. Rows are parsed from the decompressed JSONL; the exact contiguity scan mirrors the persistence reader's invariant, with packed chunk rows (`text-chunks` / `reasoning-chunks` / `tool-call-chunks` carrying `seq0`) expanded to `data.texts.length` / `data.args.length` events. The fixed repair pattern locates the first backward seq transition, deletes the synthetic `interrupted-tool-result` batch when present (renumbering the remaining committed rows down by three) and lets the rescanned gap shift the late tail up by one uniform delta; `seq`, `seq0`, `sourceEventSeqs`, and the replace range of a landed `surfaceOp` marker all shift — a stale marker range fails restore's surface fold with "surface replace: end seq not found in surface" while the contiguity scan passes. `sourceEventSeqs` is stored range-encoded (bare seqs plus inclusive `[start, end]` pairs), so the shift must handle both element shapes — a flat map silently skips pairs. Also ports `projectKey` / `encodeSegment` from the persistence backend for path resolution.
 - `lib/index.js`: `GET /session-repair/scan`, `POST /session-repair/repair` (`dryRun` supported; atomic write with a `.bak-<ts>` backup and post-write re-verification), and `POST /session-repair/restore` (newest backup back). zstd through the CLI because DSH writes many concatenated frames per log, which the one-shot zlib zstd functions do not decode.
-- Two corruption classes are covered. The backward-seq collision is the original one. The second is a broken container framing (whole log compressed as one zstd frame — seq-healthy but it fail-closes every profile at boot on `assertZstdHeaderFrame`): `containerHeaderBroken` decodes only the first frame and asserts it is exactly the header line, `scanSessionFile` reports `containerBroken` and counts such a log as corrupted, and `repairLogFile` re-containerizes via `compressLog`'s two-frame layout with byte-identical content (`recontainerizeOnly`) — combined incidents are fixed in the same write, and post-write verification checks both the seq scan and the container contract.
+- Three corruption classes are covered. The backward-seq collision is the original one. The second is a broken container framing (whole log compressed as one zstd frame — seq-healthy but it fail-closes every profile at boot on `assertZstdHeaderFrame`): `containerHeaderBroken` decodes only the first frame and asserts it is exactly the header line, `scanSessionFile` reports `containerBroken` and counts such a log as corrupted, and `repairLogFile` re-containerizes via `compressLog`'s two-frame layout with byte-identical content (`recontainerizeOnly`) — combined incidents are fixed in the same write, and post-write verification checks both the seq scan and the container contract. The third is stale provenance: a pre-fix renumber skipped range-encoded `sourceEventSeqs` pairs, so some `assistant/message` rows cite pre-shift positions; the token meter then throws "source seq N is not assistant/chunk" on every measurement, which silently blocks the 65% generation trigger, the 80% landing trigger, and manual `/compact` while the context keeps growing. `scanProvenance` resolves every cited seq through the row spans (must be strictly earlier and an `assistant/chunk` slot), `repairStaleProvenance` realigns a stale list onto the contiguous chunk run ending immediately before its message and validates every realigned seq before writing, and post-write verification re-runs the provenance scan.
 - `lib/cli.mjs`: offline CLI (`scan <log>` / `repair <log> [--dry-run]` / `scan-all`) run against the installed copy, because a container-broken log makes DSH unbootable and the in-process routes unreachable — exactly when the tool is needed. All log rewrites must go through the plugin; a manual one-shot `zstd -f` recompression is precisely how the single-frame incident was produced (see `docs/session-framing-incident-2026-09-06.md`).
 - `lib/client.js`: a "会话修复 / Session repair" settings section — workspace path (localStorage; empty scans every project directory), scan, per-session dry run / repair / restore — plus a "修复 / Repair" trigger in the `conversation.session.header.utilities` slot (order 74, between usage 72 and outline 80): a per-session panel anchored to the trigger whose dry run doubles as the status probe (200 = damaged with a preview, 409 = clean), then repair or restore for exactly this session, with `cwd` from the sessions list store. The sidebar row menu (rename/fork/archive) is hardcoded in the host workspace bundle with no extension slot, which is why the entry lives in the header band.
 - The plugin is generic and does not touch `dsh-magic-context`'s database; after a real repair its seq references must be shifted by the same rule (see `docs/session-repair.md`).
@@ -271,10 +297,10 @@ Important context behavior:
 
 ### `dsh-plugin-computer-use`
 
-- Five agent tools over the niri/Wayland desktop the DSH process runs in: `desktop_windows` (niri IPC list/focus/close/fullscreen), `desktop_tree` (AT-SPI2 accessibility tree with desktop-global pixel extents, via the spawned `lib/atspi-tree.py` helper over `gi.repository.Atspi` — the `python-atspi` package is not needed), `desktop_screenshot` (grim; window capture tries `niri msg action screenshot-window` and falls back to focus + full-screen grim), `desktop_mouse` (absolute move/click/drag over a dependency-free raw Wayland `zwlr_virtual_pointer_v1` client in `lib/wayland-pointer.js`; wheel via ydotool), and `desktop_key` (wtype text/keysyms with a ydotool keycode fallback).
+- Five agent tools over the niri/Wayland desktop the DSH process runs in: `desktop_windows` (niri IPC list/focus/close/fullscreen), `desktop_tree` (AT-SPI2 accessibility tree via the spawned `lib/atspi-tree.py` helper over `gi.repository.Atspi` — the `python-atspi` package is not needed — reconciled with niri IPC by `lib/coords.js`), `desktop_screenshot` (grim; window capture tries `niri msg action screenshot-window` and falls back to focus + full-screen grim), `desktop_mouse` (absolute move/click/drag over a dependency-free raw Wayland `zwlr_virtual_pointer_v1` client in `lib/wayland-pointer.js`; wheel via ydotool), and `desktop_key` (wtype text/keysyms with a ydotool keycode fallback).
 - `lib/wayland-pointer.js` exists because ydotool 1.0.4's daemon creates a relative-only uinput device (`capabilities/abs: 0`), so `mousemove -a` cannot target pixels; niri implements `wlr-virtual-pointer-unstable-v1` natively and the needed subset (registry walk, bind, create, `motion_absolute`, `button`, `frame`, destroy) fits a small wire-protocol client. Wheel axis is deliberately absent — REL_WHEEL detents through ydotool are unambiguous.
 - `niri msg action screenshot-window` has been observed to return success while producing no file and no clipboard image on this build; the screenshot tool polls `screenshotDir` for a new image and falls back to focus + grim, stating the fallback in its result.
-- All coordinates are desktop-global logical pixels: the tree reports them directly, and the screenshot result states the scale mapping (grim downscales to fit the 2000 px attachment limit). Multi-monitor bounding boxes with negative origins are normalized via `niri msg --json outputs`.
+- Wayland gives a client no global coordinate space, so the tree's raw extents are window-relative (GTK3) or zeroed (GTK4). `lib/coords.js` reconciles them with the compositor: floating windows get an exact origin (`global = output.logical + tile_pos_in_workspace_view`, which is output-local), while tiled windows cannot be anchored at all because niri reports a null position for them (upstream issue #2381) and are therefore printed unchanged with the app line marked `WINDOW-RELATIVE`. `desktop_mouse` speaks desktop-global logical pixels; the screenshot result states the scale mapping (grim downscales to fit the 2000 px attachment limit). Multi-monitor bounding boxes with negative origins are normalized via `niri msg --json outputs`.
 - A pure tool registrar (inject: `tools`, `systemPrompt`) mounted as a plain preset row with no isolate realm. The preset is deployed as a copy under `~/.dsh/.agent-presets/context-compact/` — unlike plugins, which live under `profiles/node_modules/`. The tools execute real desktop input with no permission surface; mount only in trusted presets. See `docs/computer-use.md`.
 
 ## Profile Composition
@@ -340,7 +366,9 @@ Other useful context tests:
 - `dsh-context-command-smoke.mjs`: `/dream`, `/ctx-search`, `/inject-memory`, and `/organize-memories`
 - `dsh-context-paragraphs-smoke.mjs`: paragraph numbering and injection
 - `dsh-context-tools-smoke.mjs`: `ctx_reduce` / `ctx_expand`
-- `dsh-context-landing-smoke.mjs`: checkpoint landing and surface stability
+- `dsh-context-landing-smoke.mjs`: checkpoint landing and surface stability, including the produced `surfaceOp` passing the host's own validator
+- `dsh-context-session-compat-smoke.mjs`: the replace-marker key-name probe (both decided branches, degradation, memoization) and the event-accessor seam
+- `dsh-context-coordinates-smoke.mjs`: event-coordinate epochs, the rebuild against real migrated logs, the truncation guard, and stale-ready-compartment retirement
 - `dsh-context-scope-smoke.mjs`: Git-worktree scope isolation
 - `dsh-context-notifications-smoke.mjs`: activity-row lifecycle, model-invisibility guard, and the model-facing notice contract
 - `dsh-context-preset-smoke.mjs`: profile default and preset wiring
@@ -348,7 +376,7 @@ Other useful context tests:
 - `dsh-context-aux-retry-smoke.mjs`: auxiliary-call retry classification, local organizer-XML repair, durable failure reason, generation cooldown, and organizer/Dreamer target resolution
 - `dsh-context-model-picker-smoke.mjs`: settings-panel provider/model/effort pickers, catalog wire contract, and manual-entry degradation
 
-For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-usage-smoke.mjs`, `dsh-tool-gate-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, `dsh-image-model-smoke.mjs`, `dsh-scheduler-smoke.mjs`, or `dsh-computer-use-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one. `dsh-computer-use-smoke.mjs` includes two live checks that skip cleanly when their socket is absent: a raw Wayland handshake against the real compositor and an AT-SPI dump against the session bus.
+For non-context plugins, run the matching `dsh-bg-smoke.mjs`, `dsh-font-smoke.mjs`, `dsh-session-titles-smoke.mjs`, `dsh-effects-smoke.mjs`, `dsh-outline-smoke.mjs`, `dsh-diff-viewer-smoke.mjs`, `dsh-session-id-smoke.mjs`, `dsh-usage-smoke.mjs`, `dsh-tool-gate-smoke.mjs`, `dsh-hypa-smoke.mjs`, `dsh-mobile-smoke.mjs`, `dsh-logo-smoke.mjs`, `dsh-image-model-smoke.mjs`, `dsh-scheduler-smoke.mjs`, or `dsh-computer-use-smoke.mjs` test. `dsh-diff-viewer-smoke.mjs` builds a throwaway git repository under `$TMPDIR`, so it needs a working `git` binary. `dsh-mobile-smoke.mjs` reads the installed host bundles directly to re-check every attribute, slot, and inline style its rules depend on, so it fails loudly when a DSH update moves one. `dsh-computer-use-smoke.mjs` includes two live checks that skip cleanly when their socket is absent: a raw Wayland handshake against the real compositor and an AT-SPI dump against the session bus.
 
 ## Git and Editing Rules
 

@@ -25,10 +25,16 @@
  * decode. Parsed results are cached per log path and invalidated by
  * (mtimeMs, size), so a live session re-reads only when its log grows.
  *
+ * One session can carry several logs: a format migration materialises the
+ * rewritten log beside the original as `session.v<version>.jsonl.zstd`, leaving
+ * `session.jsonl.zstd` frozen at the migration point. Every lookup here
+ * resolves the HIGHEST generation present — the older file would report a
+ * truncated session and pre-migration accounting.
+ *
  * @module dsh-plugin-usage
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -44,6 +50,32 @@ const CACHE_LIMIT = 64;
 /** Sessions root for the deployment. */
 export function sessionsRoot() {
   return join(resolveDshHome(), "sessions");
+}
+
+/**
+ * The current log of one session directory: the highest format generation
+ * present (`session.v3.jsonl.zstd` beats `session.jsonl.zstd`).
+ * @param dir - session directory.
+ * @returns the absolute log path, or null when the directory has no log.
+ */
+export function currentLogPath(dir) {
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  let best = null;
+  let generation = -1;
+  for (const name of entries) {
+    const match = /^session\.v(\d+)\.jsonl\.zstd$/.exec(name);
+    const value = match === null ? (name === LOG_NAME ? 0 : -1) : Number(match[1]);
+    if (value > generation) {
+      generation = value;
+      best = join(dir, name);
+    }
+  }
+  return best;
 }
 
 /** Decompress a (possibly multi-frame) zstd log via the CLI.
@@ -91,16 +123,16 @@ function loadLog(path) {
 export function sessionLogPath(cwd, sessionId) {
   if (typeof sessionId !== "string" || !SESSION_ID_PATTERN.test(sessionId)) return null;
   const dir = cwd ? join(sessionsRoot(), projectKey(cwd)) : sessionsRoot();
-  const direct = join(dir, sessionId, LOG_NAME);
-  if (existsSync(direct)) return direct;
+  const direct = currentLogPath(join(dir, sessionId));
+  if (direct !== null) return direct;
 
   // Session directories may be encoded differently by the storage backend;
   // scan one level when the plain name is absent.
   if (cwd) {
     try {
       for (const entry of readdirSync(dir)) {
-        const candidate = join(dir, entry, sessionId, LOG_NAME);
-        if (existsSync(candidate)) return candidate;
+        const candidate = currentLogPath(join(dir, entry, sessionId));
+        if (candidate !== null) return candidate;
       }
     } catch {
       return null;
@@ -113,8 +145,8 @@ export function sessionLogPath(cwd, sessionId) {
 function findSessionLogEverywhere(sessionId) {
   if (typeof sessionId !== "string" || !SESSION_ID_PATTERN.test(sessionId)) return null;
   for (const entry of readdirSync(sessionsRoot())) {
-    const candidate = join(sessionsRoot(), entry, sessionId, LOG_NAME);
-    if (existsSync(candidate)) return candidate;
+    const candidate = currentLogPath(join(sessionsRoot(), entry, sessionId));
+    if (candidate !== null) return candidate;
   }
   return null;
 }
@@ -149,8 +181,8 @@ export function overviewSessions(cwd) {
       continue;
     }
     for (const entry of entries) {
-      const path = join(sessionsRoot(), dir, entry, LOG_NAME);
-      if (!existsSync(path)) continue;
+      const path = currentLogPath(join(sessionsRoot(), dir, entry));
+      if (path === null) continue;
       try {
         const { header, collected } = loadLog(path);
         const meta = { projectDir: dir, sizeBytes: statSync(path).size };

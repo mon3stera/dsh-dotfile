@@ -1,0 +1,14 @@
+{
+  "name": "dsh-plugin-hypa",
+  "version": "0.1.0",
+  "description": "Run bash commands through the Hypa compression runtime: a per-agent shadow of the bash tool that rewrites the executed command through `hypa rewrite` + `hypa -c`",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./wrap": "./lib/wrap.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "private": true
+}

@@ -80,6 +80,63 @@ const check = (label, ok) => {
 	check("chain skips both checkpoints", r !== null && r.start === 26 && r.end === 26 && r.shadowedSeqs.join(",") === "26");
 	r = selectCompartmentRange(session3, { retainRounds: 0 });
 	check("chain retain 0 still skips checkpoints", r !== null && r.start === 26 && r.end === 29);
+
+	// 0.1.5: surface node 0 is the system prompt. Compaction must start after
+	// it (and still skip the checkpoint chain that now sits at index 1+).
+	const withSystem = {
+		events: [
+			{ type: "turn/start", seq: 0, time: 0, data: { turn: 1 } },
+			{ type: "step/start", seq: 1, time: 0, data: { turn: 1, step: 1 } },
+			{ type: "system/message", seq: 2, time: 0, data: { turn: 1, step: 1, message: { role: "system", content: [{ type: "text", text: "prompt" }] } }, surfaceOp: "append" },
+			{ type: "user/message", seq: 3, time: 0, data: { content: [{ type: "text", text: "q1" }] }, surfaceOp: "append" },
+			{ type: "assistant/message", seq: 4, time: 0, data: { turn: 1, step: 1, message: { content: [{ type: "text", text: "a1" }] } }, surfaceOp: "append" },
+			{ type: "turn/end", seq: 5, time: 0, data: { turn: 1, reason: { kind: "completed" } } },
+			{ type: "turn/start", seq: 6, time: 0, data: { turn: 2 } },
+			{ type: "user/message", seq: 7, time: 0, data: { content: [{ type: "text", text: "q2" }] }, surfaceOp: "append" },
+			{ type: "assistant/message", seq: 8, time: 0, data: { turn: 2, step: 1, message: { content: [{ type: "text", text: "a2" }] } }, surfaceOp: "append" },
+			{ type: "turn/end", seq: 9, time: 0, data: { turn: 2, reason: { kind: "completed" } } },
+			{ type: "turn/start", seq: 10, time: 0, data: { turn: 3 } },
+			{ type: "user/message", seq: 11, time: 0, data: { content: [{ type: "text", text: "q3" }] }, surfaceOp: "append" },
+			{ type: "assistant/message", seq: 12, time: 0, data: { turn: 3, step: 1, message: { content: [{ type: "text", text: "a3" }] } }, surfaceOp: "append" },
+		],
+		surface: { nodes: [2, 3, 4, 7, 8, 11, 12], replaceGeneration: 0 },
+	};
+	withSystem.eventAt = eventAtFor(withSystem.events);
+	r = selectCompartmentRange(withSystem, { retainRounds: 1 });
+	check("system head is never in the compactable range", r !== null && r.start === 3 && r.end === 11 && !r.shadowedSeqs.includes(2));
+	r = selectManualCompartmentRange(withSystem, { retainRounds: 20 });
+	check("manual short history still skips the system head", r !== null && r.start === 3 && r.end === 3);
+
+	const chained = {
+		events: [
+			...withSystem.events,
+			{ type: "compaction/summary", seq: 13, time: 0, data: {} },
+			{ type: "user/message", seq: 14, time: 0, data: { content: [{ type: "text", text: "cp" }], source: { kind: "plugin", plugin: "compact", compactionId: "c1" } }, surfaceOp: { op: "replace", startSeq: 3, endSeq: 8 } },
+			{ type: "assistant/message", seq: 15, time: 0, data: { turn: 4, step: 1, message: { content: [{ type: "text", text: "t4" }] } }, surfaceOp: "append" },
+			{ type: "assistant/message", seq: 16, time: 0, data: { turn: 5, step: 1, message: { content: [{ type: "text", text: "t5" }] } }, surfaceOp: "append" },
+		],
+		surface: { nodes: [2, 14, 15, 16], replaceGeneration: 1 },
+	};
+	chained.eventAt = eventAtFor(chained.events);
+	r = selectCompartmentRange(chained, { retainRounds: 1 });
+	check("system head then checkpoint chain starts after both", r !== null && r.start === 15 && r.end === 15);
+	r = selectCompartmentRange(chained, { retainRounds: 0 });
+	check("system+checkpoint retain 0 still skips both", r !== null && r.start === 15 && r.end === 16);
+
+	// A later in-history system/message is ordinary history and MAY be shadowed.
+	const laterSystem = {
+		events: [
+			{ type: "system/message", seq: 0, time: 0, data: { turn: 1, step: 1, message: { role: "system", content: [{ type: "text", text: "p0" }] } }, surfaceOp: "append" },
+			{ type: "user/message", seq: 1, time: 0, data: { content: [{ type: "text", text: "q1" }] }, surfaceOp: "append" },
+			{ type: "system/message", seq: 2, time: 0, data: { turn: 1, step: 2, message: { role: "system", content: [{ type: "text", text: "p1" }] } }, surfaceOp: "append" },
+			{ type: "user/message", seq: 3, time: 0, data: { content: [{ type: "text", text: "q2" }] }, surfaceOp: "append" },
+			{ type: "assistant/message", seq: 4, time: 0, data: { turn: 1, step: 2, message: { content: [{ type: "text", text: "a2" }] } }, surfaceOp: "append" },
+		],
+		surface: { nodes: [0, 1, 2, 3, 4], replaceGeneration: 0 },
+	};
+	laterSystem.eventAt = eventAtFor(laterSystem.events);
+	r = selectCompartmentRange(laterSystem, { retainRounds: 1 });
+	check("later system/message may sit inside the range", r !== null && r.start === 1 && r.end === 3 && r.shadowedSeqs.includes(2) && !r.shadowedSeqs.includes(0));
 }
 
 // ── landing transaction ─────────────────────────────────────────────────────
@@ -104,8 +161,11 @@ const check = (label, ok) => {
 				if (event.surfaceOp === "append") {
 					this.surface.nodes.push(event.seq);
 				} else {
-					const startIdx = this.surface.nodes.indexOf(event.surfaceOp.start);
-					const endIdx = this.surface.nodes.indexOf(event.surfaceOp.end);
+					// The marker's key names moved at 0.1.5; the fake fold accepts both.
+					const start = event.surfaceOp.startSeq ?? event.surfaceOp.start;
+					const end = event.surfaceOp.endSeq ?? event.surfaceOp.end;
+					const startIdx = this.surface.nodes.indexOf(start);
+					const endIdx = this.surface.nodes.indexOf(end);
 					this.surface.nodes.splice(startIdx, endIdx - startIdx + 1, event.seq);
 					this.surface.replaceGeneration += 1;
 				}
@@ -126,7 +186,23 @@ const check = (label, ok) => {
 	check("landing result shape", result.compactionId !== undefined && result.summarySeq !== undefined && result.endSeq !== undefined);
 	check("landing event order", events.map((e) => e.type).join(",") === "turn/start,user/message,step/start,assistant/message,compaction/start,compaction/summary,user/message,compaction/end");
 	const replace = events.find((e) => e.type === "user/message" && e.surfaceOp?.op === "replace");
-	check("landing replace op", replace.surfaceOp.start === 1 && replace.surfaceOp.end === 3);
+	// Assert against the HOST's own validator rather than a hardcoded shape, so a
+	// future rename fails this test instead of failing every live landing.
+	const surface = await import("/home/mon3tr/.dsh/profiles/node_modules/@deepseek-ai/dsh-session/lib/types/surface.js");
+	let markerValid = false;
+	let markerError;
+	try {
+		surface.validateSurfaceMetadata(replace);
+		markerValid = true;
+	} catch (error) {
+		markerError = error;
+	}
+	check("landing replace op accepted by host validator", markerValid ? true : (console.error(`      ${markerError.message}`), false));
+	const expectsLegacy = replace.surfaceOp.start !== undefined;
+	check(
+		"landing replace op uses the installed reader's key names",
+		expectsLegacy ? (replace.surfaceOp.end !== undefined) : (replace.surfaceOp.startSeq === 1 && replace.surfaceOp.endSeq === 3),
+	);
 	check("landing checkpoint source", replace.data.source?.plugin === "compact" && replace.data.source.compactionId === result.compactionId);
 	check("landing shadowed price", events.find((e) => e.type === "compaction/summary").data.shadowedTokenCount === 100);
 	check("landing surface now one node", session.surface.nodes.length === 1);
@@ -157,6 +233,134 @@ const check = (label, ok) => {
 		{ owner: "current-turn" },
 	).then(() => null, (e) => e);
 	check("landing summary-not-smaller fails", fat !== null && fat.message.includes("not smaller"));
+}
+
+// ── 0.1.5 system-head protection ────────────────────────────────────────────
+{
+	const foldSurface = (await import("/home/mon3tr/.dsh/profiles/node_modules/@deepseek-ai/dsh-session/lib/types/surface.js")).foldSurface;
+	const seed = [
+		{ type: "turn/start", seq: 0, time: 0, data: { turn: 1 } },
+		{ type: "step/start", seq: 1, time: 0, data: { turn: 1, step: 1 } },
+		{ type: "system/message", seq: 2, time: 0, data: { turn: 1, step: 1, message: { role: "system", content: [{ type: "text", text: "prompt" }] } }, surfaceOp: "append" },
+		{ type: "user/message", seq: 3, time: 0, data: { content: [{ type: "text", text: "a" }] }, surfaceOp: "append" },
+		{ type: "assistant/message", seq: 4, time: 0, data: { turn: 1, step: 1, message: { content: [{ type: "text", text: "b" }] } }, surfaceOp: "append" },
+	];
+	const makeSession = (events, nodes, nextSeq) => {
+		let seq = nextSeq;
+		const session = {
+			id: "s-sys",
+			events,
+			surface: { nodes: [...nodes], replaceGeneration: 0 },
+			eventAt: eventAtFor(events),
+			append(type, data, extra = {}) {
+				const event = { type, seq: seq++, time: Date.now(), data, ...extra };
+				this.events.push(event);
+				if (event.surfaceOp !== undefined) {
+					if (event.surfaceOp === "append") {
+						this.surface.nodes.push(event.seq);
+					} else {
+						const start = event.surfaceOp.startSeq ?? event.surfaceOp.start;
+						const end = event.surfaceOp.endSeq ?? event.surfaceOp.end;
+						const startIdx = this.surface.nodes.indexOf(start);
+						const endIdx = this.surface.nodes.indexOf(end);
+						this.surface.nodes.splice(startIdx, endIdx - startIdx + 1, event.seq);
+						this.surface.replaceGeneration += 1;
+					}
+				}
+				return event;
+			},
+		};
+		return session;
+	};
+	const cdb = { markCompartmentLanded: () => {} };
+	const meter = {
+		estimateMessage: () => 25,
+		measure: (s) => ({ nodes: s.surface.nodes.map((seq) => ({ seq, tokens: 1 })) }),
+	};
+
+	const events = [...seed];
+	const session = makeSession(events, [2, 3, 4], 5);
+	const result = await landCompartment(
+		{ session, cdb, meter },
+		{ id: 1, start_seq: 2, end_seq: 4, summary: "compressed", shadowed_tokens: 100 },
+		{ owner: "current-turn" },
+	);
+	check("system-head landing commits", result.endSeq !== undefined);
+	const replace = events.find((e) => e.type === "user/message" && e.surfaceOp?.op === "replace");
+	const replaceStart = replace.surfaceOp.startSeq ?? replace.surfaceOp.start;
+	check("system-head landing trims node 0 from the replace", replaceStart === 3 && (replace.surfaceOp.endSeq ?? replace.surfaceOp.end) === 4);
+	check("system-head stays on the stub surface", session.surface.nodes[0] === 2 && session.surface.nodes.includes(replace.seq));
+	let folded;
+	let foldError;
+	try {
+		folded = foldSurface(events);
+	} catch (error) {
+		foldError = error;
+	}
+	check(
+		"system-head landing is accepted by the host fold",
+		foldError === undefined && folded.nodes[0] === 2 && folded.nodes.includes(replace.seq),
+	);
+	if (foldError !== undefined) console.error(`      ${foldError.message}`);
+
+	// Rewritten system head: stored start names the previous prompt node,
+	// which the current node 0 replaced. The conversation span still lands.
+	const rewrittenEvents = [
+		{ type: "turn/start", seq: 0, time: 0, data: { turn: 1 } },
+		{ type: "step/start", seq: 1, time: 0, data: { turn: 1, step: 1 } },
+		{ type: "system/message", seq: 2, time: 0, data: { turn: 1, step: 1, message: { role: "system", content: [{ type: "text", text: "old" }] } }, surfaceOp: "append" },
+		{ type: "user/message", seq: 3, time: 0, data: { content: [{ type: "text", text: "a" }] }, surfaceOp: "append" },
+		{ type: "assistant/message", seq: 4, time: 0, data: { turn: 1, step: 1, message: { content: [{ type: "text", text: "b" }] } }, surfaceOp: "append" },
+		{ type: "system/message", seq: 5, time: 0, data: { turn: 1, step: 2, message: { role: "system", content: [{ type: "text", text: "new" }] } }, surfaceOp: { op: "replace", startSeq: 2, endSeq: 2 }, sourceEventSeqs: [2] },
+	];
+	const rewritten = makeSession(rewrittenEvents, [5, 3, 4], 6);
+	const rewrittenResult = await landCompartment(
+		{ session: rewritten, cdb, meter },
+		{ id: 2, start_seq: 2, end_seq: 4, summary: "compressed", shadowed_tokens: 100 },
+		{ owner: "current-turn" },
+	).then((value) => ({ value }), (error) => ({ error }));
+	check("rewritten system-head landing commits", rewrittenResult.value !== undefined);
+	const rewrittenReplace = rewrittenEvents.find((e) => e.type === "user/message" && e.surfaceOp?.op === "replace");
+	check(
+		"rewritten system-head landing starts at the first conversation node",
+		rewrittenReplace !== undefined && (rewrittenReplace.surfaceOp.startSeq ?? rewrittenReplace.surfaceOp.start) === 3,
+	);
+	let rewrittenFold;
+	let rewrittenFoldError;
+	try {
+		rewrittenFold = foldSurface(rewrittenEvents);
+	} catch (error) {
+		rewrittenFoldError = error;
+	}
+	check(
+		"rewritten system-head landing is accepted by the host fold",
+		rewrittenFoldError === undefined && rewrittenFold.nodes[0] === 5,
+	);
+	if (rewrittenFoldError !== undefined) console.error(`      ${rewrittenFoldError.message}`);
+
+	// System head + checkpoint chain: a gen-N compartment that incorrectly
+	// started at node 0 must not replace the checkpoints.
+	const chainedEvents = [
+		{ type: "turn/start", seq: 0, time: 0, data: { turn: 1 } },
+		{ type: "step/start", seq: 1, time: 0, data: { turn: 1, step: 1 } },
+		{ type: "system/message", seq: 2, time: 0, data: { turn: 1, step: 1, message: { role: "system", content: [{ type: "text", text: "prompt" }] } }, surfaceOp: "append" },
+		{ type: "user/message", seq: 3, time: 0, data: { content: [{ type: "text", text: "cp" }], source: { kind: "plugin", plugin: "compact", compactionId: "c1" } }, surfaceOp: "append" },
+		{ type: "user/message", seq: 4, time: 0, data: { content: [{ type: "text", text: "new" }] }, surfaceOp: "append" },
+		{ type: "assistant/message", seq: 5, time: 0, data: { turn: 1, step: 1, message: { content: [{ type: "text", text: "ok" }] } }, surfaceOp: "append" },
+	];
+	const chainedSession = makeSession(chainedEvents, [2, 3, 4, 5], 6);
+	const chainedResult = await landCompartment(
+		{ session: chainedSession, cdb, meter },
+		{ id: 3, start_seq: 2, end_seq: 5, summary: "compressed", shadowed_tokens: 100 },
+		{ owner: "current-turn" },
+	).then((value) => ({ value }), (error) => ({ error }));
+	check("system+checkpoint landing commits", chainedResult.value !== undefined);
+	const chainedReplace = chainedEvents.find((e) => e.type === "user/message" && e.surfaceOp?.op === "replace");
+	check(
+		"system+checkpoint landing starts after the checkpoint",
+		chainedReplace !== undefined && (chainedReplace.surfaceOp.startSeq ?? chainedReplace.surfaceOp.start) === 4,
+	);
+	check("system+checkpoint landing leaves the checkpoint on the surface", chainedSession.surface.nodes.includes(3) && chainedSession.surface.nodes[0] === 2);
 }
 
 if (failed > 0) {

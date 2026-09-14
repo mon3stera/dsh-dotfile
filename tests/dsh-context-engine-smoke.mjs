@@ -1,5 +1,7 @@
 // dsh-magic-context organizer (summarizer) + engine wiring smoke test.
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
 	parseOrganizerOutput,
 	validateOrganizerOutput,
@@ -288,6 +290,13 @@ const check = (label, ok) => {
 	const tmpHome = mkdtempSync("/home/mon3tr/ctx-engine-");
 	const savedHome = process.env.DSH_HOME;
 	process.env.DSH_HOME = tmpHome;
+	// The exact tokenizer reads its vocabulary from $DSH_HOME; link the real one
+	// in before the engine is built so the counter finds it on first use.
+	const realVocabulary = join(savedHome ?? join(homedir(), ".dsh"), "magic-context", "tokenizers", "deepseek.json");
+	if (existsSync(realVocabulary)) {
+		mkdirSync(join(tmpHome, "magic-context", "tokenizers"), { recursive: true });
+		symlinkSync(realVocabulary, join(tmpHome, "magic-context", "tokenizers", "deepseek.json"));
+	}
 	try {
 		// Load ContextEngine against a stub context; it must not throw and must
 		// split own keys out of the basic config (auto forced false).
@@ -460,6 +469,34 @@ const check = (label, ok) => {
 		boundaryHandler(agent.session, { type: "turn/end", seq: 2, data: { turn: 1, reason: { kind: "completed" } } });
 		check("boundary handler fires on turn/end", called.length === 1);
 
+		// A deterministic compaction-path failure (the token meter refusing to
+		// measure, for example) surfaces once as one settled error row instead of
+		// only a process-log warning that re-fires on every boundary.
+		const meterSession = {
+			id: "meter-fail",
+			events: [],
+			append(type, data) { this.events.push({ type, data }); return { type, seq: this.events.length - 1, data }; },
+		};
+		const meterAgent = { session: meterSession };
+		engine.agentBySession.set(meterSession, meterAgent);
+		const realMaybeGenerate = engine.maybeGenerate;
+		const meterError = new Error("token meter: assistant/message at seq 315866 source seq 314120 is not assistant/chunk");
+		engine.maybeGenerate = () => Promise.reject(meterError);
+		boundaryHandler(meterSession, { type: "turn/end", seq: 3, data: { turn: 2, reason: { kind: "completed" } } });
+		boundaryHandler(meterSession, { type: "turn/end", seq: 4, data: { turn: 3, reason: { kind: "completed" } } });
+		await new Promise((resolve) => setImmediate(resolve));
+		const meterRows = meterSession.events.filter((event) => event.type === "command/run");
+		const meterDone = meterSession.events.filter((event) => event.type === "command/done");
+		check("meter failure records one error activity row", meterRows.length === 1 && meterDone.length === 1 && meterDone[0].data.kind === "error");
+		check("the row carries the meter reason", String(meterDone[0].data.text).includes("not assistant/chunk"));
+		check("re-firing boundaries deduplicate", meterSession.events.length === 2);
+		engine.maybeGenerate = () => Promise.reject(new Error("token meter: a different shape"));
+		boundaryHandler(meterSession, { type: "turn/end", seq: 5, data: { turn: 4, reason: { kind: "completed" } } });
+		await new Promise((resolve) => setImmediate(resolve));
+		check("a distinct failure re-reports", meterSession.events.filter((event) => event.type === "command/run").length === 2);
+		engine.maybeGenerate = realMaybeGenerate;
+		engine.agentBySession.delete(meterSession);
+
 		// A successful landing re-selects the memory injection. The derived head is
 		// replaced in place, so the next request sees new memories instead of
 		// appending a second project_memory block.
@@ -605,6 +642,62 @@ const check = (label, ok) => {
 		engine._refreshContextUsage(usageSession);
 		usage = getContextUsage(usageSession.id);
 		check("empty memory selection reports no usage", usage.memories.count === 0 && usage.memories.tokens === 0 && usage.totalTokens === 77);
+
+		// ── exact token accounting and the checkpoint-chain budget ──────────────
+		// The engine's tokenizer is bound to the test's DSH_HOME, so the real
+		// vocabulary is linked in when it is available; without it the counter
+		// stays unavailable and every row keeps the host's heuristic figures.
+		if (!existsSync(realVocabulary)) {
+			console.log("SKIP exact accounting wiring: no vocabulary in the real DSH_HOME");
+		} else {
+			const checkpointText = "黑手升温重写：boot2 系地图打包铁律，一键 tools/boot2_build.py，先跑 boot2_build 再落地。".repeat(4);
+			const exactSession = {
+				id: "exact-usage",
+				events: {
+					1: { seq: 1, type: "user/message", data: { content: [{ type: "text", text: checkpointText }], source: { kind: "plugin", plugin: "compact", compactionId: "c9" } } },
+				},
+				surface: { nodes: [1] },
+			};
+			exactSession.eventAt = eventAtFor(exactSession.events);
+			exactSession.deriveEventMessage = () => ({ role: "user", content: exactSession.events[1].data.content });
+			engine.ctx.tokenMeter.measure = () => ({
+				totalTokens: 4321,
+				surfaceDeltaTokens: -12,
+				baseline: { kind: "usage" },
+				nodes: [{ seq: 1, tokens: 77 }],
+			});
+			await engine._priceSurface(exactSession);
+			usage = getContextUsage(exactSession.id);
+			check("compartments are priced by the tokenizer", usage.compartments.exact === true && usage.compartments.tokens > 77 && usage.compartments.heuristicTokens === 77);
+			check("the anchored measurement reaches the panel", usage.measured.tokens === 4321 && usage.measured.kind === "usage" && usage.measured.deltaTokens === -12);
+			check("the routed window sets the archival budget", engine._archivalBudget(272000) === 40800 && engine._archivalBudget(0) === 40000);
+
+			// The landing path bounds this session's chain without a Dreamer pass.
+			const chainSession = { id: "chain-budget", header: { cwd: process.cwd() } };
+			const first = engine.cdb.insertCompartment({ sessionId: "chain-budget", scopePath: process.cwd(), generation: 1, startSeq: 1, endSeq: 5, startPara: 1, endPara: 5, summary: "a".repeat(2000) });
+			engine.cdb.setCompartmentStatus(first, "ready");
+			engine.cdb.markCompartmentLanded(first, 42);
+			engine.cdb.setCompartmentSummaryTokens(first, 20000);
+			const second = engine.cdb.insertCompartment({ sessionId: "chain-budget", scopePath: process.cwd(), generation: 2, startSeq: 6, endSeq: 9, startPara: 6, endPara: 9, summary: "b".repeat(2000) });
+			engine.cdb.setCompartmentStatus(second, "ready");
+			engine.cdb.markCompartmentLanded(second, 43);
+			engine.cdb.setCompartmentSummaryTokens(second, 20000);
+			// 3 x 20000 against a 40800 budget: exactly the oldest one retires.
+			const third = engine.cdb.insertCompartment({ sessionId: "chain-budget", scopePath: process.cwd(), generation: 3, startSeq: 10, endSeq: 14, startPara: 10, endPara: 14, summary: "d".repeat(2000) });
+			engine.cdb.setCompartmentStatus(third, "ready");
+			engine.cdb.markCompartmentLanded(third, 45);
+			engine.cdb.setCompartmentSummaryTokens(third, 20000);
+			const other = engine.cdb.insertCompartment({ sessionId: "another-session", scopePath: process.cwd(), generation: 1, startSeq: 1, endSeq: 5, startPara: 1, endPara: 5, summary: "c".repeat(2000) });
+			engine.cdb.setCompartmentStatus(other, "ready");
+			engine.cdb.markCompartmentLanded(other, 44);
+			engine.cdb.setCompartmentSummaryTokens(other, 20000);
+			engine.contextWindows.set("chain-budget", 272000);
+			engine._activity = () => {};
+			const bounded = await engine._boundCheckpointChain({ session: chainSession, inject: () => {} });
+			check("the chain bound archives over-budget checkpoints", bounded.archived.length === 1 && engine.cdb.compartmentById(first).archived === 1);
+			check("the chain bound stays inside one session", engine.cdb.compartmentById(other).archived === 0 && bounded.total <= 40800);
+			engine.cdb.archiveCompartment(second);
+		}
 		engine.cdb.close();
 	} finally {
 		if (savedHome === undefined) delete process.env.DSH_HOME;

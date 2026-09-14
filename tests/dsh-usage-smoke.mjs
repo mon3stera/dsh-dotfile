@@ -164,6 +164,45 @@ console.log("host routes");
 
   const bad = await respond(route("/usage/session"), jsonRequest("/usage/session?id=../etc/passwd"));
   check("path traversal rejected", bad.status === 404);
+
+  // ---------- generation resolution ----------
+  // A migrated session carries the rewritten log beside the frozen original.
+  // Reading the unversioned name would report the pre-migration session, so the
+  // higher generation must win — for the detail route and for the overview.
+  console.log("log generations");
+  {
+    const migratedId = "session-bbbb2222-3333-4444-8555-666677778888";
+    const migratedDir = `${projectDir}/${migratedId}`;
+    const v0Lines = [
+      JSON.stringify({ type: "session", version: 0, id: migratedId, createdAt: 1700000000000, cwd, delegationDepth: 0, agentPreset: "context-compact" }),
+      usageRow(1, 1700000000100, 1, 1, { inputTokens: 111, outputTokens: 11, totalTokens: 122 }),
+    ];
+    // The v3 generation is a DIFFERENT session shape: four requests, not one.
+    const v3Lines = [
+      JSON.stringify({ type: "session", version: 3, id: migratedId, createdAt: 1700000000000, cwd, delegationDepth: 0, agentPreset: "context-compact" }),
+      usageRow(1, 1700000000100, 1, 1, { inputTokens: 200, outputTokens: 20, totalTokens: 220 }),
+      usageRow(2, 1700000000200, 1, 2, { inputTokens: 300, outputTokens: 30, totalTokens: 330 }),
+      usageRow(3, 1700000000300, 1, 3, { inputTokens: 400, outputTokens: 40, totalTokens: 440 }),
+      usageRow(4, 1700000000400, 1, 4, { inputTokens: 500, outputTokens: 50, totalTokens: 550 }),
+    ];
+    writeLog(`${migratedDir}/session.jsonl.zstd`, v0Lines);
+    writeLog(`${migratedDir}/session.v3.jsonl.zstd`, v3Lines);
+
+    const migratedDetail = await respond(route("/usage/session"), jsonRequest(`/usage/session?id=${migratedId}&cwd=${encodeURIComponent(cwd)}`));
+    check("detail reads the highest generation", migratedDetail.body.path.endsWith("session.v3.jsonl.zstd"));
+    check("detail counts the migrated log's requests", migratedDetail.body.requests.length === 4 && migratedDetail.body.totals.totalTokens === 1540);
+
+    const migratedOverview = await respond(route("/usage/overview"), jsonRequest(`/usage/overview?cwd=${encodeURIComponent(cwd)}`));
+    const migratedRow = migratedOverview.body.sessions.find((entry) => entry.sessionId === migratedId);
+    check("overview reads the highest generation", migratedRow?.requests === 4 && migratedRow?.totalTokens === 1540);
+    check("overview still lists the untouched session", migratedOverview.body.sessions.some((entry) => entry.sessionId === sessionId));
+
+    // A session with only the v0 file keeps working (nothing to migrate).
+    const legacyId = "session-cccc3333-4444-4555-8666-777788889999";
+    writeLog(`${projectDir}/${legacyId}/session.jsonl.zstd`, v0Lines.map((line) => line.replace(migratedId, legacyId)));
+    const legacyDetail = await respond(route("/usage/session"), jsonRequest(`/usage/session?id=${legacyId}&cwd=${encodeURIComponent(cwd)}`));
+    check("legacy unversioned log still resolves", legacyDetail.status === 200 && legacyDetail.body.requests.length === 1);
+  }
 }
 
 // ---------- client contract ----------

@@ -10,10 +10,11 @@ import { BasicCompactionEngine } from "@deepseek-ai/dsh-compaction-basic";
 import { isCompactCheckpointSource, ManualCompactionError } from "@deepseek-ai/dsh-compaction";
 import { CONTEXT_WINDOW_EXCEEDED_CODE, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { openDatabase } from "./db.js";
-import { selectCompartmentRange, selectManualCompartmentRange } from "./range.js";
+import { protectedSystemHeadSeq, selectCompartmentRange, selectManualCompartmentRange } from "./range.js";
 import { estimateFramedSummaryTokens, landCompartment } from "./landing.js";
 import { DEFAULT_ORGANIZER_MAX_TOKENS, summarizeCompartment } from "./summarizer.js";
 import { createParagraphAssigner, installParagraphInjector, PARAGRAPH_SECTION } from "./paragraphs.js";
+import { CURRENT_FORMAT_VERSION, inspectSessionCoordinates, rebuildSessionCoordinates, retireStaleReadyCompartments } from "./coordinates.js";
 import { createExpandTool, createReduceTool } from "./tools.js";
 import { CONTEXT_TOOL_GUIDANCE } from "./context-tool-guidance.js";
 import {
@@ -41,7 +42,8 @@ import { mergeContextConfig, setSessionFilterSeed } from "./settings.js";
 import { clearContextUsage, setContextUsage } from "./usage.js";
 import { describeAuxFailure } from "./aux-llm.js";
 import { sessionMemoryScope } from "./scope.js";
-import { sessionEventAt, sessionEvents } from "./session-compat.js";
+import { replaceSurfaceOp, sessionEventAt, sessionEvents, warmReplaceSurfaceOpProbe } from "./session-compat.js";
+import { createTokenCounter } from "./tokenizer.js";
 import { installContextCommands } from "./commands.js";
 
 const DEFAULT_GENERATE_THRESHOLD = 0.65;
@@ -52,6 +54,8 @@ const DEFAULT_DREAMER_MAX_ROUNDS = 20;
 const DEFAULT_DREAMER_TIMEOUT_MS = 600000;
 const DEFAULT_VERIFY_INTERVAL_DAYS = 30;
 const DEFAULT_COMPARTMENT_BUDGET_TOKENS = 40000;
+/** Live checkpoint share of the routed window the landing path must respect. */
+const DEFAULT_COMPARTMENT_BUDGET_RATIO = 0.15;
 /**
  * Backoff after a failed generation, doubling per consecutive failure.
  *
@@ -93,6 +97,9 @@ const OWN_KEYS = new Set([
 	"dreamerMode",
 	"verifyIntervalDays",
 	"compartmentBudgetTokens",
+	"compartmentBudgetRatio",
+	"exactTokens",
+	"tokenizerFile",
 	"dreamerProvider",
 	"dreamerModel",
 	"summarizationReasoningEffort",
@@ -268,6 +275,9 @@ export class ContextEngine extends BasicCompactionEngine {
 		dreamerMode: z.string(),
 		verifyIntervalDays: z.number().step(1).min(1),
 		compartmentBudgetTokens: z.number().step(1).min(1),
+		compartmentBudgetRatio: z.number().min(0).max(1),
+		exactTokens: z.boolean(),
+		tokenizerFile: z.string(),
 		dreamerProvider: z.string(),
 		dreamerModel: z.string(),
 		summarizationReasoningEffort: z.string(),
@@ -282,6 +292,7 @@ export class ContextEngine extends BasicCompactionEngine {
 	agentBySession = new WeakMap();
 	inFlight = new Map(); // sessionId -> Promise
 	generateFailures = new Map(); // sessionId -> { failures, until }
+	failureNotices = new Map(); // sessionId -> last reported deterministic failure reason
 	overflowRetries = new WeakMap();
 	injection = new WeakMap(); // session -> { text, memoryCount, memoryTokens }
 	idleTimers = new Map(); // session -> timer
@@ -301,6 +312,10 @@ export class ContextEngine extends BasicCompactionEngine {
 		const rerankPreset = LOCAL_RERANK_PRESETS[configured.rerankPreset];
 		this.ownConfig = {
 			generateThreshold: own.generateThreshold ?? DEFAULT_GENERATE_THRESHOLD,
+			/* exact token accounting: the Rust tokenizer when it is installed and
+			 * its vocabulary is provisioned, the host heuristic otherwise */
+			exactTokens: own.exactTokens !== false,
+			tokenizerFile: own.tokenizerFile ?? "deepseek.json",
 			retainRounds: own.retainRounds ?? DEFAULT_RETAIN_ROUNDS,
 			waitReadyTimeoutMs: own.waitReadyTimeoutMs ?? DEFAULT_WAIT_READY_TIMEOUT_MS,
 			memoryConfig: {
@@ -352,6 +367,7 @@ export class ContextEngine extends BasicCompactionEngine {
 				mode: own.dreamerMode === "loop" ? "loop" : "session",
 				verifyIntervalDays: own.verifyIntervalDays ?? DEFAULT_VERIFY_INTERVAL_DAYS,
 				compartmentBudgetTokens: own.compartmentBudgetTokens ?? DEFAULT_COMPARTMENT_BUDGET_TOKENS,
+				compartmentBudgetRatio: own.compartmentBudgetRatio ?? DEFAULT_COMPARTMENT_BUDGET_RATIO,
 				provider: own.dreamerProvider ?? "",
 				model: own.dreamerModel ?? "",
 				reasoningEffort: own.dreamerReasoningEffort ?? "",
@@ -362,6 +378,25 @@ export class ContextEngine extends BasicCompactionEngine {
 		/* the settings panel edits the composed filter, not bare schema defaults */
 		setSessionFilterSeed(this.ownConfig.sessionFilter);
 		this.cdb = openDatabase(resolveDshHome(), { embeddingDim: embeddingPreset?.embeddingDim ?? own.embeddingDim });
+		/* Probe the installed reader's replace-marker key names off the landing
+		 * path: the probe loads a module, and the first landing must not pay for
+		 * it inside the compaction transaction. Never rejects. */
+		void warmReplaceSurfaceOpProbe();
+		/* Exact token accounting: the host meter prices every block at four
+		 * characters per token, which undercounts CJK material ~2x. The counter
+		 * is optional and fails open to that same heuristic. */
+		this.tokens = createTokenCounter({
+			homeDir: resolveDshHome(),
+			file: own.tokenizerFile,
+			logger: ctx.logger,
+		});
+		/* sessionId -> Map(surface seq -> exact tokens); nodes are immutable, so
+		 * each one is priced once and only new nodes cost anything afterwards. */
+		this.pricedNodes = new Map();
+		this.pricingSessions = new Set();
+		/* sessionId -> routed context window, so the measured row can show a
+		 * share of the window without awaiting the model registry. */
+		this.contextWindows = new Map();
 		/* the archived-session set powers respectArchived; unavailable registries
 		 * simply turn that check into a no-op */
 		try {
@@ -402,6 +437,49 @@ export class ContextEngine extends BasicCompactionEngine {
 		this._registerTriggers(ctx);
 	}
 
+	/**
+	 * Rebuild a resumed session's coordinate rows when its log format moved
+	 * under them (the v0→v3 migration renumbers every event, so the seq-keyed
+	 * rows no longer name the events they were written for). Runs before the
+	 * paragraph assigner replays the log, so the replay writes into a space that
+	 * matches the log. Best effort: a failure must not take the session down,
+	 * it only leaves the old numbering in place.
+	 */
+	_rebuildCoordinatesIfStale(session) {
+		try {
+			const inspected = inspectSessionCoordinates(this.cdb, session);
+			if (inspected.state === "empty") {
+				if (inspected.epoch === undefined) {
+					this.cdb.markSessionEpoch(session.id, { formatVersion: CURRENT_FORMAT_VERSION, events: inspected.eventCount });
+				}
+				return;
+			}
+			if (inspected.state === "current") {
+				// Rows are in the current space, but a ready compartment may still
+				// hold a span the log cannot satisfy (generated before the rebuild).
+				// Retire it so the landing queue can drain into a fresh generation.
+				const retired = retireStaleReadyCompartments(this.cdb, session);
+				if (retired.length > 0) {
+					this.ctx.logger.warn(`magic-context: retired unreachable ready compartment(s) ${retired.join(", ")} for ${session.id}`);
+				}
+				return;
+			}
+			const summary = rebuildSessionCoordinates(this.cdb, session);
+			if (summary.refused) {
+				this.ctx.logger.warn(`magic-context: coordinate rebuild refused for ${session.id}: ${summary.reason}`);
+				return;
+			}
+			this.ctx.logger.info(
+				`magic-context: rebuilt event coordinates for ${session.id} (${summary.previousRows} -> ${summary.rows} paragraph rows over ${summary.events} events)`
+			);
+			if (summary.retired.length > 0) {
+				this.ctx.logger.warn(`magic-context: retired unreachable ready compartment(s) ${summary.retired.join(", ")} for ${session.id}`);
+			}
+		} catch (error) {
+			this.ctx.logger.warn(`magic-context: coordinate rebuild failed for ${session.id}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
 	/** Paragraph numbering (Phase 2) mounts on the engine's context. */
 	_installParagraphSystem(ctx) {
 		const assignParagraph = createParagraphAssigner(this.cdb);
@@ -413,20 +491,26 @@ export class ContextEngine extends BasicCompactionEngine {
 			// a completed step must not retract it. Only re-selection (session
 			// start or a durable landing) may replace its text.
 			this._refreshContextUsage(session);
+			void this._priceSurface(session);
 		});
 		ctx.on("session/event", (session, event) => {
-			if (event.surfaceOp !== undefined) this._refreshContextUsage(session);
+			if (event.surfaceOp !== undefined) {
+				this._refreshContextUsage(session);
+				void this._priceSurface(session);
+			}
 		});
 		ctx.on("agent/session-start", ({ agent }) => {
 			this.agentBySession.set(agent.session, agent);
 			const session = agent.session;
 			if (wrapped.has(session)) return;
 			wrapped.add(session);
+			this._rebuildCoordinatesIfStale(session);
 			for (const event of sessionEvents(session)) assignParagraph(session, event);
 			// Resumed sessions are re-selected too: the block is a persistent
 			// prefix, so a resumed conversation must not run without memories.
 			this.refreshInjection(session);
 			this._refreshContextUsage(session);
+			void this._priceSurface(session);
 			installParagraphInjector(session, this.cdb, {
 				extraMessage: () => {
 					const inj = this.injection.get(session);
@@ -468,6 +552,7 @@ export class ContextEngine extends BasicCompactionEngine {
 				: estimateTokens(text);
 		this.injection.set(session, { text, memoryCount: selected.length, memoryTokens });
 		this._refreshContextUsage(session);
+		void this._priceInjection(session, text);
 		if (selected.length > 0) {
 			this._activity(
 				this.agentBySession.get(session),
@@ -481,24 +566,181 @@ export class ContextEngine extends BasicCompactionEngine {
 	/** Publish checkpoint and memory-injection tokens in the current window. */
 	_refreshContextUsage(session) {
 		const injection = this.injection.get(session);
+		const window = this.contextWindows.get(session?.id) ?? 0;
+		const memories = {
+			count: injection?.memoryCount ?? 0,
+			tokens: injection?.memoryExactTokens ?? injection?.memoryTokens ?? 0,
+			heuristicTokens: injection?.memoryTokens ?? 0,
+			exact: injection?.memoryExactTokens !== undefined,
+		};
 		if (typeof this.ctx.tokenMeter.measure !== "function" || !Array.isArray(session?.surface?.nodes)) {
-			setContextUsage(session?.id, { memories: { count: injection?.memoryCount ?? 0, tokens: injection?.memoryTokens ?? 0 } });
+			setContextUsage(session?.id, { memories, measured: { kind: "none", window } });
 			return;
 		}
 		const measurement = this.ctx.tokenMeter.measure(session);
 		const tokensBySeq = new Map((measurement.nodes ?? []).map((node) => [node.seq, node.tokens]));
+		const priced = this.pricedNodes.get(session.id);
 		let compartmentCount = 0;
-		let compartmentTokens = 0;
-		for (const [index, seq] of session.surface.nodes.entries()) {
+		let heuristicTokens = 0;
+		let exactTokens = 0;
+		let unpriced = 0;
+		for (const seq of session.surface.nodes) {
 			const event = sessionEventAt(session, seq);
 			if (event?.type !== "user/message" || event.data?.source === undefined || !isCompactCheckpointSource(event.data.source)) continue;
 			compartmentCount += 1;
-			compartmentTokens += tokensBySeq.get(seq) ?? measurement.nodes?.[index]?.tokens ?? 0;
+			heuristicTokens += tokensBySeq.get(seq) ?? 0;
+			const count = priced?.get(seq);
+			if (typeof count === "number") exactTokens += count;
+			else unpriced += 1;
 		}
 		setContextUsage(session.id, {
-			compartments: { count: compartmentCount, tokens: compartmentTokens },
-			memories: { count: injection?.memoryCount ?? 0, tokens: injection?.memoryTokens ?? 0 },
+			compartments: {
+				count: compartmentCount,
+				tokens: exactTokens > 0 ? exactTokens : heuristicTokens,
+				heuristicTokens,
+				exact: exactTokens > 0 && unpriced === 0,
+			},
+			memories,
+			measured: {
+				tokens: measurement.totalTokens,
+				kind: measurement.baseline?.kind ?? "estimated",
+				deltaTokens: measurement.surfaceDeltaTokens ?? 0,
+				window,
+			},
 		});
+	}
+
+	/**
+	 * Price every not-yet-priced surface node with the exact tokenizer.
+	 *
+	 * Surface nodes are immutable once appended, so this is incremental: only
+	 * nodes appended since the last pass cost anything. Single-flight per
+	 * session, and a no-op when the tokenizer is unavailable, in which case the
+	 * panel keeps reporting the host's heuristic figures.
+	 */
+	async _priceSurface(session) {
+		if (this.ownConfig.exactTokens === false) return;
+		const nodes = session?.surface?.nodes;
+		if (!Array.isArray(nodes) || nodes.length === 0) return;
+		if (this.pricingSessions.has(session.id)) return;
+		const priced = this.pricedNodes.get(session.id) ?? new Map();
+		const pending = [];
+		for (const seq of nodes) {
+			if (priced.has(seq)) continue;
+			const event = sessionEventAt(session, seq);
+			const message = typeof session.deriveEventMessage === "function" ? session.deriveEventMessage(event) : null;
+			if (message === null || message === undefined) {
+				priced.set(seq, 0);
+				continue;
+			}
+			pending.push({ seq, message });
+		}
+		if (pending.length === 0) {
+			this.pricedNodes.set(session.id, priced);
+			return;
+		}
+		this.pricingSessions.add(session.id);
+		try {
+			const counts = await this.tokens.countMessages(pending.map((item) => item.message));
+			let counted = 0;
+			for (const [index, item] of pending.entries()) {
+				const value = counts[index];
+				if (value === null) break;
+				priced.set(item.seq, value);
+				counted += 1;
+			}
+			if (counted === 0) return;
+			const live = new Set(nodes);
+			for (const seq of [...priced.keys()]) if (!live.has(seq)) priced.delete(seq);
+			this.pricedNodes.set(session.id, priced);
+			this._refreshContextUsage(session);
+		} catch (error) {
+			this.ctx.logger.warn(`context token pricing failed: ${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			this.pricingSessions.delete(session.id);
+		}
+	}
+
+	/** Price the memory-injection prefix exactly (it rides every request). */
+	async _priceInjection(session, text) {
+		const count = await this.tokens.countText(text);
+		if (count === null) return;
+		const current = this.injection.get(session);
+		if (current === undefined || current.text !== text) return;
+		this.injection.set(session, { ...current, memoryExactTokens: count + 8 });
+		this._refreshContextUsage(session);
+	}
+
+	/** Price every compartment summary that has no exact count recorded yet. */
+	async _priceCompartments() {
+		if (this.ownConfig.exactTokens === false) return 0;
+		const pending = this.cdb.compartmentsMissingTokens();
+		if (pending.length === 0) return 0;
+		const counts = await this.tokens.countTexts(pending.map((row) => row.summary ?? ""));
+		let priced = 0;
+		for (const [index, row] of pending.entries()) {
+			const value = counts[index];
+			if (value === null) break;
+			this.cdb.setCompartmentSummaryTokens(row.id, value);
+			priced += 1;
+		}
+		return priced;
+	}
+
+	/**
+	 * Token budget for this session's live checkpoint chain.
+	 *
+	 * The budget follows the routed window when it is known, so a large window
+	 * gets proportionally more room and a small one is not buried; the absolute
+	 * `compartmentBudgetTokens` is the fallback while the window is unknown. A
+	 * ratio of 0 disables the landing-path bound.
+	 */
+	_archivalBudget(window) {
+		const ratio = this.ownConfig.dreamerConfig.compartmentBudgetRatio;
+		if (Number.isFinite(window) && window > 0 && Number.isFinite(ratio)) return Math.round(window * ratio);
+		return this.ownConfig.dreamerConfig.compartmentBudgetTokens;
+	}
+
+	/**
+	 * Keep this session's landed checkpoint chain inside its budget.
+	 *
+	 * Archival used to run only at the end of a Dreamer pass, so a failing or
+	 * idle Dreamer let the chain grow without bound: the measured session ended
+	 * with 23 landed compartments holding 106911 exact tokens (39% of a 272000
+	 * window) and every landing was followed by an immediate regeneration.
+	 * Retiring is per session, and the archived nodes leave the surface on the
+	 * next pre-step through `_removeArchivedCheckpoints`.
+	 */
+	async _boundCheckpointChain(agent) {
+		const session = agent?.session;
+		if (session === undefined) return null;
+		const ratio = this.ownConfig.dreamerConfig.compartmentBudgetRatio;
+		if (Number.isFinite(ratio) && ratio <= 0) return null;
+		await this._priceCompartments();
+		let window = this.contextWindows.get(session.id) ?? 0;
+		if (window === 0) {
+			const resolved = await this._contextWindow(agent);
+			if (Number.isFinite(resolved)) window = resolved;
+			this._noteContextWindow(session, window);
+		}
+		const budgetTokens = this._archivalBudget(window);
+		const result = runArchival(this.cdb, { budgetTokens, sessionId: session.id });
+		if (result.archived.length > 0) {
+			this._activity(
+				agent,
+				"Context: checkpoint chain trimmed",
+				`Archived ${result.archived.length} compartment(s) to hold this session's live checkpoints at ${result.total} of ${budgetTokens} tokens (${Math.round((budgetTokens / (window || 1)) * 100)}% of the window).`,
+			);
+		}
+		return result;
+	}
+
+	/** Remember the routed model's context window for the measured row. */
+	_noteContextWindow(session, window) {
+		if (!Number.isFinite(window) || window <= 0) return;
+		if (this.contextWindows.get(session.id) === window) return;
+		this.contextWindows.set(session.id, window);
+		this._refreshContextUsage(session);
 	}
 
 	/**
@@ -533,6 +775,31 @@ export class ContextEngine extends BasicCompactionEngine {
 		} catch (error) {
 			this.ctx.logger.warn(`context activity row failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+
+	/**
+	 * Report a deterministic compaction-path failure (token-meter invariant,
+	 * range selection, overflow recovery) as one settled error row.
+	 *
+	 * The 65% generation and 80% landing triggers fire on every step boundary;
+	 * when the token meter cannot measure the session (a session-log provenance
+	 * problem, for example) they fail BEFORE the generation machinery opens its
+	 * own activity row and arms a cooldown, so the only trace used to be a
+	 * process-log warning nobody sees while the context keeps growing. Rows are
+	 * deduplicated per session until the failure clears, because the triggers
+	 * re-fire continuously.
+	 */
+	_reportCompactionFailure(agent, title, error) {
+		const reason = describeAuxFailure(error instanceof Error ? error.message : String(error));
+		const id = agent?.session?.id;
+		if (id === undefined || this.failureNotices.get(id) === reason) return;
+		this.failureNotices.set(id, reason);
+		this._activity(agent, title, reason, "error");
+	}
+
+	/** Clear the dedupe after a successful generate/land so a later failure re-reports. */
+	_clearCompactionFailure(sessionId) {
+		if (sessionId !== undefined) this.failureNotices.delete(sessionId);
 	}
 
 	/** Announce one checkpoint entering the model-visible surface. */
@@ -616,6 +883,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			const agent = this.agentBySession.get(session);
 			if (agent === undefined) return;
 			this.maybeGenerate(agent).catch((error) => {
+				this._reportCompactionFailure(agent, "Context: compartment generation is blocked", error);
 				ctx.logger.warn(`compartment generation failed: ${error instanceof Error ? error.message : String(error)}`);
 			});
 		});
@@ -641,6 +909,7 @@ export class ContextEngine extends BasicCompactionEngine {
 			this._clearIdleTimer(session);
 			this.dreamerRounds.delete(session);
 			this.generateFailures.delete(session?.id);
+			this.failureNotices.delete(session?.id);
 			clearContextUsage(session?.id);
 		});
 		// 80%: land a ready compartment before the next step.
@@ -649,7 +918,10 @@ export class ContextEngine extends BasicCompactionEngine {
 				try {
 					await this._removeArchivedCheckpoints(agent);
 					await this.maybeLand(agent, signal);
+					await this._boundCheckpointChain(agent);
+					this._clearCompactionFailure(agent.session.id);
 				} catch (error) {
+					this._reportCompactionFailure(agent, "Context: compartment landing failed", error);
 					ctx.logger.warn(`compartment landing failed: ${error instanceof Error ? error.message : String(error)}`);
 				}
 			}
@@ -748,6 +1020,9 @@ export class ContextEngine extends BasicCompactionEngine {
 				maxTokens: this.ownConfig.summarizationMaxTokens,
 			});
 			this.generateFailures.delete(id);
+			/* the fresh summary needs its exact price before the next archival
+			 * decision, and the number is also what the panel reports */
+			void this._priceCompartments();
 			this._activitySettle(
 				agent,
 				activityId,
@@ -824,7 +1099,9 @@ export class ContextEngine extends BasicCompactionEngine {
 		if (cooldown !== undefined && Date.now() < cooldown.until) return;
 		const contextWindow = await this._contextWindow(agent);
 		if (contextWindow === undefined) return;
+		this._noteContextWindow(agent.session, contextWindow);
 		const measurement = this.ctx.tokenMeter.measure(session);
+		this._clearCompactionFailure(id);
 		if (measurement.totalTokens < this.ownConfig.generateThreshold * contextWindow) return;
 		const paragraphFor = (sessionId, seq) => this.cdb.paragraphFor(sessionId, seq);
 		const range = selectCompartmentRange(session, { retainRounds: this.ownConfig.retainRounds, paragraphFor })
@@ -846,7 +1123,10 @@ export class ContextEngine extends BasicCompactionEngine {
 		const session = agent.session;
 		const nodes = session.surface.nodes;
 		let seq = 0;
-		for (const node of nodes) {
+		// 0.1.5 puts the system prompt at surface node 0; the contiguous
+		// checkpoint chain starts after it.
+		const headSkip = protectedSystemHeadSeq(session) === undefined ? 0 : 1;
+		for (const node of nodes.slice(headSkip)) {
 			const event = sessionEventAt(session, node);
 			if (event?.type !== "user/message" || event.data?.source === undefined || !isCompactCheckpointSource(event.data.source)) break;
 			seq = node;
@@ -873,6 +1153,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		const session = agent.session;
 		const contextWindow = await this._contextWindow(agent);
 		if (contextWindow === undefined) return;
+		this._noteContextWindow(agent.session, contextWindow);
 		const measurement = this.ctx.tokenMeter.measure(session);
 		if (measurement.totalTokens < this.config.thresholdRatio * contextWindow) return;
 		let ready = this._readyCompartments(session.id);
@@ -941,7 +1222,7 @@ export class ContextEngine extends BasicCompactionEngine {
 				content: [{ type: "text", text: "" }],
 				source: { kind: "plugin", plugin: "dsh-magic-context" },
 			}), {
-				surfaceOp: { op: "replace", start: seq, end: seq },
+				surfaceOp: await replaceSurfaceOp(seq, seq),
 				sourceEventSeqs: [seq],
 			});
 			this.cdb.markCompartmentRemoved(compartment.id);
@@ -1172,10 +1453,12 @@ export class ContextEngine extends BasicCompactionEngine {
 			if (isAbortFailure(error, signal)) {
 				throw new ManualCompactionError("cancelled", "manual compaction was cancelled", { cause: error });
 			}
-			// The reason is already on the compartment row and in a UI notice; the
-			// command surface only distinguishes classes, so `summary` is the honest
-			// one for "the compartment could not be produced".
+			// The reason is already on the compartment row (when one exists), in a
+			// UI activity row, and in the compaction/end event; the command surface
+			// only distinguishes classes, so `summary` is the honest one for "the
+			// compartment could not be produced".
 			const reason = describeAuxFailure(error instanceof Error ? error.message : String(error));
+			this._reportCompactionFailure(agent, "Context: manual compaction failed", error);
 			this.ctx.logger.warn(`manual compaction could not produce a summary: ${reason}`);
 			throw new ManualCompactionError("summary", `manual compaction could not produce a summary: ${reason}`, { cause: error });
 		}

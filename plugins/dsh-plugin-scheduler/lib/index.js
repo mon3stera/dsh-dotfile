@@ -140,11 +140,20 @@ export function createScheduler() {
        * The RPC selectModel() is deliberately avoided — it also saves the
        * deployment-global default model, which a task must never hijack. A
        * failed selection skips the prompt rather than running on the wrong
-       * model silently. */
+       * model silently.
+       *
+       * Only the released `model/selection` members are committed: the event
+       * carries exactly what selectForNextRequest is handed, resolveCallConfig
+       * also returns `maxTokens`, and a stored log with that extra member is
+       * refused by the frozen v0 format catalog when a newer line migrates it
+       * (see plugins/dsh-plugin-session-repair/lib/normalize.js). The dropped
+       * value is the model's own default, applied by the adapter regardless. */
       if (task.provider && task.model) {
         const agent = await runner.resolveAgent(created.sessionId);
         const resolved = await runner.resolveCallConfig({ provider: task.provider, model: task.model });
-        await runner.selectModel(agent, resolved);
+        const selection = { provider: resolved.provider, model: resolved.model };
+        if (resolved.reasoningEffort !== undefined) selection.reasoningEffort = resolved.reasoningEffort;
+        await runner.selectModel(agent, selection);
       }
       await runner.prompt({
         sessionId: created.sessionId,

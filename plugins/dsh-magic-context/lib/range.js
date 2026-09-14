@@ -5,6 +5,12 @@
 // engine supplies the durable paragraph lookup from ContextDb; the local
 // fallback keeps detached range tests and older sessions usable when a number
 // has not been assigned yet. The landing later replaces exactly this span.
+//
+// 0.1.5 puts the rendered system prompt at surface node 0 as a
+// `system/message`. The host fold rejects a user-message replacement covering
+// that node ("node 0 holds the system prompt…"), so every selected range
+// starts at the first non-system node — the same rule as dsh-compaction-basic.
+// Later system nodes (in-history prompt updates) are ordinary history.
 import { isCompactCheckpointSource, toolPairingBalancedAfter, toolPairingBalancedBefore } from "@deepseek-ai/dsh-compaction";
 import { sessionEventAt } from "./session-compat.js";
 
@@ -25,6 +31,81 @@ function isSkippedToolResult(session, event) {
 function isCheckpointNode(session, seq) {
 	const event = sessionEventAt(session, seq);
 	return event?.type === "user/message" && event.data?.source !== undefined && isCompactCheckpointSource(event.data.source);
+}
+
+/**
+ * Seq of the protected system prompt at surface node 0, or `undefined`.
+ *
+ * 0.1.5 made the rendered prompt a `system/message` surface node. The host
+ * fold refuses any replacement covering that node unless the replacement is
+ * itself a `system/message` over exactly that node — a user-message checkpoint
+ * therefore must never start there. Later system nodes (in-history prompt
+ * updates) are ordinary history and may be shadowed. Matches
+ * `dsh-compaction-basic`'s `systemHead`.
+ */
+export function protectedSystemHeadSeq(session) {
+	const nodes = session.surface.nodes;
+	if (nodes.length === 0) return undefined;
+	const head = sessionEventAt(session, nodes[0]);
+	return head?.type === "system/message" ? nodes[0] : undefined;
+}
+
+/**
+ * Every seq the current system head has replaced, including itself.
+ *
+ * Each prompt update rewrites node 0 with a new `system/message` whose
+ * `surfaceOp` names the previous head. A compartment generated against an
+ * older prompt still "starts at the system head" after those updates, even
+ * though the stored start seq is no longer on the surface.
+ */
+export function protectedSystemHeadChain(session) {
+	const seqs = new Set();
+	let seq = protectedSystemHeadSeq(session);
+	while (seq !== undefined && !seqs.has(seq)) {
+		seqs.add(seq);
+		const event = sessionEventAt(session, seq);
+		if (event?.type !== "system/message") break;
+		const op = event.surfaceOp;
+		if (op === undefined || op === "append") break;
+		const previous = op.startSeq ?? op.start;
+		if (!Number.isSafeInteger(previous)) break;
+		seq = previous;
+	}
+	return seqs;
+}
+
+/**
+ * First surface index a compaction range may start at: after the protected
+ * system head, after every contiguous head checkpoint, snapped to a
+ * tool-balanced cut. The 0.1.5 surface is `[system][C1]…[Ck] + content`;
+ * starting at 0 would both rewrite the prompt (host-rejected) and
+ * re-summarize the checkpoint chain (the design forbids that).
+ */
+export function firstCompactableIndex(session) {
+	const nodes = session.surface.nodes;
+	let startIdx = protectedSystemHeadSeq(session) === undefined ? 0 : 1;
+	while (startIdx < nodes.length && isCheckpointNode(session, nodes[startIdx])) startIdx += 1;
+	while (startIdx < nodes.length && !toolPairingBalancedBefore(session, nodes[startIdx])) startIdx += 1;
+	return startIdx;
+}
+
+/**
+ * Shift a stored landing start that still names the protected system head
+ * (current or rewritten-away) onto the first compactable node. A correctly
+ * generated span already starts at or after that node and is returned
+ * unchanged; a missing start that is not in the system-head chain is also
+ * returned unchanged so `validateRange` can fail it as a genuine surface
+ * change.
+ */
+export function adjustLandingStart(session, startSeq) {
+	const nodes = session.surface.nodes;
+	const compactFrom = firstCompactableIndex(session);
+	if (compactFrom >= nodes.length) return startSeq;
+	const startIdx = nodes.indexOf(startSeq);
+	if (startIdx === -1) {
+		return protectedSystemHeadChain(session).has(startSeq) ? nodes[compactFrom] : startSeq;
+	}
+	return startIdx < compactFrom ? nodes[compactFrom] : startSeq;
 }
 
 /** Count one model-visible paragraph when no durable DB number is available. */
@@ -96,15 +177,13 @@ export function selectCompartmentRange(session, { retainRounds, paragraphFor: lo
 	while (endIdx >= 0 && !toolPairingBalancedAfter(session, nodes[endIdx])) endIdx -= 1;
 	if (endIdx < 0) return null;
 
-	// The generation range starts AFTER every contiguous head checkpoint:
-	// after several landings the surface is [C1][C2]…[Ck] + new content, and
-	// the head node is still the oldest checkpoint. Only content after the last
-	// checkpoint may be summarized again (chain design — never re-summarize).
-	let startIdx = 0;
-	while (startIdx < nodes.length && isCheckpointNode(session, nodes[startIdx])) startIdx += 1;
-	if (startIdx >= nodes.length) return null;
-	while (startIdx < nodes.length && !toolPairingBalancedBefore(session, nodes[startIdx])) startIdx += 1;
-	if (endIdx < startIdx) return null;
+	// The generation range starts AFTER the protected system head (0.1.5
+	// surface node 0) and every contiguous head checkpoint. After several
+	// landings the surface is [system][C1][C2]…[Ck] + new content; only
+	// content after the last checkpoint may be summarized again (chain
+	// design — never re-summarize, and never rewrite the system prompt).
+	const startIdx = firstCompactableIndex(session);
+	if (startIdx >= nodes.length || endIdx < startIdx) return null;
 	return {
 		start: nodes[startIdx],
 		end: nodes[endIdx],

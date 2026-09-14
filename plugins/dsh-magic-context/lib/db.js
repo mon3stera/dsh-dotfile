@@ -91,8 +91,10 @@ CREATE TABLE IF NOT EXISTS compartments (
   provider     TEXT,
   model        TEXT,
   landing_seq  INTEGER,
+  summary_tokens INTEGER,
   removed      INTEGER NOT NULL DEFAULT 0,
   error        TEXT,
+  stale        INTEGER NOT NULL DEFAULT 0,
   UNIQUE (session_id, generation)
 );
 CREATE INDEX IF NOT EXISTS compartments_session ON compartments(session_id);
@@ -110,6 +112,13 @@ CREATE TABLE IF NOT EXISTS session_facts (
   promoted_memory_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS session_facts_status ON session_facts(status);
+
+CREATE TABLE IF NOT EXISTS session_epochs (
+  session_id     TEXT PRIMARY KEY,
+  format_version INTEGER NOT NULL,
+  events         INTEGER NOT NULL,
+  rebuilt_at     INTEGER NOT NULL
+);
 `;
 
 const VEC_SCHEMA = `
@@ -197,13 +206,28 @@ export class ContextDb {
 		return row.next;
 	}
 
-	/** Assign the next global paragraph number to (session, seq); idempotent. */
+	/**
+	 * Assign the next global paragraph number to (session, seq); idempotent.
+	 *
+	 * The number is re-read per insert because a coordinate rebuild
+	 * (`replaceSessionCoordinates`) can replace a whole session's numbering
+	 * while the engine's own replay is in flight — a cached "next" would then
+	 * collide with the rebuilt rows on the UNIQUE(session_id, paragraph_no)
+	 * index, and one retry is enough to settle onto the rebuilt numbering.
+	 */
 	assignParagraph(sessionId, seq) {
 		const existing = this.paragraphFor(sessionId, seq);
 		if (existing !== undefined) return existing;
-		const no = this.nextParagraphNo(sessionId);
-		this.db.prepare("INSERT INTO paragraphs(session_id, seq, paragraph_no) VALUES (?, ?, ?)").run(sessionId, seq, no);
-		return no;
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			const no = this.nextParagraphNo(sessionId);
+			try {
+				this.db.prepare("INSERT INTO paragraphs(session_id, seq, paragraph_no) VALUES (?, ?, ?)").run(sessionId, seq, no);
+				return no;
+			} catch (error) {
+				if (attempt === 1) throw error;
+			}
+		}
+		return undefined;
 	}
 
 	// ── skip marks ──────────────────────────────────────────────────────────
@@ -222,6 +246,84 @@ export class ContextDb {
 		this.db.prepare("DELETE FROM skip_marks WHERE session_id = ?").run(sessionId);
 	}
 
+	// ── session format epochs ───────────────────────────────────────────────
+
+	/**
+	 * The recorded event-coordinate epoch for one session, or undefined when the
+	 * session has never been marked. `formatVersion` is the session log format
+	 * the rows were written from and `events` the log length at rebuild time.
+	 */
+	sessionEpoch(sessionId) {
+		const row = this.db.prepare("SELECT format_version, events, rebuilt_at FROM session_epochs WHERE session_id = ?").get(sessionId);
+		return row === undefined ? undefined : { formatVersion: row.format_version, events: row.events, rebuiltAt: row.rebuilt_at };
+	}
+
+	/** Stamp one session's coordinate epoch (idempotent). */
+	markSessionEpoch(sessionId, { formatVersion, events, rebuiltAt = Date.now() }) {
+		this.db.prepare(
+			"INSERT INTO session_epochs(session_id, format_version, events, rebuilt_at) VALUES (?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET format_version = excluded.format_version, events = excluded.events, rebuilt_at = excluded.rebuilt_at"
+		).run(sessionId, formatVersion, events, rebuiltAt);
+	}
+
+	/**
+	 * Highest seq any stored row cites for one session, across the seq-keyed
+	 * tables. A session whose rows cite seqs past its live log can only be a
+	 * pre-migration coordinate space; this is the cheap staleness probe.
+	 */
+	maxStoredSeq(sessionId) {
+		const row = this.db.prepare(
+			"SELECT MAX(seq) AS n FROM (SELECT seq FROM paragraphs WHERE session_id = ? UNION ALL SELECT seq FROM skip_marks WHERE session_id = ?)"
+		).get(sessionId, sessionId);
+		return row.n ?? -1;
+	}
+
+	/** All (seq, paragraph_no) rows of one session, by paragraph number. */
+	sessionParagraphs(sessionId) {
+		return this.db.prepare("SELECT seq, paragraph_no FROM paragraphs WHERE session_id = ? ORDER BY paragraph_no").all(sessionId);
+	}
+
+	/**
+	 * Replace one session's paragraph numbering wholesale, inside a transaction.
+	 * `rows` must be the session's paragraphs in model order (seq ascending, one
+	 * row per paragraph). Skip marks are re-derived from the new numbering: a
+	 * mark survives only when its seq is still a live paragraph.
+	 * @param sessionId - session whose rows are replaced.
+	 * @param rows - [{ seq, paragraph_no }] in ascending seq order.
+	 * @returns counts for diagnostics.
+	 */
+	replaceSessionCoordinates(sessionId, rows) {
+		const removeParagraphs = this.db.prepare("DELETE FROM paragraphs WHERE session_id = ?");
+		const insertParagraph = this.db.prepare("INSERT INTO paragraphs(session_id, seq, paragraph_no) VALUES (?, ?, ?)");
+		const removeSkips = this.db.prepare("DELETE FROM skip_marks WHERE session_id = ?");
+		const insertSkip = this.db.prepare(
+			"INSERT OR IGNORE INTO skip_marks(session_id, seq, paragraph_no, marked_at) VALUES (?, ?, ?, ?)"
+		);
+		const marks = this.db.prepare("SELECT seq, marked_at FROM skip_marks WHERE session_id = ?").all(sessionId);
+		const paraOf = new Map(rows.map((row) => [row.seq, row.paragraph_no]));
+		const begin = this.db.prepare("BEGIN IMMEDIATE");
+		const commit = this.db.prepare("COMMIT");
+		const rollback = this.db.prepare("ROLLBACK");
+		const now = Date.now();
+		let skipped = 0;
+		begin.run();
+		try {
+			removeParagraphs.run(sessionId);
+			for (const row of rows) insertParagraph.run(sessionId, row.seq, row.paragraph_no);
+			removeSkips.run(sessionId);
+			for (const mark of marks) {
+				const paragraphNo = paraOf.get(mark.seq);
+				if (paragraphNo === undefined) continue;
+				insertSkip.run(sessionId, mark.seq, paragraphNo, mark.marked_at ?? now);
+				skipped += 1;
+			}
+			commit.run();
+		} catch (error) {
+			rollback.run();
+			throw error;
+		}
+		return { rows: rows.length, skipMarks: skipped };
+	}
+
 	// ── compartments ────────────────────────────────────────────────────────
 
 	insertCompartment({ sessionId, scopePath, generation, startSeq, endSeq, startPara, endPara, summary, memoryIds, shadowedTokens, provider, model }) {
@@ -231,9 +333,21 @@ export class ContextDb {
 		return Number(result.lastInsertRowid);
 	}
 
-	setCompartmentSummary(id, { summary, provider, model }) {
-		this.db.prepare("UPDATE compartments SET summary = ?, provider = ?, model = ?, status = 'ready', error = NULL WHERE id = ?")
-			.run(summary, provider ?? null, model ?? null, id);
+	setCompartmentSummary(id, { summary, provider, model, summaryTokens }) {
+		this.db.prepare("UPDATE compartments SET summary = ?, provider = ?, model = ?, summary_tokens = COALESCE(?, summary_tokens), status = 'ready', error = NULL WHERE id = ?")
+			.run(summary, provider ?? null, model ?? null, summaryTokens ?? null, id);
+	}
+
+	/** Record one compartment's exact summary price (null clears it). */
+	setCompartmentSummaryTokens(id, tokens) {
+		this.db.prepare("UPDATE compartments SET summary_tokens = ? WHERE id = ?")
+			.run(Number.isFinite(tokens) ? Math.round(tokens) : null, id);
+	}
+
+	/** Landed compartments still missing an exact summary price. */
+	compartmentsMissingTokens(scopePath) {
+		const rows = this.db.prepare("SELECT * FROM compartments WHERE summary_tokens IS NULL AND status IN ('ready', 'landed') ORDER BY created_at").all();
+		return scopePath === undefined ? rows : rows.filter((row) => row.scope_path === scopePath);
 	}
 
 	/**
@@ -256,6 +370,27 @@ export class ContextDb {
 		return this.db.prepare("SELECT * FROM compartments WHERE id = ?").get(id);
 	}
 
+	/** Ready compartments whose span no longer exists in the session's live log. */
+	staleReadyCompartments(sessionId, eventCount) {
+		return this.db.prepare(
+			"SELECT * FROM compartments WHERE session_id = ? AND status = 'ready' AND archived = 0 AND stale = 0 AND (start_seq >= ? OR end_seq >= ?) ORDER BY generation"
+		).all(sessionId, eventCount, eventCount);
+	}
+
+	/**
+	 * Retire one compartment whose stored span the current log can never satisfy.
+	 *
+	 * Such a row is unreachable, not failing: a span past the end of the log was
+	 * generated in a coordinate space the log no longer has, so it can neither
+	 * land nor be regenerated from its own coordinates. Marking it lets the
+	 * landing queue drain so a fresh generation can take over, and the reason
+	 * survives for diagnosis.
+	 */
+	markCompartmentStale(id, reason) {
+		this.db.prepare("UPDATE compartments SET stale = 1, status = 'failed', error = ? WHERE id = ?")
+			.run(String(reason).slice(0, MAX_COMPARTMENT_ERROR_CHARS), id);
+	}
+
 	compartmentByGeneration(sessionId, generation) {
 		return this.db.prepare("SELECT * FROM compartments WHERE session_id = ? AND generation = ?").get(sessionId, generation);
 	}
@@ -263,7 +398,7 @@ export class ContextDb {
 	/** Ready (summary produced, not yet landed), per session, by generation. */
 	readyCompartments(sessionId) {
 		return this.db.prepare(
-			"SELECT * FROM compartments WHERE session_id = ? AND status = 'ready' AND archived = 0 ORDER BY generation"
+			"SELECT * FROM compartments WHERE session_id = ? AND status = 'ready' AND archived = 0 AND stale = 0 ORDER BY generation"
 		).all(sessionId);
 	}
 
@@ -599,8 +734,10 @@ function migrate(db) {
 		["provider", "ALTER TABLE compartments ADD COLUMN provider TEXT"],
 		["model", "ALTER TABLE compartments ADD COLUMN model TEXT"],
 		["landing_seq", "ALTER TABLE compartments ADD COLUMN landing_seq INTEGER"],
+		["summary_tokens", "ALTER TABLE compartments ADD COLUMN summary_tokens INTEGER"],
 		["removed", "ALTER TABLE compartments ADD COLUMN removed INTEGER NOT NULL DEFAULT 0"],
 		["error", "ALTER TABLE compartments ADD COLUMN error TEXT"],
+		["stale", "ALTER TABLE compartments ADD COLUMN stale INTEGER NOT NULL DEFAULT 0"],
 	]) {
 		if (!compartmentCols.has(name)) db.exec(ddl);
 	}

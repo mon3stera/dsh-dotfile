@@ -7,7 +7,8 @@
 // priced — new content appended after generation does not invalidate the
 // landing. This is what lets the summary run asynchronously at 65% and land at
 // 80% without a whole-surface freeze.
-import { sessionEvents } from "./session-compat.js";
+import { replaceSurfaceOp, sessionEventCount, sessionEvents } from "./session-compat.js";
+import { adjustLandingStart } from "./range.js";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -51,6 +52,25 @@ function validateRange(session, start, end) {
 	if (!toolPairingBalancedBefore(session, nodes[startIdx])) throw new Error(`landing: start seq ${start} is not a balanced boundary`);
 	if (!toolPairingBalancedAfter(session, nodes[endIdx])) throw new Error(`landing: end seq ${end} is not a balanced boundary`);
 	return { start, end, startIdx, endIdx, shadowedSeqs: nodes.slice(startIdx, endIdx + 1) };
+}
+
+/**
+ * Detect a span that can only predate the current log format. The 0.1.5
+ * migration renumbers every event, so a compartment generated before it cites
+ * seqs the live log has never had; landing such a span would replace whatever
+ * unrelated content now sits at those coordinates. `inspectSessionCoordinates`
+ * rebuilds exactly this class of row at session start, so reaching here means
+ * the session was resumed without the engine's session-start hook (a detached
+ * session) — the guard is what keeps the failure a clean refusal instead of a
+ * wrong landing. See docs/dsh-015-upgrade-handoff.md §B.
+ */
+function assertSpanInCurrentLog(session, compartment) {
+	const eventCount = sessionEventCount(session);
+	const farthest = Math.max(compartment.start_seq, compartment.end_seq);
+	if (farthest <= eventCount - 1) return;
+	throw new Error(
+		`landing: compartment ${compartment.id} spans seq ${compartment.start_seq}-${compartment.end_seq}, past the end of this session's log (${eventCount} events) — generated before the log format migration, so the span is no longer addressable`
+	);
 }
 
 /** Inspect open-turn, unmatched-compaction, and latest seed-boundary state. */
@@ -119,7 +139,14 @@ export async function landCompartment(deps, compartment, opts) {
 	signal?.throwIfAborted();
 	let selection;
 	try {
-		selection = validateRange(session, compartment.start_seq, compartment.end_seq);
+		assertSpanInCurrentLog(session, compartment);
+		// A compartment generated before the 0.1.5 system-head skip still
+		// names node 0 (or a rewritten-away previous head). Shift onto the
+		// first compactable node so the replace is a user/message over
+		// conversation, not a rewrite of the protected prompt; a correctly
+		// generated span is unchanged.
+		const start = adjustLandingStart(session, compartment.start_seq);
+		selection = validateRange(session, start, compartment.end_seq);
 	} catch (error) {
 		throw new SurfaceChangedError("landing: the stored span is no longer a valid replacement target", { cause: error });
 	}
@@ -159,14 +186,20 @@ export async function landCompartment(deps, compartment, opts) {
 			compactionId,
 			...(sourceCommandId === undefined ? {} : { sourceCommandId }),
 			summary: checkpointMessage.content,
-			shadowedRange: { start: compartment.start_seq, end: compartment.end_seq },
+			shadowedRange: { start: selection.start, end: selection.end },
 			shadowedSeqs: [...selection.shadowedSeqs],
 			shadowedTokenCount: compartment.shadowed_tokens,
 			provider: compartment.provider ?? "",
 			model: compartment.model ?? "",
 		});
 		const replaceEvent = session.append("user/message", checkpointMessage, {
-			surfaceOp: { op: "replace", start: compartment.start_seq, end: compartment.end_seq },
+			// The marker's key names moved at 0.1.5 ({start,end} -> {startSeq,endSeq});
+			// the compat probe reads the installed validator instead of guessing.
+			// `shadowedRange` above stays {start,end} on purpose — that shape did not
+			// change, and v3 logs still carry it. Endpoints are the (possibly
+			// trimmed) selection, never the stored start if that named the
+			// protected system head.
+			surfaceOp: await replaceSurfaceOp(selection.start, selection.end),
 			sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...selection.shadowedSeqs],
 		});
 		closing = true;
@@ -180,7 +213,7 @@ export async function landCompartment(deps, compartment, opts) {
 			summarySeq: summaryEvent.seq,
 			endSeq: endEvent.seq,
 			summary: checkpointMessage.content,
-			shadowedRange: { start: compartment.start_seq, end: compartment.end_seq },
+			shadowedRange: { start: selection.start, end: selection.end },
 			shadowedSeqs: [...selection.shadowedSeqs],
 			shadowedTokenCount: compartment.shadowed_tokens,
 		};

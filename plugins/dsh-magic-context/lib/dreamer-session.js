@@ -40,6 +40,27 @@ function assistantText(event) {
 	return blocks.filter((block) => block?.type === "text").map((block) => block.text).join("\n").trim();
 }
 
+/**
+ * Project a resolved call config onto the released `model/selection` member set.
+ *
+ * `sessionController.agents.selectForNextRequest` appends the object it is given
+ * verbatim as the `model/selection` event, and the host's own
+ * `llm.resolveCallConfig()` result carries `maxTokens` alongside the route. The
+ * released inventory declares provider, model, and reasoningEffort only, and a
+ * frozen v0 codec refuses to migrate a stored log carrying anything else — so
+ * passing the resolved config straight through wrote rows that make the whole
+ * session unresumable on a newer line. The dropped `maxTokens` is the model's own
+ * default, which the adapter applies anyway.
+ *
+ * @param {{provider?: string, model?: string, reasoningEffort?: string}} route - resolved call config.
+ * @returns {{provider: string, model: string, reasoningEffort?: string}}
+ */
+export function selectionOf(route) {
+	const selection = { provider: route.provider, model: route.model };
+	if (route.reasoningEffort !== undefined) selection.reasoningEffort = route.reasoningEffort;
+	return selection;
+}
+
 /** Pair tool/call with tool/result events into the shared action summary shape. */
 function collectActions(events) {
 	const pending = new Map();
@@ -121,7 +142,7 @@ export async function runDreamerSession(deps, opts) {
 		if (typeof provider === "string" && provider.length > 0 && typeof model === "string" && model.length > 0) {
 			try {
 				const resolvedRoute = await llm.resolveCallConfig({ provider, model });
-				sessionController.agents.selectForNextRequest(child, resolvedRoute);
+				sessionController.agents.selectForNextRequest(child, selectionOf(resolvedRoute));
 			} catch {
 				// fall through to the deployment default route
 			}
