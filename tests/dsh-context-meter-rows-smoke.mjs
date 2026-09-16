@@ -260,6 +260,25 @@ check(
 check("cloned swatch preserved", memories?.querySelector('span[class*="_swatch"]') !== null);
 check("memories swatch gets its own tint", memories?.querySelector('span[class*="_swatch"]')?.style.getPropertyValue("--meter-tint") === "#34d399");
 
+usage.measured = { tokens: 169000, window: 272000, kind: "usage" };
+observers[0].callback();
+await new Promise((resolve) => setTimeout(resolve, 0));
+check("does not inject a measured row (header bar already shows the total)", rows.querySelector('[data-dctx-meter-row="measured"]') === null);
+
+usage.compartments = { count: 2, tokens: 12345, exact: true, heuristicTokens: 6000 };
+observers[0].callback();
+await new Promise((resolve) => setTimeout(resolve, 0));
+check("exact compartment value drops the tilde", rows.querySelector('[data-dctx-meter-row="compartments"]')?.querySelector("dd")?.textContent === "12.3K");
+
+usage.compartments = { count: 0, tokens: 0 };
+observers[0].callback();
+await new Promise((resolve) => setTimeout(resolve, 0));
+check("empty compartment row is removed", rows.querySelector('[data-dctx-meter-row="compartments"]') === null);
+usage.compartments = { count: 2, tokens: 12345 };
+observers[0].callback();
+await new Promise((resolve) => setTimeout(resolve, 0));
+check("compartment row returns when checkpoints exist", rows.querySelector('[data-dctx-meter-row="compartments"]') !== null);
+
 // Re-running the observer must not duplicate or drift.
 observers[0].callback();
 await new Promise((resolve) => setTimeout(resolve, 0));

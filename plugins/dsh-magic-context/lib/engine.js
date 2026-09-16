@@ -394,7 +394,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		 * each one is priced once and only new nodes cost anything afterwards. */
 		this.pricedNodes = new Map();
 		this.pricingSessions = new Set();
-		/* sessionId -> routed context window, so the measured row can show a
+		/* sessionId -> routed context window, so the checkpoint-chain budget can show a
 		 * share of the window without awaiting the model registry. */
 		this.contextWindows = new Map();
 		/* the archived-session set powers respectArchived; unavailable registries
@@ -593,12 +593,17 @@ export class ContextEngine extends BasicCompactionEngine {
 			if (typeof count === "number") exactTokens += count;
 			else unpriced += 1;
 		}
+		// Prefer a complete tokenizer total over a mix of exact and heuristic
+		// figures; kick pricing when any checkpoint is still unpriced so the
+		// next refresh can flip the row to exact.
+		const exact = compartmentCount > 0 && unpriced === 0;
+		if (unpriced > 0 && typeof session.deriveEventMessage === "function") void this._priceSurface(session);
 		setContextUsage(session.id, {
 			compartments: {
 				count: compartmentCount,
-				tokens: exactTokens > 0 ? exactTokens : heuristicTokens,
+				tokens: exact ? exactTokens : heuristicTokens,
 				heuristicTokens,
-				exact: exactTokens > 0 && unpriced === 0,
+				exact,
 			},
 			memories,
 			measured: {
@@ -625,10 +630,12 @@ export class ContextEngine extends BasicCompactionEngine {
 		if (this.pricingSessions.has(session.id)) return;
 		const priced = this.pricedNodes.get(session.id) ?? new Map();
 		const pending = [];
+		const hasDerive = typeof session.deriveEventMessage === "function";
+		if (!hasDerive) return;
 		for (const seq of nodes) {
 			if (priced.has(seq)) continue;
 			const event = sessionEventAt(session, seq);
-			const message = typeof session.deriveEventMessage === "function" ? session.deriveEventMessage(event) : null;
+			const message = session.deriveEventMessage(event);
 			if (message === null || message === undefined) {
 				priced.set(seq, 0);
 				continue;
@@ -639,17 +646,36 @@ export class ContextEngine extends BasicCompactionEngine {
 			this.pricedNodes.set(session.id, priced);
 			return;
 		}
+		const isCheckpoint = (seq) => {
+			const event = sessionEventAt(session, seq);
+			return event?.type === "user/message" && event.data?.source !== undefined && isCompactCheckpointSource(event.data.source);
+		};
+		const checkpoints = pending.filter((item) => isCheckpoint(item.seq));
+		const rest = pending.filter((item) => !isCheckpoint(item.seq));
 		this.pricingSessions.add(session.id);
-		try {
-			const counts = await this.tokens.countMessages(pending.map((item) => item.message));
+		const apply = async (batch) => {
+			if (batch.length === 0) return 0;
+			const counts = await this.tokens.countMessages(batch.map((item) => item.message));
 			let counted = 0;
-			for (const [index, item] of pending.entries()) {
+			for (const [index, item] of batch.entries()) {
 				const value = counts[index];
 				if (value === null) break;
 				priced.set(item.seq, value);
 				counted += 1;
 			}
-			if (counted === 0) return;
+			return counted;
+		};
+		try {
+			// Checkpoints first: the meter sub-row only needs those, and a long
+			// surface would otherwise delay the exact Compartment figure until
+			// every conversation node had been tokenized.
+			const countedCheckpoints = await apply(checkpoints);
+			if (countedCheckpoints > 0) {
+				this.pricedNodes.set(session.id, priced);
+				this._refreshContextUsage(session);
+			}
+			const countedRest = await apply(rest);
+			if (countedCheckpoints + countedRest === 0) return;
 			const live = new Set(nodes);
 			for (const seq of [...priced.keys()]) if (!live.has(seq)) priced.delete(seq);
 			this.pricedNodes.set(session.id, priced);
@@ -735,7 +761,7 @@ export class ContextEngine extends BasicCompactionEngine {
 		return result;
 	}
 
-	/** Remember the routed model's context window for the measured row. */
+	/** Remember the routed model's context window for archival budget math. */
 	_noteContextWindow(session, window) {
 		if (!Number.isFinite(window) || window <= 0) return;
 		if (this.contextWindows.get(session.id) === window) return;

@@ -669,7 +669,7 @@ const check = (label, ok) => {
 			await engine._priceSurface(exactSession);
 			usage = getContextUsage(exactSession.id);
 			check("compartments are priced by the tokenizer", usage.compartments.exact === true && usage.compartments.tokens > 77 && usage.compartments.heuristicTokens === 77);
-			check("the anchored measurement reaches the panel", usage.measured.tokens === 4321 && usage.measured.kind === "usage" && usage.measured.deltaTokens === -12);
+			check("the anchored measurement stays on the usage payload", usage.measured.tokens === 4321 && usage.measured.kind === "usage" && usage.measured.deltaTokens === -12);
 			check("the routed window sets the archival budget", engine._archivalBudget(272000) === 40800 && engine._archivalBudget(0) === 40000);
 
 			// The landing path bounds this session's chain without a Dreamer pass.

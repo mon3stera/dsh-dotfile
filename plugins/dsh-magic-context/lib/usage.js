@@ -6,8 +6,9 @@
 //   - `tokens` is the exact figure when the tokenizer priced the material, else
 //     the host meter's four-characters-per-token heuristic (kept in
 //     `heuristicTokens` for comparison),
-//   - `measured` is the host meter's own request-pressure total, which anchors
-//     on the provider's exact usage whenever the request envelope is unchanged.
+//   - `measured` is the host meter's own request-pressure total (the same
+//     number the header bar already shows). Kept on the usage payload for
+//     archival math; the ContextMeter legend does not render it.
 const usageBySession = new Map();
 
 const EMPTY_USAGE = Object.freeze({

@@ -123,7 +123,7 @@ Compartment 状态机：`generating → ready → landed`；`generating → fail
 - **Memories 完全缺失**：`contextBreakdown` 的消息数字重放 `surface-fold`，按单个 **surface 事件**计价（`deriveEventMessage`）。而 `<project_memory>` 前缀是 `deriveMessages()` 包装层注入的 head，不是 surface 事件，因此从不计入。它却真实随每次请求发送，也被 provider 锚定的 `projectedTokens` 计入。
 - **Compartments 被折叠**：checkpoint 本身就是 surface 上的 `user/message`，已经包含在 `对话消息` 里。
 
-因此 `lib/client.js` 向该面板补两行：`项目记忆`（独立项）和 `↳ Compartment`（标为 `对话消息` 的小计，避免读者把行相加）。两行只进图例，**不加进色条**——色条按 `breakdownTotal` 归一，塞入不在该分母里的数字会歪曲比例。
+因此 `lib/client.js` 向该面板补两行：`项目记忆`（独立项）和 `↳ Compartment`（标为 `对话消息` 的小计，避免读者把行相加）。`↳ Compartment` 有 checkpoint 才出现，数字优先用真实分词器；精确值不加 `~`，tooltip 仍给出 chars/4 对照。顶栏的 `~169K / 272K` 已经是宿主锚定的请求总量，不再另插一行「实际占用」。两行只进图例，**不加进色条**——色条按 `breakdownTotal` 归一，塞入不在该分母里的数字会歪曲比例。
 
 实现约束（`tests/dsh-context-meter-rows-smoke.mjs` 锁定）：
 
@@ -164,7 +164,7 @@ ln -sfn "$DSH_HOME/profiles/web/node_modules/tokenizers" \
 
 第三条链接是必需的：插件运行副本自己的 `node_modules/`（rsync 排除、保存可选 peer）才是 `import("tokenizers")` 的解析目标，`profiles/web/node_modules` 不在它的解析路径上。profile 被 pnpm 重新 prune 后要重建该链接。
 
-面板因此多出一行 **`实际占用`**（`measured`）：它是宿主 `measure().totalTokens`，也就是压缩触发真正依据的数字——请求头未变时直接取 provider 返回的精确 usage，只对锚点之后的新增内容做估算。上面各行是构成估算，这一行是锚定值；`↳ Compartment` 的 tooltip 同时给出精确值与 chars/4 对照值。
+`↳ Compartment` 走同一套分词器：`_priceSurface` 先给 checkpoint 节点编码，再刷新 usage；全部 checkpoint 都有精确值之后面板去掉 `~`。宿主 `measure().totalTokens` 仍由顶栏展示（压缩触发看的就是它），不再在图例里重复。
 
 ### 3.2.4 checkpoint 链条预算（`compartmentBudgetRatio`）
 
